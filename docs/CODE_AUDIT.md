@@ -52,8 +52,11 @@
 - 由 `embed_edges_feature_word2vec.py::get_indexid2vec` 生成 `indexid2vec: Dict[int, np.ndarray]`：
   - 形状 `[emb_dim]`（默认 128，来自 `cfg.edge_featurization.embed_nodes.emb_dim`）。
   - 加权平均 + L2 归一化：`v / ||v||`。
-- 训练语料：`build_feature_word2vec.py::load_corpus_from_database` 从 PostgreSQL 的 `subject_node_table / file_node_table / netflow_node_table` 抽取，**整库语料**，不分 train/val/test。
-- Word2Vec 模型存于 `feature_word2vec._model_dir/feature_word2vec.model`。
+- 训练语料：`build_feature_word2vec.py::load_corpus_from_database` 从 PostgreSQL 的 `subject_node_table / file_node_table / netflow_node_table` 抽取，**整库节点语料**（包括 train/val/test 日期出现的所有节点），不分 train/val/test。这是 **transductive feature preprocessing**——它不使用攻击标签，但可能提前看到测试节点的路径、命令、IP 或端口，不是严格的 inductive 设置。
+- 配置字段 `semantic_features.corpus_scope`（本期新增）：
+  - `official_full_dataset`（默认/官方复现用）：使用整库语料。
+  - `train_only`（论文主实验用）：只使用训练日期出现的节点语料；需处理 OOV/UNK；val/test 不得更新 Word2Vec。
+- Word2Vec 模型存于 `feature_word2vec._model_dir/feature_word2vec.model`，保存时记录 `corpus_scope` 和模型 hash。
 
 ### 2.3 `TemporalData`（边特征化产物）
 
@@ -81,16 +84,29 @@ THEIA 默认：`[E, 2*128 + 2*3 + 10] = [E, 290]`。
 
 ### 2.4 `data_utils.extract_msg_from_data / extract_msg_node_type_only`
 
-为每个时间窗口 `g` 进一步注入：
-- `g.x_src`: `[E, emb_dim]` 或 `[E, node_type_dim]` — 来自 `src_emb` 或 `src_type`。
-- `g.x_dst`: `[E, emb_dim]` 或 `[E, node_type_dim]`。
+为每个时间窗口 `g` 进一步注入（默认 `use_node_type_in_node_feats=True`）：
+
+- `g.x_src`: `[E, emb_dim + node_type_dim]` — 即 `[E, 128 + 3] = [E, 131]`（THEIA 默认）。
+- `g.x_dst`: `[E, emb_dim + node_type_dim]` — 即 `[E, 131]`。
+- 当 `use_node_type_in_node_feats=False` 时：`[E, emb_dim]` = `[E, 128]`。
 - `g.msg`: `[E, ?]` — 若启用 `predict_edge_type`，剔除 `edge_type` 段；否则保留。
 - `g.edge_type`: `[E, edge_type_dim]` one-hot。
 - `g.edge_feats`: `[E, edge_type_dim]` 或 `[E, msg_dim]` 或 `None`，由 `cfg.encoder.edge_features` 控制。
 - `g.edge_index`: `[2, E]` 由 `torch.stack([src, dst])` 重建。
-- **注意：`g` 上**不显式保存 `src_type_index / dst_type_index / edge_type_index / event_index` 字段；类型只能通过 `g.x_src / x_dst` 的尾部 one-hot 反推（与任务说明 §7「不要隐式切片推断类型」相冲突，见 §13）。
+- **`g` 上当前不显式保存 `src_type_index / dst_type_index / edge_type_index / local_event_index / global_event_index / split / window_id`**。任务说明要求在审计后补充这些字段（见 §13 第7行），本期 Commit 3 将修复。
 
-### 2.5 训练侧 `OrthrusEncoder.forward` 的内部表示
+### 2.5 全局事件索引（`global_event_index`）
+
+- `global_event_index` 必须与 `full_data.msg`、`full_data.t`、`full_data.edge_type` 的拼接位置严格一一对应。
+- `full_data` 在 `data_utils.py::load_all_datasets` 中由 `train_data + val_data + test_data` 按时间顺序拼接而成：`src/dst/t/msg` 各自 `torch.cat`，没有单独维护 `global_event_index`。
+- 任务说明要求在 `TemporalData` 级别显式保存：
+  - `local_event_index`：该时间窗口内的从 0 开始的索引。
+  - `global_event_index`：在 `full_data` 中的全局索引（train/val/test 拼接后的位置）。
+  - `split`：该事件属于 train / val / test。
+  - `window_id`：该事件所属的时间窗口序号（全局）。
+- 本期 Commit 3 将实现这一字段体系；`global_event_index` 是校准器 `leave-one-out` 和节点聚合正确追踪事件来源的关键。
+
+### 2.6 训练侧 `OrthrusEncoder.forward` 的内部表示
 
 - `n_id`: 批内 + 历史邻居并集，long `[N']`。
 - `edge_index`: `[2, E_h]`（`E_h` 为历史邻居构造的边数）。
@@ -207,11 +223,15 @@ THEIA 默认：`[E, 2*128 + 2*3 + 10] = [E, 290]`。
 
 ### 7.1 阈值来源（`evaluation_utils.py::get_threshold`）
 
-- 仅支持两种方法：
+- 当前真正使用的阈值配置：`cfg.detection.evaluation.node_evaluation.threshold_method`，合法值为 `max_val_loss` 和 `mean_val_loss`（来自 `node_evaluation.py::get_node_predictions` 第 16 行调用）。
   - `max_val_loss` → `max(validation_losses)`。
   - `mean_val_loss` → `mean(validation_losses)`。
 - 阈值来自**正常验证集**所有事件的 edge-loss 列表（在 `calculate_threshold` 中聚合 `cfg.detection.gnn_testing._edge_losses_dir/val/<epoch>/*.csv` 的 `loss` 列）。
-- 注意：这里有一个**当前实现的 bug 风险**——`get_threshold(val_tw_path, ...)` 接收 `val_tw_path` 但 `node_evaluation.py::get_node_predictions` 实际传入的是 `val_tw_path`（OK）；但 `evaluation.py::standard_evaluation` 调用 `evaluation_fn(val_tw_path, test_tw_path, ...)` 时同时把模型 epoch 路径和测试路径都传了进去，签名耦合较紧。
+- **`cfg.detection.gnn_testing.threshold_method`（在 `config/orthrus.yml` 中值为 `"str"`）是一个无效/遗留配置字段**：
+  - 该字段在当前代码路径中**没有被读取**——`get_threshold` 函数的 `threshold_method` 参数来自 `cfg.detection.evaluation.node_evaluation.threshold_method`，不是 `gnn_testing.threshold_method`。
+  - `orthrus_gnn_testing.py` 中也未使用 `gnn_testing.threshold_method`。
+  - 因此 **它不会导致当前运行崩溃**，但属于无效配置，容易造成误解，应在后续清理中弃用或删除。
+- 注意：`node_evaluation.py::get_node_predictions` 调用 `get_threshold(val_tw_path, cfg.detection.evaluation.node_evaluation.threshold_method)` 时，把 epoch 目录路径和阈值方法一起传了进去，签名耦合较紧。
 
 ### 7.2 K-means（`evaluation_utils.py::compute_kmeans_labels`）
 
@@ -311,42 +331,77 @@ time_consumption = {
 - 任务说明 §5.2 已明确要求修复：被跳过阶段计时记录为 `None` 或 `0.0`。
 - **本轮不修复**，仅审计。
 
-### 10.3 其他潜在未初始化
+### 10.3 其他配置问题
 
-- `cfg.detection.gnn_testing.threshold_method` 当前在 `config/orthrus.yml` 里写为字符串 `"str"`（占位符），不是合法值；`get_threshold` 解析时会抛 `ValueError("Invalid threshold method ...")`。这也是一个隐式 bug。
+- `cfg.detection.gnn_testing.threshold_method` 当前在 `config/orthrus.yml` 里写为字符串 `"str"`——但该字段在当前代码路径中**从未被读取**，不属于影响当前运行的高风险项；应记录为遗留无效配置，后续清理时删除。
 - `cfg.detection.gnn_testing._from_weights` 等下划线开头路径变量只有在 `set_task_paths` 后才存在；CLI `--from_weights` 只在 `load_model` 时被读取。
 
 ---
 
 ## 11. 当前测试流程是否存在历史状态重置或未来信息泄漏风险
 
-### 11.1 历史状态重置
+### 11.1 历史状态重置（正确协议 vs 当前实现）
 
-- `OrthrusEncoder.reset_state` 存在（清空 `LastNeighborLoader`），但：
-  - 训练时每 epoch 开头会调用（`orthrus_gnn_training.py` L56-57）。
-  - **测试时没有显式调用**（`orthrus_gnn_testing.py` L91-141）。模型是从 checkpoint 加载的，但 `neighbor_loader.pkl` 也被加载进来——这意味着 val 段会带着**训练结束时的邻居历史**运行，然后 test 段会带着**val 结束时的邻居历史**运行。
+**正确协议**（每个 checkpoint）：每个模型 epoch checkpoint 必须严格按以下顺序执行：
+
+```
+reset_state() 一次
+→ replay train 一次（仅构建历史，不计算梯度）
+→ 连续处理 val（不重置历史）
+→ 不重置历史
+→ 连续处理 test
+```
+
+**禁止**以下任何一种错误协议：
+```
+replay train → val → reset → replay train → test   （每个 split 重置）
+replay train → val → test → reset → replay train → val → test  （每 epoch 重置）
+```
+
+**当前实现**（`orthrus_gnn_training.py` / `orthrus_gnn_testing.py`）：
+- 训练阶段：每 epoch 开头调用 `reset_state()`（OrthrusEncoder 分支），OK。
+- 测试阶段：`orthrus_gnn_testing.py::main` 没有显式调用 `reset_state()`；从 checkpoint 加载时 `neighbor_loader.pkl` 带着训练末尾的历史。这意味着：
+  - val 段看到的历史是「训练最末尾状态」。
+  - test 段看到的历史是「训练最末尾状态 + val 全部事件」。
+- `full_data` 的拼接顺序为 train + val + test，事件索引依次递增。如果 val 与 test 之间重新 reset/replay，`cur_e_id` 会与 `full_data` 中的事件索引错位，导致 `OrthrusEncoder` 取历史特征时 `e_id` 指向错误事件。
 
 ### 11.2 未来信息泄漏
 
 - 严格来说，当前 `LastNeighborLoader.insert` 在每个 batch 末尾执行，所以 batch_i 的事件不会进入 batch_i 的历史，但 batch_i 的事件**会**进入 batch_{i+1} 的历史——这是正常的滑动窗口因果。
-- 但 `full_data` 中拼接了 train+val+test 全部事件的 `msg / edge_type`（见 `data_utils.py::load_all_datasets`），用于「取出历史事件的边类型作为 `edge_feats`」。这本身**不会泄漏未来标签**，因为只用作 GNN 输入特征。
-- **真正的潜在风险**：
-  1. 测试时未 `reset_state` → 测试集第一个事件看到的「历史」实际上包含训练集最末尾若干事件。这是设计上的（**想要持续记忆**），但如果任务说明要求「验证/测试前必须基于训练集重建历史」，则需要在 testing 入口加 `reset_state` + replay train。
-  2. `last_h_storage` / `last_h_non_empty_nodes`（`Orthrus.__init__`）只在 `use_contrastive_learning=True` 时启用；当前 `config/orthrus.yml` 未启用 `predict_edge_contrastive`，所以无实际影响。
+- `full_data` 中拼接了 train+val+test 全部事件的 `msg / edge_type`，用于「取出历史事件的边类型作为 `edge_feats`」。这本身**不会泄漏未来标签**，因为只用作 GNN 输入特征。
+- `last_h_storage` / `last_h_non_empty_nodes`（`Orthrus.__init__`）只在 `use_contrastive_learning=True` 时启用；当前 `config/orthrus.yml` 未启用 `predict_edge_contrastive`，所以无实际影响。
 
-### 11.3 评估阶段的「未来」
+### 11.3 评估阶段的 epoch 选择（正确协议 vs 当前实现）
 
-- `evaluation_utils.py::compute_tw_labels` 用 PostgreSQL 真实事件时间戳回填恶意节点列表，**没有读测试集真实 edge-loss**，因此无标签泄漏。
-- 但 `standard_evaluation` 在所有 `model_epoch_*` 里**选出 best MCC** 并写入 W&B（`best_mcc` 跟踪）；这里隐含了「按测试集选择最优 epoch」的**指标泄漏**，只是未影响测试标签。任务说明 §2.2 严格禁止测试集选择超参；当前实现的 best-epoch-by-MCC 与之冲突。
+**正确协议**（任务说明 §2.2）：
+- 论文主结果：按**正常验证集平均边预测损失（min_val_mean_edge_loss）**选 best epoch。
+- 备选方案：按 `last_epoch`。
+- `standard_evaluation` 在所有 `model_epoch_*` 里按 **val mean edge loss 最小**选出 best epoch 并写入 W&B（`best_val_loss` 跟踪）。
+
+**原有 test MCC 选择（`legacy_test_selection`）**：
+- 当前 `evaluation.py::standard_evaluation` 在所有 `model_epoch_*` 里**按 test MCC 选出 best epoch** 并写入 W&B。
+- 这属于 **test leakage**：用测试集标签选择最优 epoch，违反任务说明 §2.2。
+- **允许保留为 `legacy_test_selection` 模式**，但：
+  - 默认关闭（`model_selection.method != legacy_test_selection`）。
+  - 仅用于与官方 ORTHRUS 结果的兼容性分析。
+  - 不得用于论文主结果。
 
 ### 11.4 总结风险
 
 | 风险 | 严重度 | 说明 |
 |------|--------|------|
-| 测试未重置历史 | 中 | 测试集沿用训练末尾的邻居历史；若改 replay train 即可修复 |
-| `best_mcc` 选 epoch 隐含测试集元信息 | 中-高 | 与任务说明 §2.2 严格无测试泄漏冲突；建议改成按 val MCC 选 |
-| `full_data` 拼接三段 | 低 | 仅作特征查找，未用未来标签 |
-| `cfg.detection.gnn_testing.threshold_method="str"` 占位 | 高 | 当前配置就跑不起来 |
+| 测试入口未按正确协议 replay | 高 | 当前 test 段沿用 val 末尾历史；若按正确协议 replay，cur_e_id 与 full_data 索引必须严格对齐 |
+| `full_data` 拼接顺序依赖全局事件 id | 高 | global_event_index 必须与 full_data.msg/t/edge_type 的拼接位置严格一致；当前没有显式 global_event_index 字段 |
+| epoch 选择使用 test MCC（legacy） | 中 | 属于 test leakage；需改为 `min_val_mean_edge_loss` 或 `last_epoch`；`legacy_test_selection` 模式仅作兼容性分析用 |
+| `gnn_testing.threshold_method="str"` | 低（遗留） | 该字段从未被读取，不影响当前运行；应弃用 |
+| `full_data` 拼接三段用于边特征查找 | 低 | 仅作特征查找，未用未来标签 |
+
+### 11.5 攻击场景数量（当前准确值）
+
+- **不得硬编码为 3/1**。实际启用数量由 `cfg.dataset.ground_truth_relative_path` 决定（`config.py::DATASET_DEFAULT_CONFIG`）：
+  - **THEIA_E3**：2 个攻击场景（`Browser_Extension_Drakon_Dropper` + `Firefox_Backdoor_Drakon_In_Memory`）。
+  - **THEIA_E5**：1 个攻击场景（`Firefox_Drakon_APT_BinFmt_Elevate_Inject`）。
+- Attack Detection Rate 的攻击计数必须**动态读取** `len(cfg.dataset.ground_truth_relative_path)` 或等价的已启用攻击配置，不得硬编码。
 
 ---
 
@@ -357,11 +412,18 @@ time_consumption = {
 - `edge_featurization/build_feature_word2vec.py::main`：训练数据来自 `get_indexid2msg(cur, use_cmd, use_port)`，而 `cur` 由 `init_database_connection(cfg)` 打开**当前 cfg.dataset 对应数据库**。
 - 不同数据集的 word2vec 模型落在各自 hash 目录下：`cfg.edge_featurization.embed_nodes._task_path` 由 `cfg.dataset.name` 决定（`config.py::set_task_paths` L390-393）。
 
-### 12.2 结论
+### 12.2 准确表述：Transductive Feature Preprocessing
 
 - **按数据集独立训练**，并各自存盘。E3 与 E5 向量空间不共享。
-- **没有把 word2vec 文本语料按 train/val/test 切分**：语料来自全库 node table，但 node table 的内容本身就是由 ground truth 之外的 schema 决定的，不依赖恶意标签，所以不构成「用测试集语料训练 word2vec」的违规；但需要确认 THEIA 的恶意节点同样出现在 `subject/file/netflow_node_table` 中——这与「测试语料不能用于训练 Word2Vec」的边界比较模糊。
+- **当前训练语料是「整库节点」**：来自全库 `subject_node_table / file_node_table / netflow_node_table`，包括 train / val / test 日期出现的所有节点。这不是 inductive 设置——它不使用攻击标签，但会提前看到测试节点的路径、命令、IP、端口信息，边界模糊。
 - 任务说明 §16 的「禁止把 E3 模型 + E5 word2vec 称为 zero-shot」目前**不存在该风险**（因为 word2vec 模型与 dataset 严格绑定在 hash 路径下）。
+
+### 12.3 需要的配置字段
+
+- `semantic_features.corpus_scope`（本期新增）：
+  - `official_full_dataset`（默认/官方复现用）：使用整库语料，对应当前实现。
+  - `train_only`（论文主实验用）：只使用训练日期出现的节点语料；需在 `build_feature_word2vec.py` 中增加按 `train_files` 日期过滤 node_table 的逻辑；需处理 OOV/UNK；val/test 不得更新 Word2Vec。
+- 保存时记录语料范围和模型 hash 到 `dataset_manifest.json`。
 
 ---
 
@@ -445,36 +507,36 @@ time_consumption = {
 
 ### 15.1 高风险
 
-1. **`--run_from_training` 触发 `NameError`**：`src/orthrus.py` L71-79 计算 `time_consumption` 时使用了未初始化的 `t1/t2/t3`。任务说明 §5.2 要求修。
-2. **`cfg.detection.gnn_testing.threshold_method` 当前值是占位符 `"str"`**：跑测试评估必报错。任务说明 §12 要求支持至少 3 种方法。
-3. **`evaluation.standard_evaluation` 按 test MCC 选 best epoch**：违反任务说明 §2.2（不得用测试集选择超参）。
-4. **测试入口未 `reset_state` + 未 replay train**：导致验证/测试时邻居历史非纯训练历史。任务说明 §10.8 要求严格 replay。
+1. **`--run_from_training` 触发 `NameError`**：`src/orthrus.py` L71-79 计算 `time_consumption` 时使用了未初始化的 `t1/t2/t3`。任务说明 §5.2 要求修复。
+2. **测试入口历史 replay 协议错误**：当前 test 段沿用 checkpoint 中的历史（val 末尾状态）；正确协议要求每个 checkpoint 的 val/test 前都要 `reset_state()` + replay train。如果 replay 时 `cur_e_id` 与 `full_data` 索引错位，会导致历史特征读取错误。
+3. **`global_event_index` 缺失**：`full_data` 拼接后没有显式全局事件索引；`OrthrusEncoder` 中的 `e_id` 依赖拼接顺序与 `cur_e_id` 计数的一致性。多尺度采样器（Commit 5）必须通过 `global_event_index` 从 `full_data` 读取历史事件特征，两者必须严格对齐。
+4. **epoch 选择使用 test MCC（legacy）**：违反任务说明 §2.2；需改为 `min_val_mean_edge_loss`（默认）或 `last_epoch`；`legacy_test_selection` 仅作兼容性分析。
 
 ### 15.2 中风险
 
 5. **没有 metadata cache**：train/test/evaluate 阶段硬依赖 PostgreSQL，违背任务说明 §6.3 的「已有 artifacts 时不需要 PostgreSQL」。
-6. **`EdgeTypeDecoder` 接口耦合 loss 与 logits**，无法满足任务说明 §9.1 要求的 `logits()` / `loss(logits, target, reduction)` 拆分。
-7. **`OrthrusEncoder` 直接读 `full_data.edge_type[e_id]`** 作为边特征——历史事件的真实边类型是允许的，但实现时需在新采样器中明确「e_id 集合不包含当前事件」。
-8. **数据视图（host_only / host_network_structure / host_network_full）缺失**：任务说明 §15 要求三视图共享同一 train/val/test 日期与同一 cfg。
+6. **`gnn_testing.threshold_method="str"` 遗留配置**：该字段在当前代码路径中从未被读取，不影响运行，但属于无效配置，应在后续清理中删除或替换为有效字段。
+7. **数据视图（host_only / host_network_structure / host_network_full）缺失**：任务说明 §15 要求三视图共享同一 train/val/test 日期与同一 cfg。
+8. **`save_model` 把 `LastNeighborLoader` 整体持久化**：在大节点集下体积较大；正确 replay 模式（Commit 5）不需要保存邻居状态，只需保存模型参数。
 
 ### 15.3 低风险
 
-9. **`save_model` 把 `LastNeighborLoader` 整体持久化**：在大节点集下体积较大，建议改 replay 模式（任务说明 §10.8）。
-10. **`evaluation.py::compute_tw_labels` 总是先 `os.remove(out_file)` 再重算**——若已有 cache 被合法生成，会被强制删除。任务说明希望 cache 复用。
-11. **`evaluation_utils.calculate_supervised_best_threshold` 处于死代码状态**，但不影响主流程；不要在本期删除，避免破坏 baseline 兼容。
+9. **`evaluation.py::compute_tw_labels` 总是先 `os.remove(out_file)` 再重算**——若已有 cache 被合法生成，会被强制删除。任务说明希望 cache 复用。
+10. **`evaluation_utils.calculate_supervised_best_threshold` 处于死代码状态**，但不影响主流程；不要在本期删除，避免破坏 baseline 兼容。
+11. **Semantic MLP 设计与多尺度模块存在矛盾**：现有 IMPLEMENTATION_PLAN 中描述了「为 Semantic MLP 调整多尺度门控」——这是不正确的。Semantic MLP 是简单非图基线，不读取历史邻居、不使用多尺度、不使用门控；MLP 与 `MultiScaleOrthrusEncoder` 是两条独立路径，不应相互调整。
 
 ---
 
 ## 16. 审计结论
 
 - 当前仓库是**单基线（ORTHRUS + GraphTransformer + EdgeTypeDecoder）**实现，缺少 MSTC-PIDS 任务说明要求的全部创新模块（多尺度采样、双任务解码、分层校准、Top-k 聚合、跨骨干、metadata 缓存、统一输出目录、stage 开关、单元测试、Colab Notebook）。
-- 当前实现存在 **1 个必然崩溃的 bug**（`--run_from_training`）、**1 个配置占位符 bug**（`threshold_method="str"`）、**1 个违反任务约束的选择**（best epoch by test MCC）。
+- 当前实现存在 **1 个必然崩溃的 bug**（`--run_from_training` 触发 `NameError`）和 **3 个高风险设计缺陷**（epoch 选择协议错误、历史 replay 协议错误、global_event_index 缺失）。
 - 本期最小改动需要：
   1. 修复 `orthrus.py` 计时变量（5 行内）；
-  2. 替换 `threshold_method` 默认值为合法方法（1 行）；
-  3. 改 `evaluation.py` 用 val MCC 选 best epoch（5 行内）；
-  4. 测试入口 `reset_state` + train replay（需要新增 replay 函数，约 30 行）；
-  5. 新增 `src/mstc/` 8 个文件（任务说明 §4 已列出）；
+  2. 修复 epoch 选择协议：改为 `min_val_mean_edge_loss`（默认），保留 `legacy_test_selection`；
+  3. 测试入口 `reset_state` + train replay（需要新增 replay 函数，约 30 行），**且 replay 后 val 和 test 之间不得再重置**；
+  4. `global_event_index` / `local_event_index` / `split` / `window_id` 字段体系；
+  5. 新增 `src/mstc/` 8 个文件（`time_gap.py`、`calibration.py`、`aggregation.py`、`history_store.py`、`multiscale_sampler.py`、`multiscale_encoder.py`、`dataset_views.py`、`experiment_utils.py`、`metadata_cache.py`、`metrics.py`——共 10 个，其中 `calibration.py` 提供独立 runner）；
   6. 新增 `config/experiments/*.yml`（任务说明 §4 已列出）；
   7. 新增 `tests/test_*.py`（任务说明 §22 已列出）；
   8. 新增 `src/experiments/*.py`（任务说明 §4 已列出）；

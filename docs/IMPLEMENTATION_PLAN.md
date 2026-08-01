@@ -3,6 +3,9 @@
 > 严格遵循任务说明 §24「按 8 个独立 Commit 提交」的开发顺序。本规划仅为最小改动方案，
 > 不进行大规模重构，不修改基线组件（`LastNeighborLoader` / `OrthrusEncoder` / `EdgeTypeDecoder` /
 > 阈值方法 / KMeans）的对外行为。
+>
+> 保留原始 `Orthrus` 类不变；新增 `MSTCOrthrus`（或 `MultiTaskOrthrus`）由 `model.variant` 选择。
+>
 > 用户引用的 `docs/ORTHRUS_MSTC_IMPLEMENTATION_SPEC.md` 不存在；本规划以仓库内
 > `docs/ORTHRUS-MSTC-PIDS_完整改造任务说明.md` 为准。
 
@@ -49,15 +52,24 @@ C1 baseline 保护 ─► C2 Colab + 元数据缓存 ─► C3 时间统计 ─�
   - 新增 `--artifact-root` CLI flag（默认 `os.environ.get('ORTHRUS_ARTIFACT_ROOT', './artifacts')`）。
 - `src/config.py`
   - 新增 `pipeline` 子树：`run_tracing: bool = False`，`stages: list[str] = ['all']`。
+  - 新增 `model_selection` 子树：`method: min_val_mean_edge_loss`（默认）、`legacy_test_selection`（默认关闭）。
   - 新增 `cfg.pipeline.stages` 与 `args.stages` 的解析与合并。
-  - 调整 `set_task_paths` 中 `detection.gnn_testing.threshold_method` 默认值（占位符 `"str"` → `"max_val_loss"`），并允许 `cfg.detection.gnn_testing.threshold_method` 解析为合法值。
   - 新增 `--stages`、`--skip-tracing`、`--artifact-root` CLI 注册。
+  - **不修改** `detection.gnn_testing.threshold_method`（该字段在当前代码路径中从未被读取，属于遗留配置；后续清理中处理）。
 - `src/detection/evaluation.py`
-  - 将 `best_mcc` 选择改为「按 val MCC 选 best epoch」，避免使用 test MCC。
-  - 注释化（不删除）原 test-based best 选择，便于 §23 「测试集仅在最终评估函数读取」对账。
+  - 将 epoch 选择协议改为 `model_selection.method: min_val_mean_edge_loss`（默认）。
+  - 允许备选：`last_epoch`。
+  - 新增 `legacy_test_selection` 模式（默认关闭）：保留原有按 test MCC 选 best epoch 的行为，仅用于与官方 ORTHRUS 结果的兼容性分析，不得用于论文主结果。
+  - 注释化（不删除）原有 test-based best 选择，便于对账。
 - `src/detection/orthrus_gnn_testing.py`
-  - 在每个 `model_epoch_*` 入口加 `model.encoder.reset_state()`（仅 OrthrusEncoder），并在每个 epoch 的 val/test 跑前执行 `replay_train_history(model, train_data, ...)` 重建历史。
-  - 新增 `replay_train_history` 私有函数（直接复用现有 batch loop，`torch.no_grad()` + `eval()`），不引入新数据结构。
+  - 在每个 `model_epoch_*` 入口按**正确 replay 协议**执行：
+    1. `model.encoder.reset_state()`（仅 OrthrusEncoder 分支）。
+    2. `replay_train_history(model, train_data, cfg)`：直接复用现有 batch loop，`torch.no_grad()` + `eval()`，只构建历史，不计算梯度。
+    3. 连续处理 val（不重置历史）。
+    4. **不重置历史**。
+    5. 连续处理 test。
+  - **禁止**在 val 与 test 之间插入 reset/replay。
+  - 新增 `replay_train_history` 私有函数。
 
 ### 新增文件
 
@@ -78,14 +90,31 @@ C1 baseline 保护 ─► C2 Colab + 元数据缓存 ─► C3 时间统计 ─�
 
 ### Smoke test
 
+Commit 1 **尚未实现 metadata cache 和 PostgreSQL 解耦**，不得声称真实完整运行 `train,test,evaluate` 可完全离线。Commit 1 的 smoke test 范围为：
+
 ```bash
+# 阶段开关测试
 python src/orthrus.py THEIA_E3 \
   --stages train,test,evaluate \
   --run_from_training \
-  --artifact-root /tmp/orthrus_smoke \
+  --artifact-root /tmp/orthrus_c1 \
   --seed 0 --cpu
+
+# baseline 兼容性测试（合成数据）
+pytest -q tests/test_baseline_compatibility.py
+
+# pipeline 开关测试
+pytest -q tests/test_orthrus_pipeline_stages.py
+
+# NameError 修复测试
+pytest -q tests/test_run_from_training_no_nameerror.py
 ```
-预期：3 个 epoch 跑完，不连 PostgreSQL（依赖已存在 artifacts）。
+预期（合成数据下）：
+- `--stages train,test` 等变体不抛 NameError。
+- baseline 数值与原 ORTHRUS 在合成数据上吻合（atol/rtol）。
+- 不连 PostgreSQL（测试均使用合成数据）。
+
+**真正的无 PostgreSQL 完整 smoke test 移到 Commit 2**（需要 metadata cache + preprocessed artifacts 全部就绪）。
 
 ### 高风险模块
 
@@ -94,8 +123,8 @@ python src/orthrus.py THEIA_E3 \
 
 ### 与任务说明冲突的现有实现
 
-- `config/orthrus.yml` 的 `threshold_method: str` 是占位符，必须改为合法值。
-- `evaluation.py` 用 test MCC 选 best epoch（违规 §2.2）。
+- `evaluation.py` 用 test MCC 选 best epoch（违规 §2.2）；改为 `min_val_mean_edge_loss`（默认）。
+- `gnn_testing.threshold_method="str"` 为遗留无效配置字段（不影响当前运行，应后续清理）。
 
 ### 不在本 Commit 做的事
 
@@ -115,6 +144,7 @@ python src/orthrus.py THEIA_E3 \
 - `src/config.py`
   - 新增环境变量读取：`ORTHRUS_ARTIFACT_ROOT / ORTHRUS_DATA_ROOT / ORTHRUS_DB_HOST / ORTHRUS_DB_PORT / ORTHRUS_DB_USER / ORTHRUS_DB_PASSWORD`，默认值保留原硬编码。
   - 在 `get_default_cfg` / `get_yml_cfg` 末尾把这些环境变量同步到 cfg。
+  - 新增 `semantic_features` cfg 子树：`corpus_scope`（`official_full_dataset` 或 `train_only`）。
 - `src/provnet_utils.py::init_database_connection`
   - 新增「环境变量覆盖」分支（host/port/user/password 优先用 cfg.database.*，再回退到环境变量）。
 - `src/labelling.py`
@@ -182,13 +212,17 @@ python src/orthrus.py THEIA_E3 \
 
 - `src/data_utils.py`
   - 在 `extract_msg_from_data` / `extract_msg_node_type_only` 末尾额外写入：
-    - `g.src_type`: `[E]` long。
-    - `g.dst_type`: `[E]` long。
+    - `g.src_type`: `[E]` long（源节点类型索引 0/1/2）。
+    - `g.dst_type`: `[E]` long（目的节点类型索引 0/1/2）。
     - `g.edge_type_index`: `[E]` long（来自 `g.edge_type.argmax(-1)`）。
-    - `g.event_index`: `[E]` long（在该 `TemporalData` 内的全局索引，从 0 起）。
-  - 增加断言：`src/dst/t/src_type/dst_type/edge_type_index/event_index` 长度一致；`edge_type_index ∈ [0, num_edge_types)`；`src_type/dst_type ∈ [0, num_node_types)`；`g.t` 非递减。
-- `src/temporal.py`
-  - 新增 `class TimeGapStatistics`（任务说明 §8.1-§8.4）：
+    - `g.local_event_index`: `[E]` long（该时间窗口内的从 0 开始的索引）。
+    - `g.window_id`: 标量 int（该窗口在全局 train/val/test 序列中的序号）。
+  - 增加断言：`src/dst/t/src_type/dst_type/edge_type_index/local_event_index` 长度一致；`edge_type_index ∈ [0, num_edge_types)`；`src_type/dst_type ∈ [0, num_node_types)`；`g.t` 非递减。
+  - `global_event_index`、`split` 在后续 `load_all_datasets` 中拼接生成（Commit 3 仅在 TemporalData 层面补充 local 字段）。
+- `src/mstc/time_gap.py`（**唯一实现位置**）
+  - **`TimeGapStatistics` 只实现一份，放在 `src/mstc/time_gap.py`**。
+  - `src/temporal.py` **不添加** `TimeGapStatistics`，保留原始 `LastNeighborLoader`。
+  - `class TimeGapStatistics`（任务说明 §8.1-§8.4）：
     - `fit(train_data_list)`：按时间顺序扫描，统计 `delta_src / delta_dst`（秒 = ns / 1e9），并计算分位数 `[0.2,0.4,0.6,0.8]` 与 `[0.5,0.9,0.99]`。
     - `transform(delta_seconds)` → bucket_id ∈ {0=NO_HISTORY, 1=VERY_SHORT, 2=SHORT, 3=MEDIUM, 4=LONG, 5=VERY_LONG}。
     - `transform_batch(g, last_seen_per_node)`：在 batch 入口更新 last_seen（仅用历史事件，不允许使用当前 batch 的未来事件）。
@@ -198,11 +232,13 @@ python src/orthrus.py THEIA_E3 \
 
 ### 新增文件
 
-- `src/mstc/time_gap.py`：复用 `TimeGapStatistics` 逻辑（与 `temporal.py` 版本同源，但放置在 mstc 包内便于开关管理）。
+- `src/mstc/time_gap.py`（**唯一实现位置**）
 - `config/experiments/time_only.yml`
 - `tests/test_time_gap.py`
   - NO_HISTORY、log1p、负时间差、分位数边界、bucket 划分。
   - 合成 TemporalData：5 个节点、8 条事件，时间戳 10/20/50/100/110，验证 bucket 划分稳定。
+- `tests/test_global_event_index.py`
+  - `global_event_index` 与 `full_data.msg` 拼接位置严格一致；`split` 字段正确标注 train/val/test；`window_id` 全局唯一。
 
 ### 单元测试
 
@@ -210,20 +246,21 @@ python src/orthrus.py THEIA_E3 \
 - `test_time_gap.py::test_seconds_conversion`
 - `test_time_gap.py::test_negative_delta_raises`
 - `test_time_gap.py::test_quantile_boundaries`
+- `test_global_event_index.py::test_global_index_matches_full_data`
+- `test_global_event_index.py::test_split_field_correct`
 
 ### Smoke test
 
 ```bash
-python src/orthrus.py THEIA_E3 \
-  --stages train,test,evaluate \
-  --run_from_training \
-  --model-variant mstc \
-  --enable-multiscale false \
-  --enable-time-task false \
-  --artifact-root /tmp/orthrus_t3 \
-  --seed 0 --cpu
+# Commit 3 只生成时间标签，不修改模型
+# smoke test 验证新增字段存在且格式正确
+pytest -q tests/test_time_gap.py
+pytest -q tests/test_global_event_index.py
 ```
-预期：训练照旧（time_gap 模块不参与 loss 计算），`event_predictions.csv` 多出 `src_type / dst_type / edge_type_index / event_index` 列。
+预期（合成数据下）：
+- `g.src_type / g.dst_type / g.edge_type_index / g.local_event_index / g.window_id` 字段存在且形状正确。
+- `TimeGapStatistics.fit` 在训练集上统计正确。
+- `TimeGapDecoder`（Commit 4 才接入）届时可正常读取时间标签。
 
 ### 高风险模块
 
@@ -249,28 +286,34 @@ python src/orthrus.py THEIA_E3 \
 
 ### 修改文件
 
-- `src/decoders.py`
-  - 调整 `EdgeTypeDecoder` 拆分为 `logits(h_src, h_dst)` 与 `loss(logits, target, reduction)`（任务说明 §9.1）。
-  - 新增 `class TimeGapDecoder(nn.Module)`：
-    - 共享 MLP：`Linear(2*in_dim, hidden) -> ReLU -> Linear(hidden, 6)`，然后分裂为 `src_head` 与 `dst_head`（均 `Linear(hidden, 6)`）。
-    - `forward(h_src, h_dst) -> src_logits, dst_logits`。
-    - `loss(src_logits, src_target, dst_logits, dst_target, reduction) -> loss_time`（取均值 0.5*(src+dst)）。
-- `src/factory.py::decoder_factory`
-  - 新增 `cfg.detection.gnn_training.decoder.time_gap.enabled` 开关；启用时 append `TimeGapDecoder`。
-- `src/model.py::Orthrus`
-  - 返回值改为字典：
-    - 训练：`{"loss": scalar, "loss_type": scalar, "loss_time": scalar, "loss_time_src": scalar, "loss_time_dst": scalar}`。
-    - 推理：`{"score_raw": [E], "loss_type": [E], "loss_time": [E], "loss_time_src": [E], "loss_time_dst": [E], "edge_logits": [E, R], "src_time_logits": [E, 6], "dst_time_logits": [E, 6]}`。
-  - 在 `cfg.detection.gnn_training.decoder.time_gap.enabled=False` 时退化为「仅 loss_type」字典（与原 scalar 行为兼容）。
-- `src/detection/orthrus_gnn_training.py::train`
-  - 把 `loss = model(batch, full_data)` 改为 `outputs = model(batch, full_data)`；`outputs["loss"].backward()`。
-  - 增加 `cfg.detection.gnn_training.decoder.time_gap.lambda_time` 加权。
-- `src/detection/orthrus_gnn_testing.py::test`
-  - 读取 `outputs["score_raw"]`、`outputs["loss_type"]`、`outputs["loss_time_*"]` 等；CSV 增加 `loss_type / loss_time_src / loss_time_dst / loss_time / score_raw / src_time_target / dst_time_target / src_time_prediction / dst_time_prediction` 等列。
 - `src/mstc/time_gap.py`
   - 在 `OrthrusEncoder.forward` 阶段注入 `time_targets`：
     - 由 `TimeGapStatistics` 维护 `last_seen`；每个 batch 入口调用 `transform_batch` 计算 `src_time_target / dst_time_target`。
     - **`last_seen` 只在 batch 入口更新；不在 batch 中插入当前事件**——这是因果 micro-batch 关键。
+- `src/model.py`
+  - **不直接修改原始 `Orthrus` 类**。
+  - 新增 `class MSTCOrthrus(nn.Module)`（或 `MultiTaskOrthrus`）：
+    - 接收 `encoder`（可为 `OrthrusEncoder` 或 `MultiScaleOrthrusEncoder`）。
+    - 返回字典：
+      - 训练：`{"loss": scalar, "loss_type": scalar, "loss_time": scalar, "loss_time_src": scalar, "loss_time_dst": scalar}`。
+      - 推理：`{"score_raw": [E], "loss_type": [E], "loss_time": [E], "loss_time_src": [E], "loss_time_dst": [E], "edge_logits": [E, R], "src_time_logits": [E, 6], "dst_time_logits": [E, 6]}`。
+    - `Orthrus` 类保持不变；`model_factory` 根据 `cfg.model.variant` 选择 `Orthrus` 或 `MSTCOrthrus`。
+- `src/decoders.py`
+  - 保留原始 `EdgeTypeDecoder` 不变。
+  - 新增 `class TimeGapDecoder(nn.Module)`：
+    - 结构：`shared_repr = SharedMLP(concat(h_src, h_dst))` → `src_logits = src_head(shared_repr)`，`dst_logits = dst_head(shared_repr)`。
+    - 其中 `SharedMLP` 输出 `hidden_dim`；`src_head = Linear(hidden_dim, 6)`；`dst_head = Linear(hidden_dim, 6)`。
+    - **不得先把共享层输出降成 6 维，再接两个分类头**。
+    - `forward(h_src, h_dst) -> src_logits, dst_logits`。
+    - `loss(src_logits, src_target, dst_logits, dst_target, reduction) -> loss_time`（取均值 0.5*(src+dst)）。
+- `src/factory.py::decoder_factory`
+  - 新增 `cfg.detection.gnn_training.decoder.time_gap.enabled` 开关；启用时 append `TimeGapDecoder`。
+- `src/detection/orthrus_gnn_training.py::train`
+  - 当 `cfg.model.variant == "mstc"` 时使用 `MSTCOrthrus`；其他情况使用 `Orthrus`。
+  - 使用 `MSTCOrthrus` 时：`outputs = model(batch, full_data)`；`outputs["loss"].backward()`。
+  - 增加 `cfg.detection.gnn_training.decoder.time_gap.lambda_time` 加权。
+- `src/detection/orthrus_gnn_testing.py::test`
+  - 当使用 `MSTCOrthrus` 时：读取 `outputs["score_raw"]`、`outputs["loss_type"]`、`outputs["loss_time_*"]` 等；CSV 增加详细列。
 
 ### 新增文件
 
@@ -327,8 +370,13 @@ python src/orthrus.py THEIA_E3 \
 
 - `src/mstc/history_store.py`（新增）
   - `class HistoryStore`：
-    - 内部用 `int32` 存储 `(node_id, neighbor_id, event_id, t_ns, edge_type_oh, src_emb, dst_emb)`。
-    - `insert(batch)` / `query(nodes, ref_times)` → 返回 short/medium/long 三组候选索引。
+    - **只保存必要的历史索引**：`neighbor_id`（long）、`event_id`（long）、`timestamp_ns`（**必须为 int64，纳秒时间戳**）、`direction`（可选，int8）。
+    - **不得使用 int32 存储纳秒时间戳**（int32 上限约 68 年，溢出风险）。
+    - **不得把 edge_type one-hot 存入历史存储**。
+    - **不得把 src_emb/dst_emb 存入历史存储**。
+    - 边特征和节点特征通过 `event_id` 从 `full_data` 读取。
+    - `node_id` 和 `event_id` 只有在确认数值范围安全后才可考虑 int32。
+    - `insert(batch)` / `query(nodes, ref_times)` → 返回 short/medium/long 三组 `(node_id, event_id, timestamp_ns, direction)` 元组。
 - `src/mstc/multiscale_sampler.py`（新增）
   - `class MultiScaleNeighborLoader(nn.Module)`：
     - `__call__(nodes, ref_times)` → 三个尺度的子图（与 `LastNeighborLoader` 同接口风格）。
@@ -348,7 +396,8 @@ python src/orthrus.py THEIA_E3 \
   - 当 `mode == 'multiscale'` 时构造 `MultiScaleOrthrusEncoder`；否则保持 `OrthrusEncoder`。
   - 共享 `GraphTransformer` 由 `cfg.encoder.share_encoder` 控制（默认 True）：三个尺度在同一实例上 forward。
 - `src/detection/orthrus_gnn_testing.py::main`
-  - 在每个 model_epoch_* 入口加 `model.encoder.reset_state()` + `replay_train_history(model, train_data, cfg)`（Commit 1 已建立 replay 钩子，此处只需确认 multiscale encoder 也支持）。
+  - 在每个 model_epoch_* 入口按正确 replay 协议执行：`reset_state()` → `replay_train_history()` → val → test（val 与 test 之间不重置）。
+  - Commit 1 已建立 replay 钩子，此处只需确认 multiscale encoder 也支持。
 
 ### 新增文件
 
@@ -384,8 +433,8 @@ python src/orthrus.py THEIA_E3 \
 
 ### 高风险模块
 
-- `MultiScaleNeighborLoader` 内部索引 `int32`：原 `LastNeighborLoader` 用 `long`，新组件必须保持兼容性，不能把现有 encoder 引入 `int32`。
 - 共享 `GraphTransformer`：三个尺度在同一模块 forward 时需保证 batch 维正确串联；PyG 的 `TransformerConv` 在不同子图上调用是允许的。
+- `HistoryStore` timestamp_ns 必须用 int64；溢出检查需在单元测试中覆盖。
 
 ### 与任务说明冲突的现有实现
 
@@ -403,20 +452,33 @@ python src/orthrus.py THEIA_E3 \
 
 ### 目标
 
-实现 `HierarchicalRelationCalibrator`（任务说明 §11）+ `NodeScoreAggregator`（§12）；保留旧 threshold/kmeans 对照路径。
+实现 `HierarchicalRelationCalibrator`（任务说明 §11）+ `NodeScoreAggregator`（§12）+ `DatasetViews`（§15）；保留旧 threshold/kmeans 对照路径。校准作为独立后处理阶段（不在 GNN testing 循环内拟合）。
 
 ### 修改文件
 
-- `src/mstc/calibration.py`（新增）
+- `src/detection/orthrus_gnn_testing.py::main`
+  - **GNN testing 阶段只负责输出完整 raw event scores**：写入 CSV 包含 `score_raw / loss_type / loss_time_*` 等原始输出。
+  - **不得在逐 batch 循环里拟合校准器**。
+- `src/mstc/calibration_runner.py`（新增，统一唯一位置）
+  - 独立后处理 runner，负责：
+    1. 读取完整 val raw scores（从 CSV 或从 checkpoint 重新跑 val）。
+    2. `HierarchicalRelationCalibrator.fit(val)`。
+    3. `transform_val_with_loo(val)` → leave-one-out 转换 val scores。
+    4. `calibrate(test)` → 测试集校准分数 + calibration_level。
+    5. 写入 `calibrator.pkl` 和 `calibration_summary.json`。
+- `src/mstc/calibration.py`
+  - **只放校准算法类**，不负责 I/O、不读取 CSV、不保存结果。
   - `class HierarchicalRelationCalibrator`：
     - `fit(val_event_records)`：按 `(src_type, edge_type, dst_type)` 与 `(src_type, dst_type)` 与 `GLOBAL` 三组桶分别排序，使用 `numpy.searchsorted`。
     - `calibrate(test_event_records)`：返回 `score_calibrated = -log(max(p, epsilon))` + `calibration_level ∈ {triplet, type_pair, global}`。
     - `transform_val_with_loo(val_event_records)`：leave-one-out 经验 p 值。
-- `src/mstc/aggregation.py`（新增）
+- `src/mstc/aggregation.py`
   - `class NodeScoreAggregator`：
     - `aggregate(node_to_event_scores, method, topk, include_dst)`：`topk_mean / max / mean / topk_sum`。
-- `src/detection/orthrus_gnn_testing.py::test`
-  - 把 `score_raw` 列写入 CSV；调用 `calibrator.calibrate` 写 `score_calibrated / calibration_level` 列。
+- `src/mstc/dataset_views.py`
+  - `apply_dataset_view(data, mode)`：在 `load_data_set` 之后、`full_data` 拼接之前应用。
+  - 合法模式：`host_only`、`host_network_structure`、`host_network_full`。
+  - 过滤后必须重新生成：`global_event_index`、`full_data`、`历史事件编号`、`事件数量统计`。
 - `src/detection/node_evaluation.py::get_node_predictions`
   - 用 `NodeScoreAggregator` 替换 `reduce_losses_to_score`（保留旧函数作对照）。
   - `use_kmeans` 分支保持原行为，新增 `node_threshold.method ∈ {validation_quantile, max_validation, kmeans}` 分支。
@@ -424,21 +486,26 @@ python src/orthrus.py THEIA_E3 \
   - 新增 `calibration_summary.json` 与 `calibrator.pkl` 保存逻辑。
   - `get_threshold` 增加 `validation_quantile` 与 `kmeans`（旧 max/mean 保留作对照）。
 - `src/config.py`
-  - 新增 `calibration / node_aggregation / node_threshold` cfg 子树默认值。
+  - 新增 `calibration / node_aggregation / node_threshold / dataset_view` cfg 子树默认值。
 
 ### 新增文件
 
+- `src/mstc/calibration_runner.py`（唯一实现位置；`calibration.py` 仅放算法类）
 - `config/experiments/calibration_max.yml`、`calibration_quantile.yml`、`calibration_kmeans.yml`、`calibration_global_p.yml`、`calibration_relation.yml`、`calibration_hierarchical.yml`、`host_only.yml`、`host_network_structure.yml`、`host_network_full.yml`
 - `tests/test_calibration.py`
   - `monotonic_p`、`< 1`、add-one、leave-one-out、空组回退、epsilon 不为 0。
 - `tests/test_aggregation.py`
   - `less_than_k → mean(all)`、`more_than_k → top_k_mean`、`include_dst` 切换。
+- `tests/test_dataset_views.py`
+  - `host_only` 过滤 netflow 节点；`host_network_structure` 置零 netflow 语义；`host_network_full` 保留全部。
 
 ### 单元测试
 
 - `test_calibration.py::test_p_monotonic`
 - `test_calibration.py::test_loo_p`
 - `test_aggregation.py::test_topk_mean`
+- `test_dataset_views.py::test_host_only_filter`
+- `test_dataset_views.py::test_global_event_index_regenerated`
 
 ### Smoke test
 
@@ -453,12 +520,12 @@ python src/orthrus.py THEIA_E3 \
   --artifact-root /tmp/orthrus_t6 \
   --seed 0 --cpu
 ```
-预期：`metrics.json` 含 `FP_per_million / Attack_Detection_Rate / MCC / F1 / AUPRC / AUROC`；`node_predictions.csv` / `event_predictions.csv` 完备。
+预期：`calibration_runner.py` 成功运行；`metrics.json` 含 `FP_per_million / Attack_Detection_Rate / MCC / F1 / AUPRC / AUROC`；`node_predictions.csv` / `event_predictions.csv` 完备；`calibrator.pkl` / `calibration_summary.json` 已保存。Attack Detection Rate 的攻击数量动态读取 `len(cfg.dataset.ground_truth_relative_path)`。
 
 ### 高风险模块
 
 - `HierarchicalRelationCalibrator.fit`：必须仅使用正常 val 集；不许读 test。
-- `evaluation.main`：必须把 best epoch 选择改为按 val MCC（Commit 1 已修）。
+- `evaluation.main`：`best epoch` 选择必须使用 `min_val_mean_edge_loss`（默认）或 `last_epoch`；`legacy_test_selection`（按 test MCC）仅作官方兼容分析且默认关闭；不得使用 val MCC 或 test MCC 选论文主模型。
 
 ### 与任务说明冲突的现有实现
 
@@ -476,7 +543,7 @@ python src/orthrus.py THEIA_E3 \
 
 ### 目标
 
-新增 `GraphSAGEBackbone` 与 `SemanticMLPBackbone`，使 MSTC-PIDS 与基线均可跨骨干验证。
+新增 `GraphSAGEBackbone` 与 `SemanticMLPBackbone`，使 MSTC-PIDS 与基线均可跨骨干验证。Semantic MLP 是独立简单非图基线，**不进入 `MultiScaleOrthrusEncoder` 的门控逻辑**。
 
 ### 修改文件
 
@@ -485,14 +552,14 @@ python src/orthrus.py THEIA_E3 \
     - `SAGEConv(in_dim → hid_dim) → SAGEConv(hid_dim → out_dim)`，无 edge_dim。
     - `forward(x, edge_index, **kwargs)`：与 `GraphTransformer` 同接口。
   - 新增 `class SemanticMLPBackbone(nn.Module)`：
-    - 输入 `concat(x_src, x_dst)`；两层 MLP；不读 edge_index。
+    - 输入 `concat(x_src, x_dst)`；两层 MLP；**不读 edge_index**；不使用多尺度；不使用门控。
+    - 这是一条独立的非图基线路径，与 `MultiScaleOrthrusEncoder` 互不干扰。
 - `src/factory.py::encoder_factory`
   - 新增 `cfg.detection.gnn_training.encoder.backbone ∈ {graph_transformer, graphsage, semantic_mlp}`。
-  - `semantic_mlp` 时跳过多尺度采样（直接用 `x_src / x_dst`），并把 `context.mode` 强制 `recent`。
-- `src/mstc/multiscale_encoder.py`
-  - 当 `backbone=semantic_mlp` 时 `gate_input` 中不附加 `current_src_proj / current_dst_proj`，改为 `gate_input = cat(z_short, z_medium, z_long)`（任务说明 §14.3）。
+  - 当 `backbone == 'semantic_mlp'` 时：跳过 `MultiScaleOrthrusEncoder`，直接使用 `SemanticMLPBackbone` + 对应 Decoder。
+  - `semantic_mlp` 模式强制 `context.mode = 'none'`（不读取历史邻居）。
 - `src/detection/orthrus_gnn_testing.py::test`
-  - 当 `backbone=semantic_mlp` 时不再生成 `short_gate_weight` 列。
+  - 当 `backbone=semantic_mlp` 时：不输出 `short_gate_weight / medium_gate_weight / long_gate_weight` 列。
 
 ### 新增文件
 
@@ -560,6 +627,7 @@ python src/orthrus.py THEIA_E3 \
   - 在 `stats` 中追加 `fp_per_million / attack_detection_rate / events_per_second / peak_gpu_memory_mb / peak_cpu_memory_mb`。
 - `src/detection/orthrus_gnn_training.py`
   - 记录 `train_seconds_per_epoch / total_train_seconds / peak_gpu_memory_mb / events_per_second`，写到 `runtime.json`。
+  - **完整 checkpoint 保存**：至少保存 `model_state_dict`、`optimizer_state_dict`、`epoch`、`Python random state`、`NumPy random state`、`Torch CPU RNG state`、`Torch CUDA RNG states`、`config hash`。如果使用 scheduler，也保存 `scheduler_state_dict`。**只保存模型权重不称为完整断点续训**。
 - `src/detection/orthrus_gnn_testing.py::main`
   - 记录 `test_seconds / events_per_second`。
 
@@ -596,7 +664,10 @@ python src/experiments/export_tables.py --artifact-root /tmp/orthrus_t8
 
 ### 高风险模块
 
-- `run_matrix.py` 需要在 OOM 时自动降低 `batch_size / candidate_capacity / neighbor budget`，但**必须把实际配置写进结果文件**（任务说明 §21.5）——实现要点。
+- `run_matrix.py` 的 OOM 处理：
+  - **正式实验中不得自动降低 `candidate_capacity`、`neighbor budgets`、模型维度**——这些改变会改变实验语义，导致不同 seed 不可直接汇总。
+  - **只允许在数学语义保持一致时调整 `batch_size`**（语义等价）。
+  - 发生其他 OOM 时：当前 run 失败，输出失败原因，人工制定统一资源配置，用同一配置重新运行所有对照模型。
 - `collect_results.py` 必须容忍部分 seed 失败；统计 `successful_seeds / failed_seeds`。
 
 ### 与任务说明冲突的现有实现
@@ -610,18 +681,35 @@ python src/experiments/export_tables.py --artifact-root /tmp/orthrus_t8
 
 ---
 
-## 跨 Commit 风险表
+## 跨 Commit 依赖与风险表
 
 | Commit | 高风险模块 | 失败后果 | 缓解措施 |
 |--------|-----------|----------|----------|
-| C1 | `src/orthrus.py::time_consumption` | `--run_from_training` 必崩 | 5 行修复 |
+| C1 | `src/orthrus.py::time_consumption`（NameError） | `--run_from_training` 必崩 | 5 行修复 |
+| C1 | epoch 选择改 `min_val_mean_edge_loss` | `legacy_test_selection` 与新协议冲突 | 注释旧代码，默认关闭 |
+| C1 | replay 协议（reset→train→val→test，无中间重置） | val/test 间重置导致 cur_e_id 错位 | 每个 checkpoint 只 replay 一次 |
 | C2 | `labelling.py::get_t2malicious_node` cache | 离线模式下评估失败 | pkl 与 DB 双路径 |
 | C3 | `data_utils.extract_msg_from_data` 新增字段 | 老 checkpoint 加载报错 | 字段可选，缺省时回退 |
-| C4 | `Orthrus.forward` 返回字典 | 所有 caller 必改 | 同步改 training/testing/evaluation |
+| C3 | `global_event_index` 与 `full_data` 拼接严格对齐 | 校准器 LOO 和节点聚合出错 | 多尺度采样（Commit 5）依赖此一致性 |
+| C4 | 新增 `MSTCOrthrus` | 原始 `Orthrus` 接口被意外污染 | 通过 `model.variant` 选择，原始类保持不变 |
+| C4 | `TimeGapDecoder` 结构（SharedMLP→hidden→6） | 结构错误无法收敛 | 单元测试覆盖 logits/loss 形状 |
+| C5 | `HistoryStore` timestamp_ns int64 | int32 溢出（68年限制） | 单元测试覆盖大时间戳 |
 | C5 | 共享 `GraphTransformer` 多尺度 | 多尺度引入额外显存 | 共享 encoder 是任务强制要求 |
-| C6 | 校准器仅看 val | 与 test MCC 选 best 冲突 | Commit 1 已改为 val MCC |
-| C7 | `SemanticMLPBackbone` 不读 edge_index | 多尺度采样与 MLP 兼容 | `gate_input` 维度分支处理 |
-| C8 | `run_matrix.py` OOM 自动降配 | 结果不一致 | 实际配置必须写入结果文件 |
+| C6 | 校准为独立后处理（非 GNN 测试循环内） | 与当前 `orthrus_gnn_testing.py` 架构冲突 | 新增 `calibration_runner.py` |
+| C6 | `HierarchicalRelationCalibrator.fit` 只用 val | 与 `legacy_test_selection` 冲突 | C1 已将 `legacy_test_selection` 改为默认关闭 |
+| C7 | `SemanticMLPBackbone` 独立路径 | 与 `MultiScaleOrthrusEncoder` 混用 | MLP 是独立 backbone，强制 `context.mode='none'` |
+| C8 | OOM 处理不改变实验语义 | 不同 seed 无法汇总 | 仅允许调 batch_size，其他 OOM 失败并记录原因 |
+| C8 | `run_matrix.py` seed 失败容错 | 结果不完整 | 统计 `successful_seeds / failed_seeds` |
+
+### 8 个 Commit 之间的关键依赖关系
+
+- **C1 不依赖 C2 的数据库解耦**：C1 只做 pipeline 开关 + replay 协议 + epoch 选择协议。
+- **C3 只生成时间标签，不修改模型**：生成 `local_event_index / global_event_index / split / window_id` 字段体系，供 C5/C6 使用。
+- **C4 使用新的 `MSTCOrthrus`（不改变 `Orthrus`）**：两条路径通过 `model.variant` 选择。
+- **C5 的多尺度历史 `event_id` 与 `global_event_index` 严格一致**：`HistoryStore` 只存 `event_id`，边特征通过 `event_id` 从 `full_data` 读取。
+- **C6 校准与模型测试解耦**：GNN testing 只输出 raw scores，校准器作为独立后处理运行。
+- **C7 的 Semantic MLP 不进入多尺度模块**：MLP 是独立 encoder backbone，与 `MultiScaleOrthrusEncoder` 互不干扰。
+- **C8 不得自动改变实验语义**：正式实验中 OOM 只允许调 batch_size；其他配置变化必须人工决策。
 
 ---
 
@@ -663,6 +751,7 @@ python src/experiments/export_tables.py --artifact-root /tmp/orthrus_t8
 
 ## 已知限制（与任务说明原文的差距）
 
-- THEIA_E3 / THEIA_E5 的攻击场景极少（3 / 1），`Attack Detection Rate` 仅作辅助指标（任务说明 §13 已说明）。
-- Word2Vec 按数据集独立训练（任务说明 §16 已说明）；本期不实现跨 E3/E5 zero-shot。
+- THEIA_E3 攻击场景为 2 个、THEIA_E5 为 1 个；Attack Detection Rate 仅作辅助指标（任务说明 §13 已说明）；攻击数量必须动态读取 `len(cfg.dataset.ground_truth_relative_path)`。
+- Word2Vec 当前为 transductive feature preprocessing（使用整库节点语料）；本期新增 `semantic_features.corpus_scope` 配置，官方复现用 `official_full_dataset`，论文主实验用 `train_only`。
 - GraphSAGE 无边特征（任务说明 §14.2 已说明）。
+- Semantic MLP 是独立非图基线，不使用历史邻居、不使用多尺度、不使用门控。
