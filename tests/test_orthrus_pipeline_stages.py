@@ -61,11 +61,13 @@ def mock_cfg():
 
 
 @pytest.fixture
-def mock_args():
+def mock_args(tmp_path):
     args = MagicMock()
     args.run_from_training = False
     args.stages = None
     args.skip_tracing = False
+    # Isolate artifact path resolution to tmp_path
+    args.artifact_root = str(tmp_path / "artifacts")
     return args
 
 
@@ -210,9 +212,11 @@ class TestStageConflict:
 # -------------------------------------------------------------------------- #
 # Trace gating — integration tests with all stage functions mocked
 # -------------------------------------------------------------------------- #
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
 class TestTraceGating:
 
     @requires_torch
+    @patch("orthrus.resolve_artifact_paths")
     @patch('orthrus._check_artifact_prerequisites')
     @patch('orthrus.wandb')
     @patch('orthrus.orthrus_gnn_training')
@@ -225,13 +229,14 @@ class TestTraceGating:
     def test_trace_called_when_in_stages_and_run_tracing_true(
             self, m_embed, m_w2v, m_graphs,
             m_tracing, m_eval, m_test, m_train, m_wandb,
-            m_check, mock_cfg, mock_args):
+            m_check, m_artifacts, mock_cfg, mock_args):
         """When trace in stages and run_tracing=True, tracing.main is called."""
         import orthrus
 
         mock_args.stages = "preprocess,train,test,evaluate,trace"
         mock_cfg.pipeline.run_tracing = True
-        m_wandb.run = MagicMock()  # active wandb run
+        m_wandb.run = MagicMock()
+        m_artifacts.return_value = mock_args.artifact_root  # unused but satisfied
 
         result = orthrus.main(mock_cfg, mock_args)
 
@@ -239,6 +244,7 @@ class TestTraceGating:
         assert "time_total" in result
 
     @requires_torch
+    @patch("orthrus.resolve_artifact_paths")
     @patch('orthrus._check_artifact_prerequisites')
     @patch('orthrus.wandb')
     @patch('orthrus.orthrus_gnn_training')
@@ -251,19 +257,21 @@ class TestTraceGating:
     def test_trace_not_called_when_stages_omits_trace(
             self, m_embed, m_w2v, m_graphs,
             m_tracing, m_eval, m_test, m_train, m_wandb,
-            m_check, mock_cfg, mock_args):
+            m_check, m_artifacts, mock_cfg, mock_args):
         """When trace not in stages, tracing.main is NOT called."""
         import orthrus
 
         mock_args.stages = "preprocess,train,test,evaluate"
         mock_cfg.pipeline.run_tracing = True
         m_wandb.run = MagicMock()
+        m_artifacts.return_value = mock_args.artifact_root
 
         orthrus.main(mock_cfg, mock_args)
 
         m_tracing.main.assert_not_called()
 
     @requires_torch
+    @patch("orthrus.resolve_artifact_paths")
     @patch('orthrus._check_artifact_prerequisites')
     @patch('orthrus.wandb')
     @patch('orthrus.orthrus_gnn_training')
@@ -276,19 +284,21 @@ class TestTraceGating:
     def test_trace_not_called_when_run_tracing_false(
             self, m_embed, m_w2v, m_graphs,
             m_tracing, m_eval, m_test, m_train, m_wandb,
-            m_check, mock_cfg, mock_args):
+            m_check, m_artifacts, mock_cfg, mock_args):
         """When run_tracing=False (pipeline default or --skip-tracing), tracing.main NOT called."""
         import orthrus
 
         mock_args.stages = "preprocess,train,test,evaluate,trace"
         mock_cfg.pipeline.run_tracing = False
         m_wandb.run = MagicMock()
+        m_artifacts.return_value = mock_args.artifact_root
 
         orthrus.main(mock_cfg, mock_args)
 
         m_tracing.main.assert_not_called()
 
     @requires_torch
+    @patch("orthrus.resolve_artifact_paths")
     @patch('orthrus._check_artifact_prerequisites')
     @patch('orthrus.wandb')
     @patch('orthrus.orthrus_gnn_training')
@@ -301,13 +311,14 @@ class TestTraceGating:
     def test_preprocess_calls_three_substages_in_order(
             self, m_embed, m_w2v, m_graphs,
             m_tracing, m_eval, m_test, m_train, m_wandb,
-            m_check, mock_cfg, mock_args):
+            m_check, m_artifacts, mock_cfg, mock_args):
         """--stages preprocess calls build_graphs, embed_nodes, embed_edges in order."""
         import orthrus
 
         mock_args.stages = "preprocess"
         mock_cfg.pipeline.run_tracing = True
         m_wandb.run = MagicMock()
+        m_artifacts.return_value = mock_args.artifact_root
 
         orthrus.main(mock_cfg, mock_args)
 
@@ -321,6 +332,7 @@ class TestTraceGating:
         m_tracing.main.assert_not_called()
 
     @requires_torch
+    @patch("orthrus.resolve_artifact_paths")
     @patch('orthrus._check_artifact_prerequisites')
     @patch('orthrus.wandb')
     @patch('orthrus.orthrus_gnn_training')
@@ -333,13 +345,14 @@ class TestTraceGating:
     def test_train_only_calls_training(
             self, m_embed, m_w2v, m_graphs,
             m_tracing, m_eval, m_test, m_train, m_wandb,
-            m_check, mock_cfg, mock_args):
+            m_check, m_artifacts, mock_cfg, mock_args):
         """--stages preprocess,train,test,evaluate calls each detection stage once."""
         import orthrus
 
         mock_args.stages = "preprocess,train,test,evaluate"
         mock_cfg.pipeline.run_tracing = True
         m_wandb.run = MagicMock()
+        m_artifacts.return_value = mock_args.artifact_root
 
         orthrus.main(mock_cfg, mock_args)
 
@@ -348,6 +361,7 @@ class TestTraceGating:
         m_eval.main.assert_called_once_with(mock_cfg)
 
     @requires_torch
+    @patch("orthrus.resolve_artifact_paths")
     @patch('orthrus._check_artifact_prerequisites')
     @patch('orthrus.wandb')
     @patch('orthrus.orthrus_gnn_training')
@@ -360,13 +374,14 @@ class TestTraceGating:
     def test_stages_test_evaluate_calls_test_and_eval_not_train(
             self, m_embed, m_w2v, m_graphs,
             m_tracing, m_eval, m_test, m_train, m_wandb,
-            m_check, mock_cfg, mock_args):
+            m_check, m_artifacts, mock_cfg, mock_args):
         """--stages test,evaluate (after train) calls test+eval but not train or preprocess."""
         import orthrus
 
         mock_args.stages = "test,evaluate"
         mock_cfg.pipeline.run_tracing = True
         m_wandb.run = MagicMock()
+        m_artifacts.return_value = mock_args.artifact_root
 
         orthrus.main(mock_cfg, mock_args)
 
@@ -375,6 +390,7 @@ class TestTraceGating:
         m_eval.main.assert_called_once_with(mock_cfg)
 
     @requires_torch
+    @patch("orthrus.resolve_artifact_paths")
     @patch('orthrus._check_artifact_prerequisites')
     @patch('orthrus.wandb')
     @patch('orthrus.orthrus_gnn_training')
@@ -387,7 +403,7 @@ class TestTraceGating:
     def test_default_no_stages_no_run_from_training_includes_trace(
             self, m_embed, m_w2v, m_graphs,
             m_tracing, m_eval, m_test, m_train, m_wandb,
-            m_check, mock_cfg, mock_args):
+            m_check, m_artifacts, mock_cfg, mock_args):
         """Default (no --stages, no --run_from_training) runs full pipeline with trace."""
         import orthrus
 
@@ -395,6 +411,7 @@ class TestTraceGating:
         mock_args.run_from_training = False
         mock_cfg.pipeline.run_tracing = True
         m_wandb.run = MagicMock()
+        m_artifacts.return_value = mock_args.artifact_root
 
         orthrus.main(mock_cfg, mock_args)
 

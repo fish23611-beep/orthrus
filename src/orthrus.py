@@ -2,6 +2,7 @@ import argparse
 import os
 import random
 import time as time_module
+from datetime import datetime, timezone
 
 import torch
 import wandb
@@ -37,6 +38,10 @@ from pipeline_stages import (
     parse_stages as _parse_stages,
     check_conflict as _check_conflict,
 )
+
+from artifact_paths import resolve_artifact_paths
+from run_metadata import dump_environment, dump_config, dump_runtime
+from wandb_control import resolve_wandb_mode, init_wandb, wandb_log, wandb_finish
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +218,7 @@ def main(cfg, args, **kwargs):
 
     log("==" * 30)
     if wandb.run is not None:
-        wandb.log(time_consumption)
+        wandb_log(time_consumption)
 
     return time_consumption
 
@@ -221,24 +226,68 @@ def main(cfg, args, **kwargs):
 if __name__ == '__main__':
     args, unknown_args = get_runtime_required_args(return_unknown_args=True)
 
-    exp_name = args.exp if args.exp != "" else \
-        args.__dict__["dataset"]
-        # "|".join([f"{k.split('.')[-1]}={v}" for k, v in args.__dict__.items() if "." in k and v is not None])
-    tags = args.tags.split(",") if args.tags != "" else [args.model]
-
-    wandb.init(
-        mode="online" if args.wandb else "disabled",
-        project="orthrus_repo",  # Can be changed
-        name=exp_name,
-        tags=tags,
-    )
-
     if len(unknown_args) > 0:
         raise argparse.ArgumentTypeError(f"Unknown args {unknown_args}")
 
-    cfg = get_yml_cfg(args)
-    wandb.config.update(remove_underscore_keys(dict(cfg), keys_to_keep=["_task_path"]))
+    # ------------------------------------------------------------------ #
+    # 0. W&B mode resolution
+    # ------------------------------------------------------------------ #
+    # Pre-create cfg so we can read logging.wandb_mode before full init.
+    cfg_pre = get_yml_cfg(args)
+    wandb_mode = resolve_wandb_mode(cfg_pre, args)
 
-    main(cfg, args)
+    # ------------------------------------------------------------------ #
+    # 1. Artifact root + run dir resolution
+    # ------------------------------------------------------------------ #
+    # Parse stages for artifact path resolution
+    stages = _parse_stages(args.stages, args.run_from_training)
 
-    wandb.finish()
+    # Resolve artifact paths.  create_dirs=True so stage sub-directories are created.
+    # If cfg fields are invalid, ValueError is raised;
+    # the caller is responsible for providing valid cfg in production.
+    cli_root = getattr(args, "artifact_root", None)
+    env_root = os.environ.get("ORTHRUS_ARTIFACT_ROOT", None)
+    run_dir = resolve_artifact_paths(
+        cfg_pre, stages,
+        cli_artifact_root=cli_root,
+        env_artifact_root=env_root,
+        create_dirs=True,
+    )
+
+    # ------------------------------------------------------------------ #
+    # 2. Write run metadata (environment + resolved config)
+    # ------------------------------------------------------------------ #
+    cfg_pre._run_start_time = datetime.now(timezone.utc).isoformat()
+    dump_environment(run_dir)
+    dump_config(cfg_pre, run_dir)
+
+    # ------------------------------------------------------------------ #
+    # 3. W&B initialisation
+    # ------------------------------------------------------------------ #
+    init_wandb(cfg_pre, args, wandb_mode)
+
+    # ------------------------------------------------------------------ #
+    # 4. Run pipeline
+    # ------------------------------------------------------------------ #
+    try:
+        timing = main(cfg_pre, args)
+        status = "completed"
+        error_msg = None
+    except Exception as exc:
+        status = "failed"
+        error_msg = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        # ------------------------------------------------------------------ #
+        # 5. Write runtime.json and clean up
+        # ------------------------------------------------------------------ #
+        dump_runtime(
+            cfg_pre,
+            run_dir,
+            status=status,
+            executed_stages=stages,
+            timing=timing if "timing" in dir() else {},
+            wandb_mode=wandb_mode,
+            error_message=error_msg if "error_msg" in dir() else None,
+        )
+        wandb_finish()

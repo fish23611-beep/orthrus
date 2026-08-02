@@ -52,31 +52,49 @@ requires_config = pytest.mark.skipif(
 
 
 # -------------------------------------------------------------------------- #
-# Shared fixture — patches all pipeline stage functions so tests never
-# touch the filesystem, database, or external services.
+# Shared fixture — patches all pipeline stage functions and artifact resolution
+# so tests never touch the filesystem, database, or external services.
 # -------------------------------------------------------------------------- #
 @pytest.fixture
-def mock_pipeline_runtime():
-    """Patch all pipeline stage functions and wandb.
+def mock_pipeline_runtime(tmp_path):
+    """
+    Patch all pipeline stage functions, artifact path resolution, and wandb.
 
     Returns a dict of MagicMock objects keyed by stage name.
     Does NOT patch _check_artifact_prerequisites (that is tested separately
     in TestArtifactPrerequisites).
     """
+    # Stable run_dir within tmp_path
+    run_dir = tmp_path / "run"
+
+    def _patched_resolve(cfg, stages, *, cli_artifact_root=None,
+                         env_artifact_root=None, run_dir=None, create_dirs=True):
+        # Write valid fields into cfg so downstream code that reads them doesn't break
+        cfg._artifact_root = tmp_path / "artifacts"
+        cfg._run_dir       = run_dir
+        cfg._stages        = list(stages)
+        cfg.detection.gnn_training._trained_models_dir = str(run_dir / "checkpoints")
+        cfg.detection.gnn_testing._edge_losses_dir     = str(run_dir / "edge_scores")
+        cfg.detection.evaluation.node_evaluation._precision_recall_dir = str(run_dir / "node_scores")
+        return run_dir
+
     with ExitStack() as stack:
         mocks = {
-            "build_graphs":  stack.enter_context(patch("orthrus.build_orthrus_graphs.main")),
-            "embed_nodes":    stack.enter_context(patch("orthrus.build_feature_word2vec.main")),
-            "embed_edges":    stack.enter_context(patch("orthrus.embed_edges_feature_word2vec.main")),
-            "train":          stack.enter_context(patch("orthrus.orthrus_gnn_training.main")),
-            "test":           stack.enter_context(patch("orthrus.orthrus_gnn_testing.main")),
-            "evaluate":       stack.enter_context(patch("orthrus.evaluation.main")),
-            "trace":          stack.enter_context(patch("orthrus.tracing.main")),
-            "artifact_check": stack.enter_context(patch("orthrus._check_artifact_prerequisites")),
-            "wandb":         stack.enter_context(patch("orthrus.wandb")),
+            "build_graphs":   stack.enter_context(patch("orthrus.build_orthrus_graphs.main")),
+            "embed_nodes":     stack.enter_context(patch("orthrus.build_feature_word2vec.main")),
+            "embed_edges":     stack.enter_context(patch("orthrus.embed_edges_feature_word2vec.main")),
+            "train":           stack.enter_context(patch("orthrus.orthrus_gnn_training.main")),
+            "test":            stack.enter_context(patch("orthrus.orthrus_gnn_testing.main")),
+            "evaluate":        stack.enter_context(patch("orthrus.evaluation.main")),
+            "trace":           stack.enter_context(patch("orthrus.tracing.main")),
+            "artifact_check":  stack.enter_context(patch("orthrus._check_artifact_prerequisites")),
+            "wandb":          stack.enter_context(patch("orthrus.wandb")),
+            "resolve_artifact_paths": stack.enter_context(
+                patch("orthrus.resolve_artifact_paths", side_effect=_patched_resolve)
+            ),
         }
-        # Simulate no active wandb run so wandb.log calls are no-ops
         mocks["wandb"].run = None
+        mocks["resolve_artifact_paths"].return_value = run_dir
         yield mocks
 
 
@@ -86,7 +104,8 @@ def mock_pipeline_runtime():
 class TestRunFromTrainingTiming:
 
     @requires_torch
-    def test_run_from_training_no_nameerror(self, mock_pipeline_runtime):
+    @patch("orthrus.resolve_artifact_paths")
+    def test_run_from_training_no_nameerror(self, m_artifacts, mock_pipeline_runtime):
         """--run_from_training must not raise NameError for any timing variable.
 
         Verifies: train/test/evaluate called, trace not called,
@@ -98,11 +117,14 @@ class TestRunFromTrainingTiming:
         args.run_from_training = True
         args.stages = None
         args.skip_tracing = False
+        args.artifact_root = str(mock_pipeline_runtime["resolve_artifact_paths"].return_value.parent / "artifacts")
 
         cfg = MagicMock()
         cfg.pipeline = MagicMock()
         cfg.pipeline.run_tracing = True
         cfg.detection.gnn_training.use_seed = False
+
+        m_artifacts.return_value = mock_pipeline_runtime["resolve_artifact_paths"].return_value
 
         result = orthrus.main(cfg, args)
 
@@ -124,7 +146,8 @@ class TestRunFromTrainingTiming:
         assert 'time_tracing' in result
 
     @requires_torch
-    def test_preprocess_timing_is_zero_when_skipped(self, mock_pipeline_runtime):
+    @patch("orthrus.resolve_artifact_paths")
+    def test_preprocess_timing_is_zero_when_skipped(self, m_artifacts, mock_pipeline_runtime):
         """When preprocess is skipped, time_build_graphs / embed_nodes / embed_edges are 0.0."""
         import orthrus
 
@@ -132,11 +155,14 @@ class TestRunFromTrainingTiming:
         args.run_from_training = True
         args.stages = None
         args.skip_tracing = True
+        args.artifact_root = str(mock_pipeline_runtime["resolve_artifact_paths"].return_value.parent / "artifacts")
 
         cfg = MagicMock()
         cfg.pipeline = MagicMock()
         cfg.pipeline.run_tracing = False
         cfg.detection.gnn_training.use_seed = False
+
+        m_artifacts.return_value = mock_pipeline_runtime["resolve_artifact_paths"].return_value
 
         result = orthrus.main(cfg, args)
 
@@ -145,7 +171,8 @@ class TestRunFromTrainingTiming:
             assert result[key] == 0.0, f"{key} should be 0.0 when preprocess skipped, got {result[key]}"
 
     @requires_torch
-    def test_train_test_evaluate_timing_fields_present(self, mock_pipeline_runtime):
+    @patch("orthrus.resolve_artifact_paths")
+    def test_train_test_evaluate_timing_fields_present(self, m_artifacts, mock_pipeline_runtime):
         """train/test/evaluate timing fields are present and numeric when stages run."""
         import orthrus
 
@@ -153,11 +180,14 @@ class TestRunFromTrainingTiming:
         args.run_from_training = True
         args.stages = None
         args.skip_tracing = True
+        args.artifact_root = str(mock_pipeline_runtime["resolve_artifact_paths"].return_value.parent / "artifacts")
 
         cfg = MagicMock()
         cfg.pipeline = MagicMock()
         cfg.pipeline.run_tracing = False
         cfg.detection.gnn_training.use_seed = False
+
+        m_artifacts.return_value = mock_pipeline_runtime["resolve_artifact_paths"].return_value
 
         result = orthrus.main(cfg, args)
 
@@ -167,7 +197,8 @@ class TestRunFromTrainingTiming:
             assert result[key] >= 0.0, f"{key} should be >= 0.0"
 
     @requires_torch
-    def test_time_total_always_present(self, mock_pipeline_runtime):
+    @patch("orthrus.resolve_artifact_paths")
+    def test_time_total_always_present(self, m_artifacts, mock_pipeline_runtime):
         """time_total is always present regardless of which stages run."""
         import orthrus
 
@@ -175,11 +206,14 @@ class TestRunFromTrainingTiming:
         args.run_from_training = True
         args.stages = None
         args.skip_tracing = True
+        args.artifact_root = str(mock_pipeline_runtime["resolve_artifact_paths"].return_value.parent / "artifacts")
 
         cfg = MagicMock()
         cfg.pipeline = MagicMock()
         cfg.pipeline.run_tracing = False
         cfg.detection.gnn_training.use_seed = False
+
+        m_artifacts.return_value = mock_pipeline_runtime["resolve_artifact_paths"].return_value
 
         result = orthrus.main(cfg, args)
 
@@ -188,7 +222,8 @@ class TestRunFromTrainingTiming:
         assert result['time_total'] >= 0.0
 
     @requires_torch
-    def test_time_tracing_is_zero_when_skipped(self, mock_pipeline_runtime):
+    @patch("orthrus.resolve_artifact_paths")
+    def test_time_tracing_is_zero_when_skipped(self, m_artifacts, mock_pipeline_runtime):
         """time_tracing is 0.0 when tracing is skipped (trace not in stages, run_tracing=False)."""
         import orthrus
 
@@ -196,11 +231,14 @@ class TestRunFromTrainingTiming:
         args.run_from_training = False
         args.stages = "train,test,evaluate"
         args.skip_tracing = True
+        args.artifact_root = str(mock_pipeline_runtime["resolve_artifact_paths"].return_value.parent / "artifacts")
 
         cfg = MagicMock()
         cfg.pipeline = MagicMock()
         cfg.pipeline.run_tracing = False
         cfg.detection.gnn_training.use_seed = False
+
+        m_artifacts.return_value = mock_pipeline_runtime["resolve_artifact_paths"].return_value
 
         result = orthrus.main(cfg, args)
 
@@ -214,6 +252,7 @@ class TestRunFromTrainingTiming:
 class TestRunFromTrainingStageConflict:
 
     @requires_torch
+    @patch("orthrus.resolve_artifact_paths")
     @patch('orthrus.log')
     @patch('orthrus.evaluation')
     @patch('orthrus.orthrus_gnn_testing')
@@ -226,7 +265,8 @@ class TestRunFromTrainingStageConflict:
     @patch('orthrus.wandb')
     def test_both_set_logs_warning_and_continues(
             self, m_wandb, m_check, m_tracing, m_build_graphs,
-            m_embed_nodes, m_embed_edges, m_train, m_test, m_eval, m_log):
+            m_embed_nodes, m_embed_edges, m_train, m_test, m_eval, m_log,
+            m_artifacts):
         """Both --stages and --run_from_training set: prints deprecation warning,
         uses --stages, calls train+test exactly once each, does not call any
         other stage, and returns a timing dict.
@@ -240,12 +280,14 @@ class TestRunFromTrainingStageConflict:
         args.run_from_training = True
         args.stages = "train,test"
         args.skip_tracing = False
+        args.artifact_root = str(m_artifacts.return_value.parent / "artifacts")
 
         cfg = MagicMock()
         cfg.pipeline = MagicMock()
         cfg.pipeline.run_tracing = True
         cfg.detection.gnn_training.use_seed = False
         m_wandb.run = None
+        m_artifacts.return_value = args.artifact_root  # satisfy patch
 
         result = orthrus.main(cfg, args)
 
@@ -301,7 +343,8 @@ class TestRunFromTrainingStageConflict:
         assert result['time_tracing']       == 0.0
 
     @requires_torch
-    def test_stages_alone_no_conflict(self, mock_pipeline_runtime):
+    @patch("orthrus.resolve_artifact_paths")
+    def test_stages_alone_no_conflict(self, m_artifacts, mock_pipeline_runtime):
         """--stages without --run_from_training does not raise."""
         import orthrus
 
@@ -309,17 +352,21 @@ class TestRunFromTrainingStageConflict:
         args.run_from_training = False
         args.stages = "preprocess,train"
         args.skip_tracing = False
+        args.artifact_root = str(mock_pipeline_runtime["resolve_artifact_paths"].return_value.parent / "artifacts")
 
         cfg = MagicMock()
         cfg.pipeline = MagicMock()
         cfg.pipeline.run_tracing = True
         cfg.detection.gnn_training.use_seed = False
 
+        m_artifacts.return_value = mock_pipeline_runtime["resolve_artifact_paths"].return_value
+
         result = orthrus.main(cfg, args)
         assert isinstance(result, dict)
 
     @requires_torch
-    def test_run_from_training_alone_no_conflict(self, mock_pipeline_runtime):
+    @patch("orthrus.resolve_artifact_paths")
+    def test_run_from_training_alone_no_conflict(self, m_artifacts, mock_pipeline_runtime):
         """--run_from_training without --stages does not raise."""
         import orthrus
 
@@ -327,11 +374,14 @@ class TestRunFromTrainingStageConflict:
         args.run_from_training = True
         args.stages = None
         args.skip_tracing = True
+        args.artifact_root = str(mock_pipeline_runtime["resolve_artifact_paths"].return_value.parent / "artifacts")
 
         cfg = MagicMock()
         cfg.pipeline = MagicMock()
         cfg.pipeline.run_tracing = False
         cfg.detection.gnn_training.use_seed = False
+
+        m_artifacts.return_value = mock_pipeline_runtime["resolve_artifact_paths"].return_value
 
         result = orthrus.main(cfg, args)
         assert isinstance(result, dict)
@@ -401,7 +451,8 @@ class TestSkipTracingConfig:
 class TestArtifactPrerequisites:
 
     @requires_torch
-    def test_test_stage_without_train_missing_checkpoint_dir(self, tmp_path):
+    @patch("orthrus.resolve_artifact_paths")
+    def test_test_stage_without_train_missing_checkpoint_dir(self, m_artifacts, tmp_path):
         """test without train: missing checkpoint dir raises FileNotFoundError."""
         import orthrus
 
@@ -415,6 +466,9 @@ class TestArtifactPrerequisites:
         args.run_from_training = False
         args.stages = "test"
         args.skip_tracing = False
+        args.artifact_root = str(tmp_path / "artifacts")
+
+        m_artifacts.return_value = tmp_path / "run"
 
         with pytest.raises(FileNotFoundError) as exc_info:
             orthrus.main(cfg, args)
@@ -422,7 +476,8 @@ class TestArtifactPrerequisites:
         assert "train" in str(exc_info.value).lower()
 
     @requires_torch
-    def test_test_stage_without_train_empty_checkpoint_dir(self, tmp_path):
+    @patch("orthrus.resolve_artifact_paths")
+    def test_test_stage_without_train_empty_checkpoint_dir(self, m_artifacts, tmp_path):
         """test without train: empty checkpoint dir raises FileNotFoundError."""
         import orthrus
 
@@ -439,20 +494,23 @@ class TestArtifactPrerequisites:
         args.run_from_training = False
         args.stages = "test"
         args.skip_tracing = False
+        args.artifact_root = str(tmp_path / "artifacts")
+
+        m_artifacts.return_value = tmp_path / "run"
 
         with pytest.raises(FileNotFoundError) as exc_info:
             orthrus.main(cfg, args)
         assert "empty" in str(exc_info.value).lower()
 
     @requires_torch
-    def test_test_with_train_skips_checkpoint_check(self, tmp_path):
+    @patch("orthrus.resolve_artifact_paths")
+    def test_test_with_train_skips_checkpoint_check(self, m_artifacts, tmp_path):
         """test WITH train: _check_artifact_prerequisites is called but
         no FileNotFoundError should be raised even though the checkpoint dir
         does not exist — the check is skipped when train is in stages."""
         import orthrus
 
         cfg = MagicMock()
-        # Point to a directory that does NOT exist
         cfg.detection.gnn_training._trained_models_dir = str(tmp_path / "nonexistent")
         cfg.pipeline = MagicMock()
         cfg.pipeline.run_tracing = False
@@ -462,8 +520,10 @@ class TestArtifactPrerequisites:
         args.run_from_training = False
         args.stages = "train,test"
         args.skip_tracing = False
+        args.artifact_root = str(tmp_path / "artifacts")
 
-        # Patch stage functions to prevent real training
+        m_artifacts.return_value = tmp_path / "run"
+
         with patch("orthrus.orthrus_gnn_training.main") as m_train, \
              patch("orthrus.orthrus_gnn_testing.main") as m_test, \
              patch("orthrus.wandb") as m_wandb:
@@ -477,7 +537,8 @@ class TestArtifactPrerequisites:
         assert isinstance(result, dict)
 
     @requires_torch
-    def test_evaluate_stage_without_test_missing_edge_losses_dir(self, tmp_path):
+    @patch("orthrus.resolve_artifact_paths")
+    def test_evaluate_stage_without_test_missing_edge_losses_dir(self, m_artifacts, tmp_path):
         """evaluate without test: missing edge-loss dir raises FileNotFoundError."""
         import orthrus
 
@@ -491,19 +552,23 @@ class TestArtifactPrerequisites:
         args.run_from_training = False
         args.stages = "evaluate"
         args.skip_tracing = False
+        args.artifact_root = str(tmp_path / "artifacts")
+
+        m_artifacts.return_value = tmp_path / "run"
 
         with pytest.raises(FileNotFoundError) as exc_info:
             orthrus.main(cfg, args)
         assert "evaluate" in str(exc_info.value).lower()
 
     @requires_torch
-    def test_evaluate_stage_without_test_no_test_split(self, tmp_path):
+    @patch("orthrus.resolve_artifact_paths")
+    def test_evaluate_stage_without_test_no_test_split(self, m_artifacts, tmp_path):
         """evaluate without test: dir exists but no 'test' split raises FileNotFoundError."""
         import orthrus
 
         edge_dir = tmp_path / "edge_losses"
         edge_dir.mkdir()
-        (edge_dir / "train").mkdir()  # wrong split — no "test" subdir
+        (edge_dir / "train").mkdir()
 
         cfg = MagicMock()
         cfg.detection.gnn_testing._edge_losses_dir = str(edge_dir)
@@ -515,30 +580,24 @@ class TestArtifactPrerequisites:
         args.run_from_training = False
         args.stages = "evaluate"
         args.skip_tracing = False
+        args.artifact_root = str(tmp_path / "artifacts")
+
+        m_artifacts.return_value = tmp_path / "run"
 
         with pytest.raises(FileNotFoundError) as exc_info:
             orthrus.main(cfg, args)
         assert "test" in str(exc_info.value).lower()
 
     @requires_torch
-    def test_evaluate_with_test_skips_test_output_check_but_requires_model(self, tmp_path):
-        """test,evaluate run together: evaluate does not check for prior test output,
-        but if train is NOT in stages the checkpoint dir must exist and be non-empty.
-
-        Setup:
-        - train NOT in stages → artifact check for model weights MUST pass
-        - test IS in stages    → no artifact check for edge-loss output
-        - evaluate IS in stages → no artifact check for edge-loss output
-        """
+    @patch("orthrus.resolve_artifact_paths")
+    def test_evaluate_with_test_skips_test_output_check(self, m_artifacts, tmp_path):
+        """test,evaluate run together: evaluate does not check for prior test output."""
         import orthrus
 
-        # Real checkpoint dir with a fake weight file — satisfies the model check
         checkpoint_dir = tmp_path / "checkpoints"
         checkpoint_dir.mkdir()
         (checkpoint_dir / "model_epoch_1.pt").touch()
 
-        # Edge-loss dir does NOT exist — but this should NOT be checked
-        # because test IS in the current stages
         edge_losses_dir = tmp_path / "edge_losses"
 
         cfg = MagicMock()
@@ -552,6 +611,9 @@ class TestArtifactPrerequisites:
         args.run_from_training = False
         args.stages = "test,evaluate"
         args.skip_tracing = False
+        args.artifact_root = str(tmp_path / "artifacts")
+
+        m_artifacts.return_value = tmp_path / "run"
 
         with patch("orthrus.orthrus_gnn_testing.main") as m_test, \
              patch("orthrus.evaluation.main") as m_eval, \
@@ -561,7 +623,6 @@ class TestArtifactPrerequisites:
             m_eval.return_value = None
             result = orthrus.main(cfg, args)
 
-        # test and evaluate both ran; no FileNotFoundError raised
         m_test.assert_called_once()
         m_eval.assert_called_once()
         assert isinstance(result, dict)
@@ -602,6 +663,7 @@ class TestTimingCompleteness:
         args.run_from_training = False
         args.stages = stages
         args.skip_tracing = False
+        args.artifact_root = str(mock_pipeline_runtime["resolve_artifact_paths"].return_value.parent / "artifacts")
 
         cfg = MagicMock()
         cfg.pipeline = MagicMock()

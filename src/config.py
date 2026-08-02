@@ -292,6 +292,10 @@ def get_default_cfg(args):
      cfg.model_selection.method = "min_val_mean_edge_loss"  # ["min_val_mean_edge_loss", "last_epoch"]
      cfg.model_selection.legacy_test_selection_enabled = False  # True=select by test MCC (leakage); DISABLED — raises ValueError
 
+     # Logging / W&B
+     cfg.logging = CN()
+     cfg.logging.wandb_mode = None   # None=unset (use --wandb / default), "disabled"/"offline"/"online"
+
      # Database: we simply create variables for all configurations described in the dict
      cfg.database = CN()
      for attr, value in DATABASE_DEFAULT_CONFIG.items():
@@ -338,6 +342,11 @@ def get_runtime_required_args(return_unknown_args=False, args=None):
                               "'all' runs everything. If omitted, behavior depends on --run_from_training.")
      parser.add_argument('--skip-tracing', action='store_true',
                          help="Skip attack reconstruction (tracing) stage. Overrides pipeline.run_tracing to False.")
+     parser.add_argument('--artifact-root', type=str, default=None,
+                         dest='artifact_root', metavar='PATH',
+                         help="Root directory for all artifacts. "
+                              "Takes precedence over the ORTHRUS_ARTIFACT_ROOT environment variable. "
+                              "Default: ./artifacts (or ORTHRUS_ARTIFACT_ROOT if set).")
 
      # All args in the cfg can be also set in the arg parser from CLI
      parser = add_cfg_args_to_parser(TASK_ARGS, parser)
@@ -349,7 +358,7 @@ def get_runtime_required_args(return_unknown_args=False, args=None):
           sys.exit(1)
 
      args.model = "orthrus"
-     
+
      if return_unknown_args:
           return args, unknown_args
      return args
@@ -497,7 +506,7 @@ def check_task_dependency_graph(yml_file: str):
 def get_yml_cfg(args):
      # Checks that CLI args are OK
      check_args(args)
-     
+
      # Inits with default configurations
      cfg = get_default_cfg(args)
 
@@ -508,11 +517,17 @@ def get_yml_cfg(args):
 
      # Overrides default config with config from yml file
      cfg.merge_from_file(yml_file)
-     
+
      # Overwrites args to the cfg
      overwrite_cfg_with_args(cfg, args)
 
-     # Asserts all required configurations are present in the final cfg
+     # Handle --artifact-root explicitly (non-dotted CLI arg, not processed by overwrite_cfg_with_args)
+     artifact_root_raw = getattr(args, "artifact_root", None)
+     if artifact_root_raw is not None:
+         from artifact_paths import resolve_artifact_root
+         cfg._artifact_root_raw = artifact_root_raw
+
+     # Checks args after all overrides are applied
      check_task_dependency_graph(yml_file)
 
      # Based on the defined restart args, computes a unique path on disk
