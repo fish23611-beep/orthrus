@@ -287,6 +287,11 @@ def get_default_cfg(args):
      if getattr(args, 'skip_tracing', False):
          cfg.pipeline.run_tracing = False
 
+     # Epoch / model selection
+     cfg.model_selection = CN()
+     cfg.model_selection.method = "min_val_mean_edge_loss"  # ["min_val_mean_edge_loss", "last_epoch"]
+     cfg.model_selection.legacy_test_selection_enabled = False  # True=select by test MCC (leakage); DISABLED — raises ValueError
+
      # Database: we simply create variables for all configurations described in the dict
      cfg.database = CN()
      for attr, value in DATABASE_DEFAULT_CONFIG.items():
