@@ -101,7 +101,10 @@ def main(cfg, args, **kwargs):
     # ------------------------------------------------------------------
     # 1. Parse stages + resolve tracing
     # ------------------------------------------------------------------
-    _check_conflict(args.stages, args.run_from_training)
+    conflict_warning = _check_conflict(args.stages, args.run_from_training)
+    if conflict_warning is not None:
+        log(conflict_warning)
+        # When both are set, --stages takes precedence; run_from_training is ignored.
 
     stages = _parse_stages(args.stages, args.run_from_training)
 

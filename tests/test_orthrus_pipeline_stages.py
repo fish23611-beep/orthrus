@@ -184,24 +184,27 @@ class TestParseStages:
 class TestStageConflict:
 
     def test_no_conflict_no_stages(self):
-        """No --stages, no --run_from_training → no conflict."""
-        _check_conflict(None, run_from_training=False)  # should not raise
+        """No --stages, no --run_from_training → no warning."""
+        result = _check_conflict(None, run_from_training=False)
+        assert result is None
 
     def test_no_conflict_stages_only(self):
-        """--stages without --run_from_training → no conflict."""
-        _check_conflict("train,test", run_from_training=False)  # should not raise
+        """--stages without --run_from_training → no warning."""
+        result = _check_conflict("train,test", run_from_training=False)
+        assert result is None
 
     def test_no_conflict_run_from_training_only(self):
-        """--run_from_training without --stages → no conflict."""
-        _check_conflict(None, run_from_training=True)  # should not raise
+        """--run_from_training without --stages → no warning."""
+        result = _check_conflict(None, run_from_training=True)
+        assert result is None
 
-    def test_conflict_raises(self):
-        """Both --stages and --run_from_training → ValueError."""
-        with pytest.raises(ValueError) as exc_info:
-            _check_conflict("train,test", run_from_training=True)
-        assert "conflict" in str(exc_info.value).lower()
-        assert "--stages" in str(exc_info.value)
-        assert "--run_from_training" in str(exc_info.value)
+    def test_both_set_returns_warning(self):
+        """Both --stages and --run_from_training → deprecation warning (no exception)."""
+        result = _check_conflict("train,test", run_from_training=True)
+        assert result is not None
+        assert "warning" in result.lower()
+        assert "--stages" in result
+        assert "--run_from_training" in result
 
 
 # -------------------------------------------------------------------------- #

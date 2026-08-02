@@ -17,6 +17,9 @@ def parse_stages(stages_str, run_from_training):
     """
     Parse --stages CLI argument and resolve effective stages.
 
+    When both --stages and --run_from_training are set, --stages takes precedence
+    and a deprecation warning is logged (handled in orthrus.main).
+
     Returns:
         ordered list of canonical stage names (preprocess/train/test/evaluate/trace)
     """
@@ -47,10 +50,20 @@ def parse_stages(stages_str, run_from_training):
 
 
 def check_conflict(stages_str, run_from_training):
-    """Raise ValueError if --stages and --run_from_training conflict."""
+    """
+    Check for conflicting arguments.
+
+    When both --stages and --run_from_training are set, a warning is returned
+    (not raised) so orthrus.main can log it and continue.  The --stages value
+    takes precedence.
+
+    Returns:
+        str | None: deprecation warning message, or None if no conflict.
+    """
     if stages_str is not None and run_from_training:
-        raise ValueError(
-            "Conflicting arguments: --stages and --run_from_training cannot both be set. "
-            "Use --stages alone to control the pipeline; --run_from_training is deprecated "
-            "in favour of explicit --stages."
+        return (
+            "WARNING: --run_from_training is deprecated when --stages is also set. "
+            "Ignoring --run_from_training; using explicit --stages. "
+            "Run without --stages to use --run_from_training."
         )
+    return None

@@ -214,8 +214,26 @@ class TestRunFromTrainingTiming:
 class TestRunFromTrainingStageConflict:
 
     @requires_torch
-    def test_both_set_raises_valueerror(self):
-        """Providing both --run_from_training and --stages raises ValueError."""
+    @patch('orthrus.log')
+    @patch('orthrus.evaluation')
+    @patch('orthrus.orthrus_gnn_testing')
+    @patch('orthrus.orthrus_gnn_training')
+    @patch('orthrus.embed_edges_feature_word2vec')
+    @patch('orthrus.build_feature_word2vec')
+    @patch('orthrus.build_orthrus_graphs')
+    @patch('orthrus.tracing')
+    @patch('orthrus._check_artifact_prerequisites')
+    @patch('orthrus.wandb')
+    def test_both_set_logs_warning_and_continues(
+            self, m_wandb, m_check, m_tracing, m_build_graphs,
+            m_embed_nodes, m_embed_edges, m_train, m_test, m_eval, m_log):
+        """Both --stages and --run_from_training set: prints deprecation warning,
+        uses --stages, calls train+test exactly once each, does not call any
+        other stage, and returns a timing dict.
+
+        Critically: this test does NOT touch the filesystem, database, or run
+        any real training. All stage entry points are patched.
+        """
         import orthrus
 
         args = MagicMock()
@@ -227,10 +245,60 @@ class TestRunFromTrainingStageConflict:
         cfg.pipeline = MagicMock()
         cfg.pipeline.run_tracing = True
         cfg.detection.gnn_training.use_seed = False
+        m_wandb.run = None
 
-        with pytest.raises(ValueError) as exc_info:
-            orthrus.main(cfg, args)
-        assert "conflict" in str(exc_info.value).lower()
+        result = orthrus.main(cfg, args)
+
+        # --stages takes precedence: train + test each called exactly once
+        m_train.main.assert_called_once_with(cfg)
+        m_test.main.assert_called_once_with(cfg)
+
+        # preprocess / evaluate / trace must NOT be called
+        m_build_graphs.main.assert_not_called()
+        m_embed_nodes.main.assert_not_called()
+        m_embed_edges.main.assert_not_called()
+        m_eval.main.assert_not_called()
+        m_tracing.main.assert_not_called()
+
+        # A deprecation warning naming both flags must have been logged.
+        # We do not use assert_called_once because main emits many log calls.
+        # Flatten positional + keyword args from every log() invocation into
+        # a single text blob, then check for the required substrings.
+        def _flatten(call_args):
+            """Yield every string-ish fragment from a call.args / call.kwargs pair."""
+            for arg in call_args.args:
+                if isinstance(arg, str):
+                    yield arg
+                else:
+                    yield repr(arg)
+            for val in call_args.kwargs.values():
+                if isinstance(val, str):
+                    yield val
+                else:
+                    yield repr(val)
+
+        all_log_text = "\n".join(
+            frag for call_args in m_log.call_args_list
+            for frag in _flatten(call_args)
+        )
+        for needle in ("--stages", "--run_from_training", "deprecated"):
+            assert needle in all_log_text, (
+                f"Expected log message containing {needle!r} when both "
+                f"--stages and --run_from_training are set; got: {all_log_text!r}"
+            )
+
+        # Main returns a complete timing dict
+        assert isinstance(result, dict)
+        assert 'time_total' in result
+        assert 'time_gnn_training' in result
+        assert 'time_gnn_testing' in result
+
+        # Preprocess / evaluate / trace timing must be 0.0
+        assert result['time_build_graphs'] == 0.0
+        assert result['time_embed_nodes'] == 0.0
+        assert result['time_embed_edges'] == 0.0
+        assert result['time_evaluation']    == 0.0
+        assert result['time_tracing']       == 0.0
 
     @requires_torch
     def test_stages_alone_no_conflict(self, mock_pipeline_runtime):
