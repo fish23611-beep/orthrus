@@ -375,8 +375,8 @@ def resolve_artifact_paths(
         run_dir = run_dir.expanduser().resolve()
 
     # 3. Write back to cfg so existing modules continue to work
-    cfg._artifact_root = artifact_root
-    cfg._run_dir      = run_dir
+    cfg._artifact_root = str(artifact_root)
+    cfg._run_dir      = str(run_dir)
     cfg._stages       = list(stages)
 
     cfg.detection.gnn_training._trained_models_dir = str(run_dir / "checkpoints")

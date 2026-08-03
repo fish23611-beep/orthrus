@@ -359,8 +359,10 @@ def test_cfg_fields_populated_without_creating_dirs(tmp_path):
     assert hasattr(cfg, "_artifact_root")
     assert hasattr(cfg, "_run_dir")
     assert cfg._stages == stages
-    assert isinstance(cfg._run_dir, Path)
-    assert cfg._run_dir == run_dir
+    # yacs requires _artifact_root and _run_dir to be str (not Path)
+    assert isinstance(cfg._artifact_root, str), f"_artifact_root must be str, got {type(cfg._artifact_root)}"
+    assert isinstance(cfg._run_dir, str), f"_run_dir must be str, got {type(cfg._run_dir)}"
+    assert Path(cfg._run_dir) == run_dir, f"_run_dir should equal computed path"
 
 
 def test_cfg_output_dirs_mapped(tmp_path):
@@ -370,7 +372,8 @@ def test_cfg_output_dirs_mapped(tmp_path):
     cfg = _make_cfg(dataset="THEIA_E3", model="orthrus", seed=0)
     resolve_artifact_paths(cfg, ["train", "test", "evaluate"], create_dirs=False)
 
-    run_dir = cfg._run_dir
+    # _run_dir is now str (for yacs compat); convert to Path for path ops
+    run_dir = Path(cfg._run_dir)
     assert cfg.detection.gnn_training._trained_models_dir == str(run_dir / "checkpoints")
     assert cfg.detection.gnn_testing._edge_losses_dir == str(run_dir / "edge_scores")
     assert cfg.detection.evaluation.node_evaluation._precision_recall_dir == str(run_dir / "node_scores")
@@ -385,7 +388,7 @@ def test_explicit_run_dir_bypasses_derivation(tmp_path):
     explicit.mkdir(parents=True)
     resolve_artifact_paths(cfg, ["train"], run_dir=explicit, create_dirs=False)
 
-    assert cfg._run_dir == explicit
+    assert cfg._run_dir == str(explicit)
 
 
 def test_magicmock_cfg_raises_valueerror():
@@ -421,9 +424,9 @@ def test_default_artifacts_resolved_under_cwd(tmp_path, monkeypatch):
     run_dir = resolve_artifact_paths(cfg, ["train"])
 
     expected = (tmp_path / DEFAULT_ARTIFACT_ROOT.name / "THEIA_E3" / "runs" / "orthrus" / "seed_0").resolve()
-    assert cfg._run_dir == expected
+    assert cfg._run_dir == str(expected)
     # Directories created in tmp_path, not project root
-    assert cfg._run_dir.is_relative_to(tmp_path)
+    assert Path(cfg._run_dir).is_relative_to(tmp_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -438,7 +441,7 @@ def test_selected_stages_only_get_dirs(tmp_path, monkeypatch):
     cfg = _make_cfg(dataset="THEIA_E3", model="orthrus", seed=0)
     resolve_artifact_paths(cfg, ["train", "test", "evaluate"])
 
-    run_dir = cfg._run_dir
+    run_dir = Path(cfg._run_dir)
     assert (run_dir / "checkpoints").is_dir()
     assert (run_dir / "edge_scores").is_dir()
     assert (run_dir / "node_scores").is_dir()
