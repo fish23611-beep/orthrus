@@ -1,10 +1,10 @@
-import argparse
+﻿import argparse
 import os
 import random
 import time as time_module
 
 import torch
-import wandb
+import wandb  # noqa: F401 - kept for backward compatibility with existing tests
 import numpy as np
 from provnet_utils import remove_underscore_keys, log
 
@@ -38,6 +38,72 @@ from pipeline_stages import (
     check_conflict as _check_conflict,
 )
 
+# C2: Import wandb_control for mode-aware W&B initialization
+try:
+    from wandb_control import resolve_wandb_mode, init_wandb, wandb_log, wandb_finish
+except ImportError:
+    # Fallback if wandb_control not available
+    resolve_wandb_mode = None
+    init_wandb = None
+    wandb_log = None
+    wandb_finish = None
+
+
+# ---------------------------------------------------------------------------
+# Detection-only mode helpers
+# ---------------------------------------------------------------------------
+
+def _is_detection_only_mode(cfg) -> bool:
+    """Check if pipeline mode is detection_only."""
+    return (
+        hasattr(cfg, "pipeline")
+        and hasattr(cfg.pipeline, "mode")
+        and cfg.pipeline.mode == "detection_only"
+    )
+
+
+def _check_detection_only_prerequisites(stages, cfg) -> list[str]:
+    """
+    Check that required artifacts exist for detection_only mode.
+
+    Returns list of missing artifacts. Empty list means all OK.
+    """
+    missing = []
+
+    # Check for preprocess artifacts (required even in detection_only)
+    graph_path = cfg.graph_construction.build_graphs._graphs_dir
+    if not os.path.isdir(graph_path):
+        missing.append(f"Graphs directory: {graph_path}")
+    elif not os.listdir(graph_path):
+        missing.append(f"Graphs directory is empty: {graph_path}")
+
+    w2v_path = cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir
+    if not os.path.isdir(w2v_path):
+        missing.append(f"Word2Vec models: {w2v_path}")
+
+    edge_embeds = cfg.edge_featurization.embed_edges._edge_embeds_dir
+    if not os.path.isdir(edge_embeds):
+        missing.append(f"Edge embeddings: {edge_embeds}")
+
+    # Train/checkpoint requirements
+    if "train" in stages:
+        pass  # Train will generate checkpoints
+    elif "test" in stages or "evaluate" in stages:
+        checkpoint_dir = cfg.detection.gnn_training._trained_models_dir
+        if not os.path.isdir(checkpoint_dir):
+            missing.append(f"Checkpoints: {checkpoint_dir}")
+        elif not os.listdir(checkpoint_dir):
+            missing.append(f"Checkpoints directory empty: {checkpoint_dir}")
+
+    if "evaluate" in stages:
+        edge_scores_dir = cfg.detection.gnn_testing._edge_losses_dir
+        if not os.path.isdir(edge_scores_dir):
+            missing.append(f"Edge scores: {edge_scores_dir}")
+        elif "test" not in os.listdir(edge_scores_dir):
+            missing.append(f"Test split in edge scores: {edge_scores_dir}")
+
+    return missing
+
 
 # ---------------------------------------------------------------------------
 # Artifact prerequisite checks
@@ -47,8 +113,8 @@ def _check_artifact_prerequisites(stages, cfg):
     Check that required artifacts exist when an upstream stage is NOT being run.
 
     Rules:
-    - test selected  AND train NOT selected  → check model checkpoint dir
-    - evaluate selected AND test NOT selected → check test edge-loss output dir
+    - test selected  AND train NOT selected  鈫?check model checkpoint dir
+    - evaluate selected AND test NOT selected 鈫?check test edge-loss output dir
     """
     train_run = "train" in stages
     test_run = "test" in stages
@@ -99,14 +165,43 @@ def _check_artifact_prerequisites(stages, cfg):
 # ---------------------------------------------------------------------------
 def main(cfg, args, **kwargs):
     # ------------------------------------------------------------------
-    # 1. Parse stages + resolve tracing
+    # 0. C2: Detection-only mode validation
     # ------------------------------------------------------------------
-    conflict_warning = _check_conflict(args.stages, args.run_from_training)
-    if conflict_warning is not None:
-        log(conflict_warning)
-        # When both are set, --stages takes precedence; run_from_training is ignored.
+    is_detection_only = _is_detection_only_mode(cfg)
 
-    stages = _parse_stages(args.stages, args.run_from_training)
+    if is_detection_only:
+        log("Running in detection_only mode")
+        # Parse stages normally
+        conflict_warning = _check_conflict(args.stages, args.run_from_training)
+        if conflict_warning is not None:
+            log(conflict_warning)
+
+        stages = _parse_stages(args.stages, args.run_from_training)
+
+        # Check prerequisites
+        missing = _check_detection_only_prerequisites(stages, cfg)
+        if missing:
+            raise FileNotFoundError(
+                f"detection_only mode: required artifacts missing:\n" +
+                "\n".join(f"  - {m}" for m in missing) +
+                "\n\nRun in full_pipeline mode first, or provide required artifacts."
+            )
+
+        # In detection_only mode, force exclude preprocess stages
+        stages = [s for s in stages if s != "preprocess"]
+        if "preprocess" in stages:
+            stages.remove("preprocess")
+        log(f"detection_only: running stages {stages} (preprocess skipped)")
+    else:
+        # ------------------------------------------------------------------
+        # 1. Parse stages + resolve tracing
+        # ------------------------------------------------------------------
+        conflict_warning = _check_conflict(args.stages, args.run_from_training)
+        if conflict_warning is not None:
+            log(conflict_warning)
+            # When both are set, --stages takes precedence; run_from_training is ignored.
+
+        stages = _parse_stages(args.stages, args.run_from_training)
 
     # Tracing is gated by both the stage list and cfg.pipeline.run_tracing
     do_trace = "trace" in stages and cfg.pipeline.run_tracing
@@ -126,7 +221,7 @@ def main(cfg, args, **kwargs):
     t0 = time_module.time()
 
     # ------------------------------------------------------------------
-    # 3. Preprocess
+    # 3. Preprocess (skip in detection_only mode)
     # ------------------------------------------------------------------
     t_build_graphs = None
     t_embed_nodes = None
@@ -212,13 +307,13 @@ def main(cfg, args, **kwargs):
         log(f"{k}: {v} s")
 
     log("==" * 30)
-    if wandb.run is not None:
-        wandb.log(time_consumption)
 
     return time_consumption
 
 
 if __name__ == '__main__':
+    import wandb
+
     args, unknown_args = get_runtime_required_args(return_unknown_args=True)
 
     exp_name = args.exp if args.exp != "" else \
@@ -226,19 +321,33 @@ if __name__ == '__main__':
         # "|".join([f"{k.split('.')[-1]}={v}" for k, v in args.__dict__.items() if "." in k and v is not None])
     tags = args.tags.split(",") if args.tags != "" else [args.model]
 
-    wandb.init(
-        mode="online" if args.wandb else "disabled",
-        project="orthrus_repo",  # Can be changed
-        name=exp_name,
-        tags=tags,
-    )
+    cfg = get_yml_cfg(args)
+
+    # C2: Use mode-aware W&B initialization
+    if init_wandb is not None and resolve_wandb_mode is not None:
+        wandb_mode = resolve_wandb_mode(cfg, args)
+        run = init_wandb(cfg, args, wandb_mode)
+        wandb.config.update(remove_underscore_keys(dict(cfg), keys_to_keep=["_task_path"]))
+    else:
+        # Fallback to original behavior
+        wandb.init(
+            mode="online" if args.wandb else "disabled",
+            project="orthrus_repo",
+            name=exp_name,
+            tags=tags,
+        )
+        wandb.config.update(remove_underscore_keys(dict(cfg), keys_to_keep=["_task_path"]))
 
     if len(unknown_args) > 0:
         raise argparse.ArgumentTypeError(f"Unknown args {unknown_args}")
 
-    cfg = get_yml_cfg(args)
-    wandb.config.update(remove_underscore_keys(dict(cfg), keys_to_keep=["_task_path"]))
+    time_consumption = main(cfg, args)
 
-    main(cfg, args)
-
-    wandb.finish()
+    # C2: Use mode-aware W&B logging
+    if wandb_finish is not None:
+        wandb_log(time_consumption)
+        wandb_finish()
+    else:
+        if wandb.run is not None:
+            wandb.log(time_consumption)
+        wandb.finish()
