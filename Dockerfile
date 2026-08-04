@@ -18,14 +18,15 @@ ENV PATH=$JAVA_HOME/bin:$PATH
 # installing sudo
 RUN apt-get update && apt-get install -y sudo git
 
-# installing Anaconda version 23.3.1
-RUN wget https://repo.anaconda.com/archive/Anaconda3-2023.03-1-Linux-x86_64.sh
-RUN bash Anaconda3-2023.03-1-Linux-x86_64.sh -b -p /opt/conda
-RUN rm Anaconda3-2023.03-1-Linux-x86_64.sh
+# installing a pinned official Miniconda installer (Linux x86_64)
+RUN wget --no-verbose https://repo.anaconda.com/miniconda/Miniconda3-py39_24.11.1-0-Linux-x86_64.sh \
+    && echo "3ea8373098d72140e08aac9217822b047ec094eb457e7f73945af7c6f68bf6f5  Miniconda3-py39_24.11.1-0-Linux-x86_64.sh" | sha256sum -c - \
+    && bash Miniconda3-py39_24.11.1-0-Linux-x86_64.sh -b -p /opt/conda \
+    && rm Miniconda3-py39_24.11.1-0-Linux-x86_64.sh
 ENV PATH="/opt/conda/bin:$PATH"
 
 # installing python libraries
-RUN conda create -n pids python=3.9 && \
+RUN conda create -y -n pids python=3.9 && \
     echo "source /opt/conda/bin/activate pids" >> ~/.bashrc
 # https://pythonspeed.com/articles/activate-conda-dockerfile/
 SHELL ["conda", "run", "-n", "pids", "/bin/bash", "-c"]
