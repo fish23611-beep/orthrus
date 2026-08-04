@@ -281,6 +281,17 @@ def get_default_cfg(args):
      cfg._from_weights_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "weights/")
      cfg._seed = args.seed
 
+     # Pipeline stage control
+     cfg.pipeline = CN()
+     cfg.pipeline.run_tracing = True  # default True for backward compat; --skip-tracing overrides to False
+     if getattr(args, 'skip_tracing', False):
+         cfg.pipeline.run_tracing = False
+
+     # Epoch / model selection
+     cfg.model_selection = CN()
+     cfg.model_selection.method = "min_val_mean_edge_loss"  # ["min_val_mean_edge_loss", "last_epoch"]
+     cfg.model_selection.legacy_test_selection_enabled = False  # True=select by test MCC (leakage); DISABLED — raises ValueError
+
      # Database: we simply create variables for all configurations described in the dict
      cfg.database = CN()
      for attr, value in DATABASE_DEFAULT_CONFIG.items():
@@ -321,6 +332,12 @@ def get_runtime_required_args(return_unknown_args=False, args=None):
      parser.add_argument('--show_attack', type=int, help="Number of attack for plotting", default=0)
      parser.add_argument('--gt_type', type=str, help="Type of ground truth", default="orthrus")
      parser.add_argument('--plot_gt', type=bool, help="If we plot ground truth", default=False)
+     parser.add_argument('--stages', type=str, default=None,
+                         help="Comma-separated pipeline stages to run (e.g. 'preprocess,train,test,evaluate'). "
+                              "Standard stages: preprocess, train, test, evaluate, trace. "
+                              "'all' runs everything. If omitted, tracing is disabled by default.")
+     parser.add_argument('--skip-tracing', action='store_true',
+                         help="Skip attack reconstruction (tracing) stage. Overrides pipeline.run_tracing to False.")
 
      # All args in the cfg can be also set in the arg parser from CLI
      parser = add_cfg_args_to_parser(TASK_ARGS, parser)

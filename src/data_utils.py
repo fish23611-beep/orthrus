@@ -8,14 +8,43 @@ from torch_geometric.loader import TemporalDataLoader
 from encoders import OrthrusEncoder
 
 
-def load_all_datasets(cfg):
-    train_data = load_data_set(cfg, path=cfg.edge_featurization.embed_edges._edge_embeds_dir, split="train")
-    val_data = load_data_set(cfg, path=cfg.edge_featurization.embed_edges._edge_embeds_dir, split="val")
-    test_data = load_data_set(cfg, path=cfg.edge_featurization.embed_edges._edge_embeds_dir, split="test")
+DATASET_SPLITS = ("train", "val", "test")
+
+
+def load_all_datasets(cfg, required_splits=None):
+    """Load requested splits and build lookup data from only those splits.
+
+    ``required_splits`` defaults to all splits for backwards compatibility.
+    Omitted splits remain empty in the unchanged five-item return tuple.
+    """
+    if required_splits is None:
+        required_splits = DATASET_SPLITS
+
+    requested = set(required_splits)
+    unknown_splits = requested.difference(DATASET_SPLITS)
+    if unknown_splits:
+        unknown = ", ".join(sorted(unknown_splits))
+        raise ValueError(f"Unknown dataset split(s): {unknown}")
+    if not requested:
+        raise ValueError("At least one dataset split must be requested")
+
+    datasets = {split: [] for split in DATASET_SPLITS}
+    for split in DATASET_SPLITS:
+        if split in requested:
+            datasets[split] = load_data_set(
+                cfg,
+                path=cfg.edge_featurization.embed_edges._edge_embeds_dir,
+                split=split,
+            )
+
+    train_data = datasets["train"]
+    val_data = datasets["val"]
+    test_data = datasets["test"]
     
     all_msg, all_t, all_edge_types = [], [], []
     max_node = 0
-    for dataset in [train_data, val_data, test_data]:
+    for split in DATASET_SPLITS:
+        dataset = datasets[split]
         for data in dataset:
             all_msg.append(data.msg)
             all_t.append(data.t)

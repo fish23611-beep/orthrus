@@ -89,7 +89,17 @@ def main(val_tw_path, test_tw_path, model_epoch_dir, cfg, tw_to_malicious_nodes,
     scores_img_file = os.path.join(out_dir, f"scores_{model_epoch_dir}.png")
     simple_scores_img_file = os.path.join(out_dir, f"simple_scores_{model_epoch_dir}.png")
     dor_img_file = os.path.join(out_dir, f"dor_{model_epoch_dir}.png")
-    
+
+    # ------------------------------------------------------------------ #
+    # Compute val_mean_edge_loss BEFORE returning stats so it can be used
+    # by evaluation.py to select the best epoch (min val loss).
+    # ------------------------------------------------------------------ #
+    _val_loss_list = []
+    for _f in sorted(os.listdir(val_tw_path)):
+        _df = pd.read_csv(os.path.join(val_tw_path, _f))
+        _val_loss_list.extend(_df["loss"].tolist())
+    val_mean_edge_loss = float(np.mean(_val_loss_list)) if _val_loss_list else float("nan")
+
     log("Analysis of malicious nodes:")
     nodes, y_truth, y_preds, pred_scores, max_val_loss_tw = [], [], [], [], []
     for nid, result in results.items():
@@ -99,7 +109,7 @@ def main(val_tw_path, test_tw_path, model_epoch_dir, cfg, tw_to_malicious_nodes,
         y_preds.append(y_hat)
         pred_scores.append(score)
         max_val_loss_tw.append(max_tw)
-        
+
         if y_true == 1:
             log(f"-> Malicious node {nid:<7}: loss={score:.3f} | is TP:" + (" ✅ " if y_true == y_hat else " ❌ ") + (node_to_path[nid]['path']))
 
@@ -110,14 +120,15 @@ def main(val_tw_path, test_tw_path, model_epoch_dir, cfg, tw_to_malicious_nodes,
     plot_simple_scores(pred_scores, y_truth, simple_scores_img_file)
     plot_scores_with_paths(pred_scores, y_truth, nodes, max_val_loss_tw, tw_to_malicious_nodes, scores_img_file, cfg)
     stats = classifier_evaluation(y_truth, y_preds, pred_scores)
-    
+
     fp_in_malicious_tw_ratio = analyze_false_positives(y_truth, y_preds, pred_scores, max_val_loss_tw, nodes, tw_to_malicious_nodes)
     stats["fp_in_malicious_tw_ratio"] = fp_in_malicious_tw_ratio
-    
+    stats["val_mean_edge_loss"] = val_mean_edge_loss  # used by evaluation.py for best-epoch selection
+
     results_file = os.path.join(out_dir, f"result_{model_epoch_dir}.pth")
     stats_file = os.path.join(out_dir, f"stats_{model_epoch_dir}.pth")
 
     torch.save(results, results_file)
     torch.save(stats, stats_file)
-    
+
     return stats

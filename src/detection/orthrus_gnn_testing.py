@@ -45,7 +45,7 @@ def test(
             edge_index = batch.original_edge_index
         else:
             edge_index = batch.edge_index
-        
+
         num_events = each_edge_loss.shape[0]
         edge_types = torch.argmax(batch.edge_type, dim=1) + 1
         for i in range(num_events):
@@ -88,13 +88,42 @@ def test(
     #     f'Time: {time_interval}, Loss: {tot_loss:.4f}, Nodes_count: {len(unique_nodes)}, Edges_count: {event_count}, Cost Time: {(end - start):.2f}s')
 
 
+@torch.no_grad()
+def _replay_train_history(model, train_data, full_data, cfg, device):
+    """
+    Replay the training data through the model to build temporal history.
+
+    Runs the model on each training graph in eval/no_grad mode to populate
+    the neighbor loader history WITHOUT computing or storing gradients.
+    After this, the model can directly process val/test — they will see
+    the full training-set history.
+
+    This replaces the old approach of loading a serialized neighbor_loader from
+    a checkpoint, which saved the LAST-EPOCH history only and required
+    O(num_nodes × neighbor_size) disk space.
+    """
+    model.eval()
+    for g in train_data:
+        g.to(device=device)
+        try:
+            batch_loader = batch_loader_factory(cfg, g, model.graph_reindexer)
+            for batch in batch_loader:
+                # Forward pass only — builds neighbor-loader history via insert(src, dst)
+                # Signature matches model(batch, full_data, inference=True) used in test()
+                model(batch, full_data, inference=True)
+        finally:
+            g.to("cpu")
+
+
 def main(cfg):
     # load the map between nodeID and node labels
     cur, _ = init_database_connection(cfg)
     nodeid2msg = gen_nodeid2msg(cur=cur)
     nodeid2msg = {k: str(v) for k, v in nodeid2msg.items()}  # pre-compute because it's too slow in main loop
 
-    _, val_data, test_data, full_data, max_node_num = load_all_datasets(cfg)
+    train_data, val_data, test_data, full_data, max_node_num = load_all_datasets(
+        cfg, required_splits=("train", "val", "test")
+    )
 
     # For each model trained at a given epoch, we test
     gnn_models_dir = cfg.detection.gnn_training._trained_models_dir
@@ -107,11 +136,26 @@ def main(cfg):
         torch.cuda.empty_cache()
         model = build_model(data_sample=test_data[0], device=device, cfg=cfg, max_node_num=max_node_num)
         model = load_model(model, os.path.join(gnn_models_dir, trained_model))
-        
+
         if cfg._from_weights:
             model.load_state_dict(torch.load(os.path.join(cfg._from_weights_path, f"{cfg.dataset.name}.pkl")))
 
-        # TODO: we may want to move the validation set into the training for early stopping
+        # ------------------------------------------------------------------ #
+        # Correct replay protocol (per checkpoint, before val+test):
+        #   1. reset_state()  — clears any stale history
+        #   2. replay train   — rebuilds history from scratch
+        #   3. val (no reset) — sees full train history
+        #   4. test (no reset) — sees train + val history
+        # Val and test must NOT reset/replay between them.
+        # ------------------------------------------------------------------ #
+        if hasattr(model, 'encoder') and hasattr(model.encoder, 'reset_state'):
+            model.encoder.reset_state()
+            log(f"    [replay] reset_state() called for {trained_model}")
+
+        _replay_train_history(model, train_data, full_data, cfg, device)
+        log(f"    [replay] train history rebuilt for {trained_model}")
+
+        # Process val then test — NO reset/replay between them
         for graphs, split in [
             (val_data, "val"),
             (test_data, "test"),

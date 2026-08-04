@@ -1,0 +1,94 @@
+{
+  "baseline_commit": "2cc2ee714f7a9c288e25209c171c37810942eb2f",
+  "environment": {
+    "python": "3.10.13",
+    "torch": "1.13.1"
+  },
+  "generator_version": "c1-baseline-v1",
+  "input_summary": {
+    "data_seeds": {
+      "test": 303,
+      "train": 101,
+      "val": 202
+    },
+    "dropout": 0.0,
+    "model_seed": 314159,
+    "node_aggregation": "maximum incident test-edge score",
+    "node_feature_dim": 4,
+    "num_edge_types": 2,
+    "num_nodes": 6,
+    "prediction_threshold": "maximum validation-edge score",
+    "topology": "three six-edge directed rings (train, val, test)"
+  },
+  "outputs": {
+    "edge_level_loss": 0.6955535411834717,
+    "edge_predictions": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "inference_scores": [
+      0.6222639083862305,
+      0.7338589429855347,
+      0.5990873575210571,
+      0.7475166320800781,
+      0.6019009947776794,
+      0.7603016495704651
+    ],
+    "node_predictions": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 0,
+      "4": 0,
+      "5": 0
+    },
+    "node_scores": {
+      "0": 0.7603016495704651,
+      "1": 0.7338589429855347,
+      "2": 0.7338589429855347,
+      "3": 0.7475166320800781,
+      "4": 0.7475166320800781,
+      "5": 0.7603016495704651
+    },
+    "prediction_threshold": 0.7631737589836121,
+    "replay_train_scores": [
+      0.6683619022369385,
+      0.7282425165176392,
+      0.6705121994018555,
+      0.7208818197250366,
+      0.6631482839584351,
+      0.7221744060516357
+    ],
+    "shapes": {
+      "edge_level_loss": [
+        1
+      ],
+      "inference_scores": [
+        6
+      ],
+      "replay_train_scores": [
+        6
+      ],
+      "validation_scores": [
+        6
+      ]
+    },
+    "stability": {
+      "inference_mean": 0.6774882674217224,
+      "inference_sum": 4.064929485321045,
+      "node_score_sum": 4.483354449272156
+    },
+    "validation_scores": [
+      0.7631737589836121,
+      0.6346492767333984,
+      0.7464945316314697,
+      0.6411057710647583,
+      0.7509338855743408,
+      0.6046629548072815
+    ]
+  }
+}
