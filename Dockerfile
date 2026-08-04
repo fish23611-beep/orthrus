@@ -4,8 +4,15 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
-RUN apt-get update \
-    && apt-get install -y wget ca-certificates graphviz gnupg lsb-release maven
+RUN sed -i \
+    -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+    -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+    /etc/apt/sources.list \
+    && apt-get -o Acquire::Retries=3 -o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false update \
+    && apt-get -o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false install -y ca-certificates \
+    && update-ca-certificates \
+    && apt-get -o Acquire::Retries=3 update \
+    && apt-get install -y wget graphviz gnupg lsb-release maven
 
 # installing JDK1.8
 RUN apt update && \
@@ -25,6 +32,10 @@ RUN wget --no-verbose https://repo.anaconda.com/miniconda/Miniconda3-py39_24.11.
     && rm Miniconda3-py39_24.11.1-0-Linux-x86_64.sh
 ENV PATH="/opt/conda/bin:$PATH"
 
+# Make Conda downloads resilient to transient registry disconnects.
+RUN conda config --system --set remote_max_retries 10 \
+    && conda config --system --set remote_connect_timeout_secs 30 \
+    && conda config --system --set remote_read_timeout_secs 180
 # installing python libraries
 RUN conda create -y -n pids python=3.9 && \
     echo "source /opt/conda/bin/activate pids" >> ~/.bashrc
