@@ -61,6 +61,12 @@ RUN pip install gensim==4.3.1 pytz==2024.1 pandas==2.2.2 yacs==0.1.8
 RUN pip uninstall -y scipy && pip install scipy==1.10.1 && \
     pip uninstall -y numpy && pip install numpy==1.26.4
 
+# Install test dependencies (pytest, pytest-mock) for container validation
+COPY requirements-devcontainer.txt /tmp/requirements-devcontainer.txt
+RUN /opt/conda/envs/pids/bin/python -m pip install --no-cache-dir -r /tmp/requirements-devcontainer.txt && \
+    rm /tmp/requirements-devcontainer.txt && \
+    /opt/conda/envs/pids/bin/python -c "import pytest; import pytest_mock; print('test deps OK')"
+
 WORKDIR /home
 COPY . .
 
