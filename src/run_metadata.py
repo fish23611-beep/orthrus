@@ -31,6 +31,7 @@ Key design decisions
   separate functions so callers can write them independently.
 - ``dump_runtime`` accepts a ``status`` keyword so the caller can set
   ``"completed"`` or ``"failed"`` based on its own exception handling.
+- Database passwords are NOT written to config_resolved.yml or environment.json.
 """
 
 from __future__ import annotations
@@ -169,7 +170,7 @@ def dump_environment(run_dir: Path | str | None) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Config dump
+# Config dump (with password redaction)
 # --------------------------------------------------------------------------- #
 
 def dump_config(cfg, run_dir: Path | str | None) -> None:
@@ -177,17 +178,33 @@ def dump_config(cfg, run_dir: Path | str | None) -> None:
     Write ``config_resolved.yml`` to ``run_dir``.
 
     Serialises the full resolved CfgNode as a plain dict, excluding MagicMock
-    objects and private (``_``-prefixed) keys.
+    objects and private (``_``-prefixed) keys. Database passwords are redacted.
     """
     if not _is_valid_path(run_dir):
         return
 
     cfg_dict = _cfg_to_dict(cfg)
 
-    # Write as JSON first (always serialisable), then convert to YAML manually
-    # to avoid a hard yaml dependency.  The format is a straightforward
-    # YAML-compatible dict dump.
+    # Redact database password
+    cfg_dict = _redact_database_password(cfg_dict)
+
+    # Write as YAML
     _write_yaml(run_dir / "config_resolved.yml", cfg_dict)
+
+
+def _redact_database_password(cfg_dict: dict) -> dict:
+    """Recursively redact database.password from config dict."""
+    if isinstance(cfg_dict, dict):
+        result = {}
+        for k, v in cfg_dict.items():
+            if k == "password":
+                result[k] = "[REDACTED]"
+            else:
+                result[k] = _redact_database_password(v)
+        return result
+    elif isinstance(cfg_dict, (list, tuple)):
+        return [_redact_database_password(item) for item in cfg_dict]
+    return cfg_dict
 
 
 # --------------------------------------------------------------------------- #

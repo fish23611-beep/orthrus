@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import os
 import hashlib
 import pathlib
@@ -10,6 +10,17 @@ from pprint import pprint
 from yacs.config import CfgNode as CN
 from psycopg2 import extras as ex
 import psycopg2
+
+# ================================================================================
+# Environment variable names for ORTHRUS C2 configuration
+# Priority: CLI/YAML > Environment Variables > Internal Defaults
+# ================================================================================
+ORTHRUS_ARTIFACT_ROOT_ENV = "ORTHRUS_ARTIFACT_ROOT"
+ORTHRUS_DATA_ROOT_ENV = "ORTHRUS_DATA_ROOT"
+ORTHRUS_DB_HOST_ENV = "ORTHRUS_DB_HOST"
+ORTHRUS_DB_PORT_ENV = "ORTHRUS_DB_PORT"
+ORTHRUS_DB_USER_ENV = "ORTHRUS_DB_USER"
+ORTHRUS_DB_PASSWORD_ENV = "ORTHRUS_DB_PASSWORD"
 
 # [EDITABLE AREA]: Insert your output path and credentials to the DB
 # ================================================================================
@@ -267,12 +278,44 @@ DATASET_DEFAULT_CONFIG = {
      },
 }
 
+def _resolve_artifact_root_from_env():
+    """Resolve artifact root from ORTHRUS_ARTIFACT_ROOT env var."""
+    env_val = os.environ.get(ORTHRUS_ARTIFACT_ROOT_ENV)
+    if env_val:
+        return str(env_val)
+    return ROOT_ARTIFACT_DIR
+
+def _resolve_data_root_from_env():
+    """Resolve data root from ORTHRUS_DATA_ROOT env var."""
+    return os.environ.get(ORTHRUS_DATA_ROOT_ENV)
+
+def _resolve_db_config_from_env():
+    """Resolve database config from environment variables.
+
+    Priority: Env Var > Internal Default
+    Returns dict with host, port, user, password.
+    """
+    return {
+        "host": os.environ.get(ORTHRUS_DB_HOST_ENV, DATABASE_DEFAULT_CONFIG["host"]),
+        "port": os.environ.get(ORTHRUS_DB_PORT_ENV, DATABASE_DEFAULT_CONFIG["port"]),
+        "user": os.environ.get(ORTHRUS_DB_USER_ENV, DATABASE_DEFAULT_CONFIG["user"]),
+        "password": os.environ.get(ORTHRUS_DB_PASSWORD_ENV, DATABASE_DEFAULT_CONFIG["password"]),
+    }
+
 def get_default_cfg(args):
      """
      Inits the shared cfg object with default configurations.
+
+     Priority order (highest to lowest):
+       1. CLI / YAML (handled by overwrite_cfg_with_args and merge_from_file)
+       2. Environment variables (ORTHRUS_*)
+       3. Internal defaults
      """
      cfg = CN()
-     cfg._artifact_dir = ROOT_ARTIFACT_DIR
+
+     # Resolve artifact root with env var support
+     cfg._artifact_dir = _resolve_artifact_root_from_env()
+     cfg._data_root = _resolve_data_root_from_env()  # May be None
 
      cfg._test_mode = False
 
@@ -283,6 +326,7 @@ def get_default_cfg(args):
 
      # Pipeline stage control
      cfg.pipeline = CN()
+     cfg.pipeline.mode = "full_pipeline"  # C2: "full_pipeline" or "detection_only"
      cfg.pipeline.run_tracing = True  # default True for backward compat; --skip-tracing overrides to False
      if getattr(args, 'skip_tracing', False):
          cfg.pipeline.run_tracing = False
@@ -290,7 +334,7 @@ def get_default_cfg(args):
      # Epoch / model selection
      cfg.model_selection = CN()
      cfg.model_selection.method = "min_val_mean_edge_loss"  # ["min_val_mean_edge_loss", "last_epoch"]
-     cfg.model_selection.legacy_test_selection_enabled = False  # True=select by test MCC (leakage); DISABLED — raises ValueError
+     cfg.model_selection.legacy_test_selection_enabled = False  # True=select by test MCC (leakage); DISABLED 鈥?raises ValueError
 
      # Logging / W&B
      cfg.logging = CN()
@@ -298,15 +342,31 @@ def get_default_cfg(args):
 
      # Database: we simply create variables for all configurations described in the dict
      cfg.database = CN()
+     db_env_config = _resolve_db_config_from_env()
      for attr, value in DATABASE_DEFAULT_CONFIG.items():
-          setattr(cfg.database, attr, value)
+         setattr(cfg.database, attr, value)
+     # Apply env overrides (env vars take precedence over defaults)
+     for attr, value in db_env_config.items():
+         setattr(cfg.database, attr, value)
 
      # Dataset: we simply create variables for all configurations described in the dict
      cfg.dataset = CN()
      cfg.dataset.name = args.dataset
      for attr, value in DATASET_DEFAULT_CONFIG[cfg.dataset.name].items():
           setattr(cfg.dataset, attr, value)
-     
+
+     # C2: Testing configuration
+     cfg.testing = CN()
+     cfg.testing.include_node_messages = True  # Whether to include node messages in test output
+
+     # C2: Semantic features configuration (interface only, Word2Vec logic unchanged)
+     cfg.semantic_features = CN()
+     cfg.semantic_features.corpus_scope = "official_full_dataset"  # ["official_full_dataset", "train_only"]
+
+     # C2: Logging configuration
+     cfg.logging = CN()
+     cfg.logging.wandb_mode = "disabled"  # ["disabled", "offline", "online"]
+
      # Tasks: we create nested None variables for all arguments
      def create_cfg_recursive(cfg, task_args_dict: dict):
           for task, subtasks in task_args_dict.items():
@@ -318,7 +378,7 @@ def get_default_cfg(args):
                     setattr(cfg, task, None)
 
      create_cfg_recursive(cfg, TASK_ARGS)
-     
+
      return cfg
 
 def get_runtime_required_args(return_unknown_args=False, args=None):
@@ -350,7 +410,7 @@ def get_runtime_required_args(return_unknown_args=False, args=None):
 
      # All args in the cfg can be also set in the arg parser from CLI
      parser = add_cfg_args_to_parser(TASK_ARGS, parser)
-     
+
      try:
           args, unknown_args = parser.parse_known_args(args)
      except:
@@ -367,9 +427,9 @@ def overwrite_cfg_with_args(cfg, args):
      """
      The framework can be also parametrized using the CLI args.
      These args are priorited compared to yml file parameters.
-     This function simply overwrites the cfg with the parameters 
+     This function simply overwrites the cfg with the parameters
      given within args.
-     
+
      To override a parameter in cfg, use a dotted style:
      ```python orthrus.py --detection.gnn_training.seed=42```
      """
@@ -378,7 +438,7 @@ def overwrite_cfg_with_args(cfg, args):
                cfg_ptr = cfg
                dots = arg.split(".")
                path, attr_name = dots[:-1], dots[-1]
-               
+
                for attr in path:
                     cfg_ptr = getattr(cfg_ptr, attr)
                setattr(cfg_ptr, attr_name, value)
@@ -397,7 +457,7 @@ def set_task_paths(cfg):
                clean_hash_args = ["".join([c for c in str(restart_value) if c not in set(" []\"\'")]) for restart_value in restart_values]
                final_hash_string = ",".join(clean_hash_args)
                final_hash_string = hashlib.sha256(final_hash_string.encode("utf-8")).hexdigest()
-               
+
                subtask_to_hash[subtask_name] = final_hash_string
 
      # Then, for each subtask, we want its unique hash to also depend from its previous dependencies' hashes.
@@ -409,19 +469,19 @@ def set_task_paths(cfg):
                subtask_cfg = getattr(task_cfg, subtask_name)
                deps = sorted(list(get_dependees(subtask_name, TASK_DEPENDENCIES, set())))
                deps_hash = "".join([subtask_to_hash[dep] for dep in deps])
-               
+
                final_hash_string = deps_hash + subtask_to_hash[subtask_name]
                final_hash_string = hashlib.sha256(final_hash_string.encode("utf-8")).hexdigest()
-               
+
                if task in ["graph_construction", "edge_featurization"]:
                     subtask_cfg._task_path = os.path.join(cfg._artifact_dir, task, cfg.dataset.name, subtask_name, final_hash_string)
                else:
                     subtask_cfg._task_path = os.path.join(cfg._artifact_dir, task, subtask_name, final_hash_string, cfg.dataset.name)
-               
+
                # The directory to save logs related to the graph_construction task
                subtask_cfg._logs_dir = os.path.join(subtask_cfg._task_path, "logs/")
                os.makedirs(subtask_cfg._logs_dir, exist_ok=True)
-     
+
      # graph_construction paths
      cfg.graph_construction.build_graphs._graphs_dir = os.path.join(cfg.graph_construction.build_graphs._task_path, "nx/")
      cfg.graph_construction.build_graphs._tw_labels = os.path.join(cfg.graph_construction.build_graphs._task_path, "tw_labels/")
@@ -442,7 +502,11 @@ def set_task_paths(cfg):
 
      # Triage paths
      cfg.attack_reconstruction.tracing._tracing_graph_dir = os.path.join(cfg.attack_reconstruction.tracing._task_path, "tracing_graphs")
-     
+
+     # C2: Metadata cache directory (derived from graph_construction task path)
+     cfg._metadata_dir = os.path.join(cfg.graph_construction.build_graphs._task_path, "metadata")
+     os.makedirs(cfg._metadata_dir, exist_ok=True)
+
      # TODO
      cfg.postprocessing._task_path = None
 
@@ -469,7 +533,7 @@ def validate_yml_file(yml_file: str):
                               # Optional: check for type correctness
                          if not isinstance(sub_config, sub_tasks):
                               raise TypeError(f"Parameter '{' > '.join(path + [key])}' should be of type {sub_tasks.__name__}.")
-     
+
      validate_config(user_config, TASK_ARGS)
      print(f"YAML configuration file \"{yml_file.split('/')[-1]}\" is valid")
 
@@ -477,7 +541,7 @@ def check_args(args):
      available_models = os.listdir(os.path.join(os.path.dirname(os.path.dirname(__file__)), "config"))
      if not any([args.model in model for model in available_models]):
           raise ValueError(f"Unknown model {args.model}. Available models are {available_models}")
-     
+
      available_datasets = DATASET_DEFAULT_CONFIG.keys()
      if args.dataset not in available_datasets:
           raise ValueError(f"Unknown dataset {args.dataset}. Available datasets are {available_datasets}")
@@ -485,7 +549,7 @@ def check_args(args):
 def check_task_dependency_graph(yml_file: str):
      with open(yml_file, 'r') as file:
           user_config = yaml.safe_load(file)
-     
+
      subtasks = [j for i in user_config.values() for j in i]
      deps = TASK_DEPENDENCIES
      subtask_set = set(subtasks)
@@ -503,6 +567,36 @@ def check_task_dependency_graph(yml_file: str):
           raise ValueError(("The requested subtasks don't respect the subtask dependency graph."
                f"Tasks: {subtasks}\nTask dependency graph: {deps}"))
 
+def _validate_wandb_mode(mode: str) -> str:
+    """Validate wandb mode, return validated mode string."""
+    valid_modes = ("disabled", "offline", "online")
+    mode_str = str(mode).strip().lower()
+    if mode_str not in valid_modes:
+        raise ValueError(
+            f"Invalid logging.wandb_mode={mode!r}. Allowed values: {', '.join(valid_modes)}"
+        )
+    return mode_str
+
+def _validate_pipeline_mode(mode: str) -> str:
+    """Validate pipeline mode, return validated mode string."""
+    valid_modes = ("full_pipeline", "detection_only")
+    mode_str = str(mode).strip().lower()
+    if mode_str not in valid_modes:
+        raise ValueError(
+            f"Invalid pipeline.mode={mode!r}. Allowed values: {', '.join(valid_modes)}"
+        )
+    return mode_str
+
+def _validate_corpus_scope(scope: str) -> str:
+    """Validate corpus scope, return validated scope string."""
+    valid_scopes = ("official_full_dataset", "train_only")
+    scope_str = str(scope).strip().lower()
+    if scope_str not in valid_scopes:
+        raise ValueError(
+            f"Invalid semantic_features.corpus_scope={scope!r}. Allowed values: {', '.join(valid_scopes)}"
+        )
+    return scope_str
+
 def get_yml_cfg(args):
      # Checks that CLI args are OK
      check_args(args)
@@ -518,7 +612,7 @@ def get_yml_cfg(args):
      # Overrides default config with config from yml file
      cfg.merge_from_file(yml_file)
 
-     # Overwrites args to the cfg
+# Overwrites args to the cfg
      overwrite_cfg_with_args(cfg, args)
 
      # Handle --artifact-root explicitly (non-dotted CLI arg, not processed by overwrite_cfg_with_args)
@@ -526,6 +620,41 @@ def get_yml_cfg(args):
      if artifact_root_raw is not None:
          from artifact_paths import resolve_artifact_root
          cfg._artifact_root_raw = artifact_root_raw
+
+     # C2: Apply environment variable overrides (after CLI but before final paths)
+     env_artifact = os.environ.get(ORTHRUS_ARTIFACT_ROOT_ENV)
+     if artifact_root_raw is None and env_artifact:
+         cfg._artifact_dir = str(env_artifact)
+
+     env_data_root = os.environ.get(ORTHRUS_DATA_ROOT_ENV)
+     if env_data_root:
+         cfg._data_root = str(env_data_root)
+
+     env_db_host = os.environ.get(ORTHRUS_DB_HOST_ENV)
+     if env_db_host:
+         cfg.database.host = env_db_host
+
+     env_db_port = os.environ.get(ORTHRUS_DB_PORT_ENV)
+     if env_db_port:
+         cfg.database.port = str(env_db_port)  # Keep as string for psycopg2 compatibility
+
+     env_db_user = os.environ.get(ORTHRUS_DB_USER_ENV)
+     if env_db_user:
+         cfg.database.user = env_db_user
+
+     env_db_password = os.environ.get(ORTHRUS_DB_PASSWORD_ENV)
+     if env_db_password:
+         cfg.database.password = env_db_password
+
+     # C2: Validate new configuration options
+     if hasattr(cfg, "logging") and hasattr(cfg.logging, "wandb_mode"):
+         cfg.logging.wandb_mode = _validate_wandb_mode(cfg.logging.wandb_mode)
+
+     if hasattr(cfg, "pipeline") and hasattr(cfg.pipeline, "mode"):
+         cfg.pipeline.mode = _validate_pipeline_mode(cfg.pipeline.mode)
+
+     if hasattr(cfg, "semantic_features") and hasattr(cfg.semantic_features, "corpus_scope"):
+         cfg.semantic_features.corpus_scope = _validate_corpus_scope(cfg.semantic_features.corpus_scope)
 
      # Checks args after all overrides are applied
      check_task_dependency_graph(yml_file)
@@ -574,7 +703,7 @@ def flatten_arg_values(cfg):
                          helper(f"{key}={value}", flatten_list)
           else:
                flatten_list.append(dict_or_val)
-     
+
      flatten_list = []
      helper(cfg, flatten_list)
      return flatten_list
@@ -604,7 +733,7 @@ def add_cfg_args_to_parser(cfg, parser):
                return separator_dict
 
           return _create_separator_dict(deepcopy(nested_dict))
-   
+
      separator_dict = nested_dict_to_separator_dict(cfg)
 
      for k, v in separator_dict.items():

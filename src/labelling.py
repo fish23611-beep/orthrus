@@ -1,9 +1,71 @@
-from collections import defaultdict
+﻿from collections import defaultdict
 
 from config import *
 from provnet_utils import *
 
+
+def _get_metadata_cache(cfg):
+    """
+    Get or create MetadataCache instance from cfg.
+
+    Returns None if cfg._metadata_dir is not set.
+    """
+    if not hasattr(cfg, "_metadata_dir") or not cfg._metadata_dir:
+        return None
+    from mstc.metadata_cache import MetadataCache
+    return MetadataCache(cfg._metadata_dir)
+
+
+def _is_detection_only_mode(cfg) -> bool:
+    """Check if pipeline mode is detection_only."""
+    return (
+        hasattr(cfg, "pipeline")
+        and hasattr(cfg.pipeline, "mode")
+        and cfg.pipeline.mode == "detection_only"
+    )
+
+
 def get_ground_truth(cfg):
+    """
+    Get ground truth nodes, paths, and UUID mapping.
+
+    Cache-first strategy:
+    - If cache hit: return cached data (no DB connection)
+    - If cache miss + full_pipeline: fall back to DB
+    - If cache miss + detection_only: raise clear error
+    """
+    cache = _get_metadata_cache(cfg)
+
+    # Try cache first
+    if cache is not None and cache.has_ground_truth_nodes():
+        try:
+            ground_truth_nids = cache.load_ground_truth_nodes()
+            # Load other related caches if available
+            uuid_to_node_id = {}
+            if cache.has_uuid_to_node_id():
+                uuid_to_node_id = cache.load_uuid_to_node_id()
+            ground_truth_paths = {}
+            # Return with cache data
+            return ground_truth_nids, ground_truth_paths, uuid_to_node_id
+        except Exception:
+            pass  # Fall through to DB path
+
+    # Cache miss - check mode
+    if _is_detection_only_mode(cfg):
+        if cache is not None:
+            missing = cache.validate_required([
+                "ground_truth_nodes", "uuid_to_node_id"
+            ])
+            raise FileNotFoundError(
+                f"detection_only mode: required caches missing: {missing}. "
+                f"Run in full_pipeline mode or provide cached metadata."
+            )
+        else:
+            raise FileNotFoundError(
+                "detection_only mode: no metadata cache configured and no DB fallback allowed."
+            )
+
+    # full_pipeline: use DB
     cur, connect = init_database_connection(cfg)
     uuid2nids, _ = get_uuid2nids(cur)
 
@@ -20,7 +82,40 @@ def get_ground_truth(cfg):
                 uuid_to_node_id[node_uuid] = str(node_id)
     return set(ground_truth_nids), ground_truth_paths, uuid_to_node_id
 
+
 def get_GP_of_each_attack(cfg):
+    """
+    Get ground truth nodes for each attack.
+
+    Cache-first strategy:
+    - If cache hit: return cached data (no DB connection)
+    - If cache miss + full_pipeline: fall back to DB
+    - If cache miss + detection_only: raise clear error
+    """
+    cache = _get_metadata_cache(cfg)
+
+    # Try cache first
+    if cache is not None and cache.has_attack_to_nodes():
+        try:
+            attack_to_nids = cache.load_attack_to_nodes()
+            return attack_to_nids
+        except Exception:
+            pass  # Fall through to DB path
+
+    # Cache miss - check mode
+    if _is_detection_only_mode(cfg):
+        if cache is not None:
+            missing = cache.validate_required(["attack_to_nodes"])
+            raise FileNotFoundError(
+                f"detection_only mode: required caches missing: {missing}. "
+                f"Run in full_pipeline mode or provide cached metadata."
+            )
+        else:
+            raise FileNotFoundError(
+                "detection_only mode: no metadata cache configured and no DB fallback allowed."
+            )
+
+    # full_pipeline: use DB
     cur, connect = init_database_connection(cfg)
     uuid2nids, _ = get_uuid2nids(cur)
 
@@ -54,6 +149,7 @@ def get_uuid2nids(cur):
 
     return uuid2nids, nid2uuid
 
+
 def datetime_to_ns_time_US(date):
     """
     :param date: str   format: %Y-%m-%d %H:%M:%S   e.g. 2013-10-10 23:40:00
@@ -79,6 +175,39 @@ def get_events(cur,
     return rows
 
 def get_t2malicious_node(cfg) -> dict[list]:
+    """
+    Get timestamp to malicious node UUIDs mapping.
+
+    Cache-first strategy:
+    - If cache hit: return cached data (no DB connection)
+    - If cache miss + full_pipeline: fall back to DB
+    - If cache miss + detection_only: raise clear error
+    """
+    cache = _get_metadata_cache(cfg)
+
+    # Try cache first
+    if cache is not None and cache.has_time_to_malicious_nodes():
+        try:
+            t_to_node = cache.load_time_to_malicious_nodes()
+            if t_to_node:  # Non-empty cache
+                return t_to_node
+        except Exception:
+            pass  # Fall through to DB path
+
+    # Cache miss - check mode
+    if _is_detection_only_mode(cfg):
+        if cache is not None:
+            missing = cache.validate_required(["time_to_malicious_nodes"])
+            raise FileNotFoundError(
+                f"detection_only mode: required caches missing: {missing}. "
+                f"Run in full_pipeline mode or provide cached metadata."
+            )
+        else:
+            raise FileNotFoundError(
+                "detection_only mode: no metadata cache configured and no DB fallback allowed."
+            )
+
+    # full_pipeline: use DB
     cur, connect = init_database_connection(cfg)
     uuid2nids, nid2uuid = get_uuid2nids(cur)
 

@@ -1,4 +1,4 @@
-from tqdm import tqdm
+﻿from tqdm import tqdm
 
 from encoders import OrthrusEncoder
 from provnet_utils import *
@@ -22,7 +22,7 @@ def test(
 ):
     model.eval()
 
-    time_with_loss = {}  # key: time，  value： the losses
+    time_with_loss = {}  # key: time锛? value锛?the losses
     edge_list = []
     unique_nodes = torch.tensor([]).to(device=device)
     start_time = data.t[0]
@@ -52,8 +52,15 @@ def test(
             srcnode = int(edge_index[0, i])
             dstnode = int(edge_index[1, i])
 
-            srcmsg = nodeid2msg[srcnode]
-            dstmsg = nodeid2msg[dstnode]
+            # Get node messages based on include_node_messages config
+            include_msgs = getattr(getattr(cfg, "testing", None), "include_node_messages", True)
+            if include_msgs and nodeid2msg:
+                srcmsg = nodeid2msg.get(srcnode, f"node:{srcnode}")
+                dstmsg = nodeid2msg.get(dstnode, f"node:{dstnode}")
+            else:
+                srcmsg = f"node:{srcnode}"
+                dstmsg = f"node:{dstnode}"
+
             t_var = int(batch.t[i])
             edge_type_idx = edge_types[i].item()
             edge_type = rel2id[edge_type_idx]
@@ -95,12 +102,12 @@ def _replay_train_history(model, train_data, full_data, cfg, device):
 
     Runs the model on each training graph in eval/no_grad mode to populate
     the neighbor loader history WITHOUT computing or storing gradients.
-    After this, the model can directly process val/test — they will see
+    After this, the model can directly process val/test 鈥?they will see
     the full training-set history.
 
     This replaces the old approach of loading a serialized neighbor_loader from
     a checkpoint, which saved the LAST-EPOCH history only and required
-    O(num_nodes × neighbor_size) disk space.
+    O(num_nodes 脳 neighbor_size) disk space.
     """
     model.eval()
     for g in train_data:
@@ -108,17 +115,84 @@ def _replay_train_history(model, train_data, full_data, cfg, device):
         try:
             batch_loader = batch_loader_factory(cfg, g, model.graph_reindexer)
             for batch in batch_loader:
-                # Forward pass only — builds neighbor-loader history via insert(src, dst)
+                # Forward pass only 鈥?builds neighbor-loader history via insert(src, dst)
                 # Signature matches model(batch, full_data, inference=True) used in test()
                 model(batch, full_data, inference=True)
         finally:
             g.to("cpu")
 
 
-def main(cfg):
-    # load the map between nodeID and node labels
+def _is_detection_only_mode(cfg) -> bool:
+    """Check if pipeline mode is detection_only."""
+    return (
+        hasattr(cfg, "pipeline")
+        and hasattr(cfg.pipeline, "mode")
+        and cfg.pipeline.mode == "detection_only"
+    )
+
+
+def _get_metadata_cache(cfg):
+    """Get or create MetadataCache instance from cfg."""
+    if not hasattr(cfg, "_metadata_dir") or not cfg._metadata_dir:
+        return None
+    from mstc.metadata_cache import MetadataCache
+    return MetadataCache(cfg._metadata_dir)
+
+
+def _load_nodeid2msg(cfg) -> dict:
+    """
+    Load node ID to message mapping with cache-first strategy.
+
+    Priority:
+    1. nodeid2msg.pkl cache
+    2. node_metadata.pkl (derive display field)
+    3. full_pipeline: DB fallback
+    4. detection_only: raise error
+    """
+    cache = _get_metadata_cache(cfg)
+    include_msgs = getattr(getattr(cfg, "testing", None), "include_node_messages", True)
+
+    # If include_node_messages is False, skip loading and return empty
+    if not include_msgs:
+        return {}
+
+    # Try nodeid2msg cache first
+    if cache is not None and cache.has_nodeid2msg():
+        try:
+            return cache.load_nodeid2msg()
+        except Exception:
+            pass  # Fall through to next option
+
+    # Try node_metadata cache
+    if cache is not None and cache.has_node_metadata():
+        try:
+            return cache.derive_nodeid2msg_from_metadata()
+        except Exception:
+            pass  # Fall through to next option
+
+    # Cache miss - check mode
+    if _is_detection_only_mode(cfg):
+        if cache is not None:
+            missing = cache.validate_required(["nodeid2msg"])
+            raise FileNotFoundError(
+                f"detection_only mode: required caches missing: {missing}. "
+                f"Set testing.include_node_messages=false to skip node messages."
+            )
+        else:
+            raise FileNotFoundError(
+                "detection_only mode: no metadata cache configured and include_node_messages is true. "
+                "Set testing.include_node_messages=false to skip node messages."
+            )
+
+    # full_pipeline: use DB fallback
     cur, _ = init_database_connection(cfg)
     nodeid2msg = gen_nodeid2msg(cur=cur)
+    return {k: str(v) for k, v in nodeid2msg.items()}
+
+
+def main(cfg):
+    # Load node messages with cache-first strategy
+    nodeid2msg = _load_nodeid2msg(cfg)
     nodeid2msg = {k: str(v) for k, v in nodeid2msg.items()}  # pre-compute because it's too slow in main loop
 
     train_data, val_data, test_data, full_data, max_node_num = load_all_datasets(cfg)
@@ -140,10 +214,10 @@ def main(cfg):
 
         # ------------------------------------------------------------------ #
         # Correct replay protocol (per checkpoint, before val+test):
-        #   1. reset_state()  — clears any stale history
-        #   2. replay train   — rebuilds history from scratch
-        #   3. val (no reset) — sees full train history
-        #   4. test (no reset) — sees train + val history
+        #   1. reset_state()  鈥?clears any stale history
+        #   2. replay train   鈥?rebuilds history from scratch
+        #   3. val (no reset) 鈥?sees full train history
+        #   4. test (no reset) 鈥?sees train + val history
         # Val and test must NOT reset/replay between them.
         # ------------------------------------------------------------------ #
         if hasattr(model, 'encoder') and hasattr(model.encoder, 'reset_state'):
@@ -153,7 +227,7 @@ def main(cfg):
         _replay_train_history(model, train_data, full_data, cfg, device)
         log(f"    [replay] train history rebuilt for {trained_model}")
 
-        # Process val then test — NO reset/replay between them
+        # Process val then test 鈥?NO reset/replay between them
         for graphs, split in [
             (val_data, "val"),
             (test_data, "test"),

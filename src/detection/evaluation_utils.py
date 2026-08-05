@@ -1,4 +1,4 @@
-from collections import defaultdict
+﻿from collections import defaultdict
 
 from sklearn.metrics import (
     auc,
@@ -72,7 +72,7 @@ def calculate_supervised_best_threshold(losses, labels):
 
 def plot_precision_recall(scores, y_truth, out_file):
     precision, recall, thresholds = precision_recall_curve(y_truth, scores)
-    
+
     plt.figure(figsize=(8, 6))
     plt.plot(recall, precision, marker='.', label='Precision-Recall curve')
     plt.xlabel('Recall')
@@ -115,7 +115,7 @@ def plot_scores_with_paths(scores, y_truth, nodes, max_val_loss_tw, tw_to_malici
             paths.append(node_to_path[n]["cmd"] if "cmd" in node_to_path[n] else path)
         else:
             paths.append(path)
-            
+
     # Convert data to numpy arrays for easy manipulation
     scores = np.array(scores)
     y_truth = np.array(y_truth)
@@ -137,18 +137,18 @@ def plot_scores_with_paths(scores, y_truth, nodes, max_val_loss_tw, tw_to_malici
     paths_1 = [path for path, label in zip(paths, y_truth) if label == 1]
 
     plt.figure(figsize=(12, 6))
-    
+
     red = (155/255, 44/255, 37/255)
     green = (62/255, 126/255, 42/255)
 
     # Plot each type with a different marker for Label 0
     for t in marker_styles.keys():
-        plt.scatter(scores_0[types_0 == t], [0]*sum(types_0 == t), 
+        plt.scatter(scores_0[types_0 == t], [0]*sum(types_0 == t),
                     marker=marker_styles[t], color=green, label=f'Label 0 - {t}')
 
     # Plot each type with a different marker for Label 1
     for t in marker_styles.keys():
-        plt.scatter(scores_1[types_1 == t], [1]*sum(types_1 == t), 
+        plt.scatter(scores_1[types_1 == t], [1]*sum(types_1 == t),
                     marker=marker_styles[t], color=red, label=f'Label 1 - {t}')
 
     # Adding labels and title
@@ -178,7 +178,7 @@ def plot_scores_with_paths(scores, y_truth, nodes, max_val_loss_tw, tw_to_malici
     for i, (score, path, _, max_tw_idx) in enumerate(top_1):
         y_position = 1 - (i * 0.1)  # Adjust y-position for each label to avoid overlap and add space between groups
         plt.text(max(scores) + 1, y_position, f"{str(path)[-30:]} ({score:.2f}): TW {max_tw_idx}", fontsize=8, va='center', ha='left', color=red)
-        
+
     plt.text(max(scores) // 3, 1.6, f"Dataset: {cfg.dataset.name}", fontsize=8, va='center', ha='left', color='black')
     plt.text(max(scores) // 3, 1.5, f"Malicious TW: {str(list(tw_to_malicious_nodes.keys()))}", fontsize=8, va='center', ha='left', color='black')
 
@@ -188,17 +188,17 @@ def plot_scores_with_paths(scores, y_truth, nodes, max_val_loss_tw, tw_to_malici
 
 def plot_false_positives(y_true, y_pred, out_file):
     plt.figure(figsize=(10, 6))
-    
+
     plt.plot(y_pred, label='y_pred', color='blue')
-    
+
     # Adding green dots for true positives (y_true == 1)
     label_indices = [i for i, true in enumerate(y_true) if true == 1]
     plt.scatter(label_indices, [y_pred[i] for i in label_indices], color='green', label='True Positive')
-    
+
     # Adding red dots for false positives (y_true == 0 and y_pred == 1)
     false_positive_indices = [i for i, (true, pred) in enumerate(zip(y_true, y_pred)) if true == 0 and pred == 1]
     plt.scatter(false_positive_indices, [y_pred[i] for i in false_positive_indices], color='red', label='False Positive')
-    
+
     plt.xlabel('Index')
     plt.ylabel('Prediction Value')
     plt.title('True Positives and False Positives in Predictions')
@@ -217,11 +217,11 @@ def plot_dor_recall_curve(scores, y_truth, out_file):
     for threshold in thresholds:
         # Make predictions based on the threshold
         predictions = scores >= threshold
-        
+
         # Calculate TP, FP, TN, FN
         TN, FP, FN, TP = confusion_matrix(y_truth, predictions).ravel()
         recall = TP / (TP + FN) if (TP + FN) > 0 else 0
-        
+
         # Calculate Diagnostic Odds Ratio (DOR)
         if (FP * FN) == 0:
             dor = np.nan
@@ -274,17 +274,77 @@ def get_start_end_from_graph(graph):
         time_list.append(int(data['time']))
     return min(time_list), max(time_list)
 
+def _get_metadata_cache(cfg):
+    """Get or create MetadataCache instance from cfg."""
+    if not hasattr(cfg, "_metadata_dir") or not cfg._metadata_dir:
+        return None
+    from mstc.metadata_cache import MetadataCache
+    return MetadataCache(cfg._metadata_dir)
+
+
+def _is_detection_only_mode(cfg) -> bool:
+    """Check if pipeline mode is detection_only."""
+    return (
+        hasattr(cfg, "pipeline")
+        and hasattr(cfg.pipeline, "mode")
+        and cfg.pipeline.mode == "detection_only"
+    )
+
+
 def compute_tw_labels(cfg):
     """
     Gets the malcious node IDs present in each time window.
+
+    Cache-first strategy:
+    - If cache hit with valid data: use cache (no deletion, no recompute)
+    - If cache miss + full_pipeline: compute from DB/cache
+    - If cache miss + detection_only: raise clear error
     """
+    cache = _get_metadata_cache(cfg)
     out_path = cfg.graph_construction.build_graphs._tw_labels
     out_file = os.path.join(out_path, "tw_to_malicious_nodes.pkl")
+
+    # Try to use cache first
+    if cache is not None and cache.has_time_to_malicious_nodes():
+        try:
+            cached_data = cache.load_time_to_malicious_nodes()
+            # Validate cached data
+            if cached_data and len(cached_data) > 0:
+                log("Using cached time-window labels")
+                uuid_to_node_id = get_ground_truth_uuid_to_node_id(cfg)
+                # Convert to expected format
+                tw_to_malicious_nodes = {}
+                for tw, nodes in cached_data.items():
+                    unique_nodes, counts = np.unique(nodes, return_counts=True)
+                    node_to_count = {node: count for node, count in zip(unique_nodes, counts)}
+                    log(f"TW {tw} -> {len(unique_nodes)} malicious nodes + {len(nodes)} malicious edges")
+                    node_to_count = {uuid_to_node_id[node_id]: count for node_id, count in node_to_count.items()}
+                    tw_to_malicious_nodes[tw] = node_to_count
+                return tw_to_malicious_nodes
+        except Exception:
+            pass  # Fall through to recompute
+
+    # Cache miss or invalid - check mode
+    if _is_detection_only_mode(cfg):
+        if cache is not None:
+            missing = cache.validate_required(["time_to_malicious_nodes"])
+            raise FileNotFoundError(
+                f"detection_only mode: required caches missing: {missing}. "
+                f"Run in full_pipeline mode or provide cached metadata."
+            )
+        else:
+            raise FileNotFoundError(
+                "detection_only mode: no metadata cache configured and no DB fallback allowed."
+            )
+
+    # full_pipeline: compute labels
     uuid_to_node_id = get_ground_truth_uuid_to_node_id(cfg)
 
+    # Only delete and recompute if cache doesn't exist or is invalid
     if os.path.exists(out_file):
-        os.remove(out_file)
-    
+        # Don't delete - just recompute if needed
+        pass
+
     if not os.path.exists(out_file):
         log(f"Computing time-window labels...")
         os.makedirs(out_path, exist_ok=True)
@@ -303,28 +363,35 @@ def compute_tw_labels(cfg):
 
             # start = tw.t.min().item()
             # end = tw.t.max().item()
-            
+
             for t, node_ids in t_to_node.items():
                 if start < t < end:
                     for node_id in node_ids: # src, dst, or [src, dst] malicious nodes
                         tw_to_malicious_nodes[i].append(node_id)
                     num_found_event_labels += 1
-                    
+
         log(f"Found {num_found_event_labels}/{len(t_to_node)} edge labels.")
         torch.save(tw_to_malicious_nodes, out_file)
-        
+
+        # Also save to metadata cache if available
+        if cache is not None:
+            try:
+                cache.save_time_to_malicious_nodes(dict(tw_to_malicious_nodes))
+            except Exception:
+                pass  # Best effort
+
     # Used to retrieve node ID from node raw UUID
     # node_labels_path = os.path.join(cfg._ground_truth_dir, cfg.dataset.ground_truth_events_relative_path)
 
     # uuid_to_node_id = get_ground_truth_uuid_to_node_id(cfg)
-    
+
     # Create a mapping TW number => malicious node IDs
     tw_to_malicious_nodes = torch.load(out_file)
     for tw, nodes in tw_to_malicious_nodes.items():
         unique_nodes, counts = np.unique(nodes, return_counts=True)
         node_to_count = {node: count for node, count in zip(unique_nodes, counts)}
         log(f"TW {tw} -> {len(unique_nodes)} malicious nodes + {len(nodes)} malicious edges")
-        
+
         node_to_count = {uuid_to_node_id[node_id]: count for node_id, count in node_to_count.items()}
         # pprint(node_to_count, width=1)
         tw_to_malicious_nodes[tw] = node_to_count
@@ -439,7 +506,7 @@ def viz_graph(
     #     edge_index = edge_index[:, final_indices]
     #     edge_scores = edge_scores[final_indices]
     #     y = y[final_indices]
-    
+
     if edge_index.shape[0] != 2:
         edge_index = np.array([edge_index[:, 0], edge_index[:, 1]])
 
@@ -453,18 +520,18 @@ def viz_graph(
             for node in [src, dst]:
                 path = node_to_path_and_type[node]['path']
                 typ = node_to_path_and_type[node]['type']
-                
+
                 if (path, typ) not in merged_nodes:
                     merged_nodes[(path, typ)] = {"idx": idx, "label": 0, "predicted": 0}
                     idx += 1
                 edge_tuple.append(merged_nodes[(path, typ)]["idx"])
                 old_node_to_merged_node[node] = merged_nodes[(path, typ)]["idx"]
-                
+
                 # If only one malicious node is present in the merged node, it is malicious
                 merged_nodes[(path, typ)]["label"] = max(merged_nodes[(path, typ)]["label"], int(node in malicious_nodes))
                 # I fonly one good prediction of the merged nodes is correct, we set predicted=1. If node not predicted, we set to -1
                 merged_nodes[(path, typ)]["predicted"] = max(merged_nodes[(path, typ)]["predicted"], int(node_to_correct_pred.get(node, -1)))
-            
+
             merged_edges[tuple(edge_tuple)]["t"].append(i)
             merged_edges[tuple(edge_tuple)]["score"].append(score)
 
@@ -480,7 +547,7 @@ def viz_graph(
             unique_predicted.append(d["predicted"])
             unique_paths.append(path)
             unique_types.append(typ)
-            
+
         source_nodes = malicious_nodes
         new_source_nodes = {old_node_to_merged_node[n] for n in source_nodes}
 
@@ -493,7 +560,7 @@ def viz_graph(
         unique_labels = [n in malicious_nodes for n in unique_nodes]
         unique_predicted = [node_to_correct_pred.get(n, -1) for n in unique_nodes]
         edge_t = list(range(len(edge_index[0])))
-        
+
         source_nodes = malicious_nodes
         source_node_map = {old: new for new, old in enumerate(unique_nodes)}
         new_source_nodes = [source_node_map.get(node, -1) for node in source_nodes]
@@ -505,7 +572,7 @@ def viz_graph(
     G.vs["path"] = unique_paths
     G.vs["type"] = unique_types
     G.vs["shape"] = ["rectangle" if typ == "file" else "circle" if typ == "subject" else "triangle" for typ in unique_types]
-    
+
     G.vs["label"] = unique_labels
     G.vs["predicted"] = unique_predicted
     G.es["t"] = edge_t
@@ -604,10 +671,10 @@ def compute_kmeans_labels(results, topk_K):
     # Extract scores and nodes from the highest cluster
     cluster_scores = highest_value_cluster[:, 1].astype(float)
     anomaly_nodes = highest_value_cluster[:, 0]
-    
+
     for idx in highest_value_cluster_indices:
         global_idx = len(score_values) - topk_K + idx
         node_id = nodes_to_score[global_idx, 0]
         results[node_id]["y_hat"] = 1
-        
+
     return results

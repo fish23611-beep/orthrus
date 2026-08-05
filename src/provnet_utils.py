@@ -1,4 +1,4 @@
-import pytz
+﻿import pytz
 from time import mktime
 from datetime import datetime
 import time
@@ -257,11 +257,11 @@ def get_logger(name: str, filename: str):
     logger.info("")
     logger.info(f"START LOGGING FOR SUBTASK: {name}")
     logger.info("")
-    
+
     log("")
     log(f"START LOGGING FOR SUBTASK: {name}")
     log("")
-    
+
     return logger
 
 def get_all_files_from_folders(base_dir: str, folders: list[str]):
@@ -289,10 +289,10 @@ def remove_underscore_keys(data, keys_to_keep=[], keys_to_rm=[]):
 def compute_mcc(tp, fp, tn, fn):
     numerator = (tp * tn) - (fp * fn)
     denominator = ((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) ** 0.5
-    
+
     if denominator == 0:
         return 0
-    
+
     mcc = numerator / denominator
     return mcc
 
@@ -318,13 +318,13 @@ def classifier_evaluation(y_test, y_test_pred, scores):
     try:
         balanced_acc = balanced_accuracy_score(y_test, y_test_pred)
     except: balanced_acc=float("nan")
-    
+
     sensitivity = tp / (tp + fn)
     specificity = tn / (tn + fp)
     lr_plus = sensitivity / (1 - specificity)
     dor = (tp * tn) / (fp * fn)
     mcc = compute_mcc(tp, fp, tn, fn)
-    
+
     log(f'total num: {len(y_test)}')
     log(f'tn: {tn}')
     log(f'fp: {fp}')
@@ -448,11 +448,24 @@ def get_device(cfg):
 def get_node_to_path_and_type(cfg):
     out_path = cfg.graph_construction.build_graphs._node_id_to_path
     out_file = os.path.join(out_path, "node_to_paths.pkl")
-    
+
     if not os.path.exists(out_file):
         os.makedirs(out_path, exist_ok=True)
+
+        # Check for detection_only mode - no DB fallback allowed
+        is_detection_only = (
+            hasattr(getattr(cfg, "pipeline", None), "mode", None)
+            and cfg.pipeline.mode == "detection_only"
+        )
+
+        if is_detection_only:
+            raise FileNotFoundError(
+                f"detection_only mode: node_to_paths.pkl not found at {out_file}. "
+                f"Run in full_pipeline mode first to generate this artifact."
+            )
+
         cur, connect = init_database_connection(cfg)
-        
+
         queries = {
             "file": "SELECT index_id, path FROM file_node_table;",
             "netflow": "SELECT index_id, src_addr, dst_addr, src_port, dst_port FROM netflow_node_table;",
@@ -475,14 +488,14 @@ def get_node_to_path_and_type(cfg):
 
         torch.save(node_to_path_type, out_file)
         connect.close()
-        
+
     else:
         node_to_path_type = torch.load(out_file)
-        
+
     return node_to_path_type
 
 def get_all_filelist(filepath):
     files = glob.glob(f"{filepath}/*json*")
     # files = [file for file in files if file.endswith("json")]
-    
+
     return files
