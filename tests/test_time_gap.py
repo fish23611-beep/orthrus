@@ -429,3 +429,49 @@ def test_load_missing_raises():
         path = os.path.join(tmpdir, "nonexistent.json")
         with pytest.raises(FileNotFoundError):
             TimeGapStatistics.load(path)
+
+
+# --------------------------------------------------------------------------- #
+# Cross-window time-order tests
+# --------------------------------------------------------------------------- #
+def test_fit_equal_timestamps_across_windows_legal():
+    """
+    Window 1 ends at t=20, Window 2 starts at t=20.
+    Equal timestamps across windows are valid — within-window non-decreasing
+    is already validated separately.
+    """
+    g1 = _make_graph(
+        src=torch.tensor([0, 1]),
+        dst=torch.tensor([1, 2]),
+        t=torch.tensor([10, 20]),
+    )
+    g2 = _make_graph(
+        src=torch.tensor([0, 1]),
+        dst=torch.tensor([2, 0]),
+        t=torch.tensor([20, 30]),
+    )
+    stats = TimeGapStatistics()
+    stats.fit([g1, g2])  # must not raise
+    assert len(stats.time_bucket_boundaries) == 4
+
+
+def test_fit_decreasing_timestamps_across_windows_raises():
+    """
+    Window 1 ends at t=20, Window 2 starts at t=19.
+    When both windows are fitted together, the first event of g2 (t=19)
+    compares against node 0's last_seen from g1 (t=20), producing a
+    negative delta and raising ValueError.
+    """
+    g1 = _make_graph(
+        src=torch.tensor([0, 1]),
+        dst=torch.tensor([1, 2]),
+        t=torch.tensor([10, 20]),
+    )
+    g2 = _make_graph(
+        src=torch.tensor([0, 1]),
+        dst=torch.tensor([2, 0]),
+        t=torch.tensor([19, 30]),  # starts lower than g1 ended
+    )
+    stats = TimeGapStatistics()
+    with pytest.raises(ValueError, match="[Nn]egative|[Dd]elta"):
+        stats.fit([g1, g2])  # g2[0] t=19 < g1's last_seen[0]=20 → negative delta

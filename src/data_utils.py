@@ -8,6 +8,13 @@ from torch_geometric.loader import TemporalDataLoader
 from encoders import OrthrusEncoder
 
 
+# --------------------------------------------------------------------------- #
+# Split name <-> index mapping (centralised — defined in one place only)
+# --------------------------------------------------------------------------- #
+SPLIT_NAME_TO_INDEX = {"train": 0, "val": 1, "test": 2}
+INDEX_TO_SPLIT_NAME = {v: k for k, v in SPLIT_NAME_TO_INDEX.items()}
+
+
 def _validate_event_fields(g: TemporalData, cfg) -> None:
     """
     Validates the structural consistency of a single temporal graph window.
@@ -70,6 +77,15 @@ def _inject_event_indices(g: TemporalData, cfg) -> None:
         dst_type      : torch.long, shape [E]
         edge_type_index: torch.long, shape [E]
         local_event_index: torch.long, shape [E]
+
+    Node types are always extracted from the one-hot tensors that were
+    stored during message parsing (``g.src_type_onehot`` /
+    ``g.dst_type_onehot``).  This guarantees correct semantics regardless
+    of the ``use_node_type_in_node_feats`` setting and regardless of
+    embedding values.
+
+    For legacy artifacts that lack the one-hot attributes, a fallback
+    attempts to extract types from the known message layout.
     """
     node_type_dim = cfg.dataset.num_node_types
     edge_type_dim = cfg.dataset.num_edge_types
@@ -77,19 +93,52 @@ def _inject_event_indices(g: TemporalData, cfg) -> None:
     msg_dim = g.msg.shape[1]
     short_msg_dim = node_type_dim * 2 + edge_type_dim
 
-    if msg_dim == short_msg_dim:
-        # only_type path: msg = [src_type | edge_type | dst_type]
+    # ------------------------------------------------------------------
+    # Node type extraction — authoritative source is the stored one-hot
+    # ------------------------------------------------------------------
+    if hasattr(g, "src_type_onehot") and hasattr(g, "dst_type_onehot"):
+        if g.src_type_onehot.shape != (g.src.shape[0], node_type_dim):
+            raise ValueError(
+                f"src_type_onehot has wrong shape {g.src_type_onehot.shape}; "
+                f"expected ({g.src.shape[0]}, {node_type_dim})"
+            )
+        if g.dst_type_onehot.shape != (g.src.shape[0], node_type_dim):
+            raise ValueError(
+                f"dst_type_onehot has wrong shape {g.dst_type_onehot.shape}; "
+                f"expected ({g.src.shape[0]}, {node_type_dim})"
+            )
+        g.src_type = g.src_type_onehot.argmax(dim=-1).long()
+        g.dst_type = g.dst_type_onehot.argmax(dim=-1).long()
+    elif msg_dim == short_msg_dim:
+        # only_type legacy artifact: msg = [src_type | edge_type | dst_type]
         g.src_type = g.msg[:, :node_type_dim].argmax(dim=-1).long()
         g.dst_type = g.msg[:, node_type_dim + edge_type_dim:].argmax(dim=-1).long()
     else:
-        if hasattr(g, "x_src") and hasattr(g, "x_dst"):
-            g.src_type = g.x_src[:, :node_type_dim].argmax(dim=-1).long()
-            g.dst_type = g.x_dst[:, :node_type_dim].argmax(dim=-1).long()
+        # Full-embedding legacy artifact with no one-hot attributes.
+        # Attempt to recover types from the known message layout:
+        # msg = [src_type_raw | src_emb | edge_type | dst_type_raw | dst_emb]
+        if msg_dim == node_type_dim + edge_type_dim + node_type_dim:
+            # No embeddings, just types (edge case)
+            g.src_type = g.msg[:, :node_type_dim].argmax(dim=-1).long()
+            g.dst_type = g.msg[:, node_type_dim + edge_type_dim:].argmax(dim=-1).long()
+        elif hasattr(g, "x_src") and g.x_src.shape[1] >= node_type_dim:
+            # Heuristic fallback — warn but do not silently use wrong source
+            raise ValueError(
+                f"Cannot reliably extract node types from x_src/x_dst when "
+                f"node type features are not stored. Set "
+                f"use_node_type_in_node_feats=True or re-process the source "
+                f"artifacts to store src_type_onehot/dst_type_onehot."
+            )
         else:
             raise ValueError(
                 f"msg has unexpected dimension {msg_dim}; expected either "
-                f"{short_msg_dim} (only_type) or larger with x_src/x_dst available."
+                f"{short_msg_dim} (only_type) or one-hot types must be "
+                f"stored as src_type_onehot/dst_type_onehot on the graph."
             )
+
+    # ------------------------------------------------------------------
+    # Edge type and local index
+    # ------------------------------------------------------------------
     g.edge_type_index = g.edge_type.argmax(dim=-1).long()
     g.local_event_index = torch.arange(g.src.shape[0], dtype=torch.long)
 
@@ -112,11 +161,17 @@ def _inject_full_data_event_fields(
         src_type           : concatenated per-window src_type
         dst_type           : concatenated per-window dst_type
         edge_type_index    : concatenated per-window edge_type_index
+        src                : concatenated per-window src
+        dst                : concatenated per-window dst
+        split              : torch.long, shape [total_events], per-event split index
+        event_split        : alias of split
+        split_name         : torch.long, shape [total_events], per-event split name (string tensor)
 
     Sets on each window ``g``:
         global_event_index : global positions [start_offset, ...)
         event_index        : alias of global_event_index
-        split              : "train" | "val" | "test"
+        split              : integer index, one of {0, 1, 2}
+        split_name         : original string name ("train" | "val" | "test")
         window_id          : monotonic integer across all splits
     """
     all_windows = [(g, "train") for g in train_data] + \
@@ -130,6 +185,9 @@ def _inject_full_data_event_fields(
     all_src_type: list[torch.Tensor] = []
     all_dst_type: list[torch.Tensor] = []
     all_edge_type_index: list[torch.Tensor] = []
+    all_src: list[torch.Tensor] = []
+    all_dst: list[torch.Tensor] = []
+    all_split: list[torch.Tensor] = []
 
     for g, split_name in all_windows:
         num_events = g.src.shape[0]
@@ -137,7 +195,8 @@ def _inject_full_data_event_fields(
             cumulative_offset, cumulative_offset + num_events, dtype=torch.long
         )
         g.event_index = g.global_event_index
-        g.split = split_name
+        g.split = SPLIT_NAME_TO_INDEX[split_name]  # integer index
+        g.split_name = split_name                   # original string
         g.window_id = window_id_counter
         window_id_counter += 1
         cumulative_offset += num_events
@@ -146,12 +205,19 @@ def _inject_full_data_event_fields(
         all_src_type.append(g.src_type)
         all_dst_type.append(g.dst_type)
         all_edge_type_index.append(g.edge_type_index)
+        all_src.append(g.src)
+        all_dst.append(g.dst)
+        all_split.append(torch.full((num_events,), SPLIT_NAME_TO_INDEX[split_name], dtype=torch.long))
 
     full_data.global_event_index = torch.cat(all_global_event_index)
     full_data.event_index = full_data.global_event_index
     full_data.src_type = torch.cat(all_src_type)
     full_data.dst_type = torch.cat(all_dst_type)
     full_data.edge_type_index = torch.cat(all_edge_type_index)
+    full_data.src = torch.cat(all_src)
+    full_data.dst = torch.cat(all_dst)
+    full_data.split = torch.cat(all_split)
+    full_data.event_split = full_data.split  # alias
 
     return full_data
 
@@ -161,19 +227,29 @@ def load_all_datasets(cfg):
     val_data = load_data_set(cfg, path=cfg.edge_featurization.embed_edges._edge_embeds_dir, split="val")
     test_data = load_data_set(cfg, path=cfg.edge_featurization.embed_edges._edge_embeds_dir, split="test")
 
-    all_msg, all_t, all_edge_types = [], [], []
+    all_msg, all_t, all_edge_types, all_src, all_dst = [], [], [], [], []
     max_node = 0
     for dataset in [train_data, val_data, test_data]:
         for data in dataset:
             all_msg.append(data.msg)
             all_t.append(data.t)
             all_edge_types.append(data.edge_type)
+            all_src.append(data.src)
+            all_dst.append(data.dst)
             max_node = max(max_node, torch.cat([data.src, data.dst]).max().item())
 
     all_msg = torch.cat(all_msg)
     all_t = torch.cat(all_t)
     all_edge_types = torch.cat(all_edge_types)
-    full_data = Data(msg=all_msg, t=all_t, edge_type=all_edge_types)
+    all_src = torch.cat(all_src)
+    all_dst = torch.cat(all_dst)
+    full_data = Data(
+        msg=all_msg,
+        t=all_t,
+        edge_type=all_edge_types,
+        src=all_src,
+        dst=all_dst,
+    )
     max_node = max_node + 1
     print(f"Max node in {cfg.dataset.name}: {max_node}")
 
@@ -229,6 +305,11 @@ def extract_msg_node_type_only(data_set: list[TemporalData], cfg) -> list[Tempor
             fields[field] = g.msg[:, idx: idx + size]
             idx += size
 
+        # Preserve the raw one-hot type tensors so _inject_event_indices can
+        # derive the correct type index directly from the authoritative source.
+        g.src_type_onehot = fields["src_type_raw"].clone()
+        g.dst_type_onehot = fields["dst_type_raw"].clone()
+
         x_src = fields["src_type_raw"]
         x_dst = fields["dst_type_raw"]
 
@@ -275,6 +356,13 @@ def extract_msg_from_data(data_set: list[TemporalData], cfg) -> list[TemporalDat
         for field, size in field_to_size:
             fields[field] = g.msg[:, idx: idx + size]
             idx += size
+
+        # Preserve the raw one-hot type tensors so _inject_event_indices can
+        # derive the correct type index without ever consulting the embedding.
+        # This is the authoritative source of truth regardless of the
+        # use_node_type_in_node_feats setting.
+        g.src_type_onehot = fields["src_type_raw"].clone()
+        g.dst_type_onehot = fields["dst_type_raw"].clone()
 
         x_src = fields["src_emb"]
         x_dst = fields["dst_emb"]

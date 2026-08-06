@@ -147,6 +147,15 @@ class TimeGapStatistics:
                     delta_seconds = delta_ns / 1_000_000_000.0
                     finite_intervals_dst.append(delta_seconds)
 
+                # Self-loop double-counting note:
+                # When src == dst, the same event contributes one sample to
+                # finite_intervals_src AND one to finite_intervals_dst.
+                # This is intentional: each target (src_time_gap / dst_time_gap)
+                # is an independent prediction task, and a self-loop provides
+                # two finite-interval training samples — one for each target.
+                # This is NOT equivalent to updating state twice; the state
+                # itself is updated once per event (see lines below).
+
                 last_seen_ns[src_i] = t_i_ns
                 last_seen_ns[dst_i] = t_i_ns
 
