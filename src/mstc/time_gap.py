@@ -249,32 +249,42 @@ class TimeGapStatistics:
         src_target = torch.full((E,), NO_HISTORY, dtype=torch.long)
         dst_target = torch.full((E,), NO_HISTORY, dtype=torch.long)
 
+        # All targets observe the pre-batch snapshot.  For a node that occurs
+        # more than once, use its earliest current-batch timestamp so no event
+        # can observe another event from the same batch.
+        reference_time: Dict[int, int] = {}
+        for i in range(E):
+            t_i_ns = int(g.t[i].item())
+            for node_id in (int(g.src[i].item()), int(g.dst[i].item())):
+                reference_time[node_id] = min(reference_time.get(node_id, t_i_ns), t_i_ns)
+
         for i in range(E):
             src_i = int(g.src[i].item())
             dst_i = int(g.dst[i].item())
-            t_i_ns = int(g.t[i].item())
+            src_reference_ns = reference_time[src_i]
+            dst_reference_ns = reference_time[dst_i]
 
             last_src = last_seen.get(src_i)
             if last_src is not None and last_src != -1:
-                delta_ns = t_i_ns - last_src
+                delta_ns = src_reference_ns - last_src
                 if delta_ns < 0:
                     raise ValueError(
                         f"Negative time delta detected: "
-                        f"current t={t_i_ns}, last_seen[{src_i}]={last_src}."
+                        f"current t={src_reference_ns}, last_seen[{src_i}]={last_src}."
                     )
                 delta_seconds = delta_ns / 1_000_000_000.0
-                src_target[i] = self.transform(delta_seconds)
+                src_target[i] = self._bucket(math.log1p(delta_seconds))
 
             last_dst = last_seen.get(dst_i)
             if last_dst is not None and last_dst != -1:
-                delta_ns = t_i_ns - last_dst
+                delta_ns = dst_reference_ns - last_dst
                 if delta_ns < 0:
                     raise ValueError(
                         f"Negative time delta detected: "
-                        f"current t={t_i_ns}, last_seen[{dst_i}]={last_dst}."
+                        f"current t={dst_reference_ns}, last_seen[{dst_i}]={last_dst}."
                     )
                 delta_seconds = delta_ns / 1_000_000_000.0
-                dst_target[i] = self.transform(delta_seconds)
+                dst_target[i] = self._bucket(math.log1p(delta_seconds))
 
         for i in range(E):
             src_i = int(g.src[i].item())

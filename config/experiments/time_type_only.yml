@@ -1,0 +1,14 @@
+# C4 wrapper with only the legacy edge-type task enabled.
+model:
+  variant: mstc
+
+detection:
+  gnn_training:
+    decoder:
+      predict_edge_type:
+        enabled: true
+      time_gap:
+        enabled: false
+        lambda_time: 0.3
+        hidden_dim: 128
+        num_classes: 6

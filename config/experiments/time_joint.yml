@@ -1,0 +1,14 @@
+# C4 joint edge-type and time-gap training overlay.
+model:
+  variant: mstc
+
+detection:
+  gnn_training:
+    decoder:
+      predict_edge_type:
+        enabled: true
+      time_gap:
+        enabled: true
+        lambda_time: 0.3
+        hidden_dim: 128
+        num_classes: 6

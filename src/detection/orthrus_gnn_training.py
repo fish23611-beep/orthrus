@@ -5,6 +5,7 @@ import torch.nn as nn
 import wandb
 
 from encoders import OrthrusEncoder
+from model import MSTCOrthrus
 from config import *
 from data_utils import *
 from factory import *
@@ -24,7 +25,18 @@ def train(data,
     for batch in batch_loader:
         optimizer.zero_grad()
 
-        loss = model(batch, full_data)
+        outputs = model(batch, full_data)
+        loss = outputs["loss"] if isinstance(outputs, dict) else outputs
+        if isinstance(outputs, dict):
+            log(
+                "MSTC batch loss={:.4f}, type={:.4f}, time={:.4f}, src={:.4f}, dst={:.4f}".format(
+                    outputs["loss"].item(),
+                    outputs["loss_type"].item(),
+                    outputs["loss_time"].item(),
+                    outputs["loss_time_src"].item(),
+                    outputs["loss_time_dst"].item(),
+                )
+            )
 
         loss.backward()
         optimizer.step()
@@ -43,7 +55,13 @@ def main(cfg):
 
     train_data, _, _, full_data, max_node_num = load_all_datasets(cfg)
 
-    model = build_model(data_sample=train_data[0], device=device, cfg=cfg, max_node_num=max_node_num)
+    time_gap_statistics = None
+    if cfg.model.variant == "mstc" and cfg.detection.gnn_training.decoder.time_gap.enabled:
+        time_gap_statistics = fit_time_gap_statistics(train_data)
+    model = build_model(
+        data_sample=train_data[0], device=device, cfg=cfg, max_node_num=max_node_num,
+        time_gap_statistics=time_gap_statistics,
+    )
     optimizer = optimizer_factory(cfg, parameters=set(model.parameters()))
 
     num_epochs = 1 if cfg._from_weights else cfg.detection.gnn_training.num_epochs
@@ -52,8 +70,10 @@ def main(cfg):
     for epoch in tqdm(range(1, num_epochs + 1), desc="Training"):
         start = timer()
 
-        # Before each epoch, we reset the memory
-        if isinstance(model.encoder, OrthrusEncoder):
+        # Before each epoch, reset the coupled encoder/time state for MSTC.
+        if isinstance(model, MSTCOrthrus):
+            model.reset_state()
+        elif isinstance(model.encoder, OrthrusEncoder):
             model.encoder.reset_state()
 
         tot_loss = 0

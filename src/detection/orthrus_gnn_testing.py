@@ -1,6 +1,7 @@
 ﻿from tqdm import tqdm
 
 from encoders import OrthrusEncoder
+from model import MSTCOrthrus
 from provnet_utils import *
 from data_utils import *
 from config import *
@@ -36,7 +37,9 @@ def test(
     for batch in batch_loader:
         unique_nodes = torch.cat([unique_nodes, batch.edge_index.flatten()]).unique()
 
-        each_edge_loss = model(batch, full_data, inference=True)
+        outputs = model(batch, full_data, inference=True)
+        is_mstc = isinstance(outputs, dict)
+        each_edge_loss = outputs["score_raw"] if is_mstc else outputs
         tot_loss += each_edge_loss.sum().item()
 
         # If the graph has been reindexed in the loader, we retrieve original node IDs
@@ -48,6 +51,7 @@ def test(
 
         num_events = each_edge_loss.shape[0]
         edge_types = torch.argmax(batch.edge_type, dim=1) + 1
+        edge_type_indices = getattr(batch, "edge_type_index", edge_types - 1)
         for i in range(num_events):
             srcnode = int(edge_index[0, i])
             dstnode = int(edge_index[1, i])
@@ -64,16 +68,47 @@ def test(
             t_var = int(batch.t[i])
             edge_type_idx = edge_types[i].item()
             edge_type = rel2id[edge_type_idx]
-            loss = each_edge_loss[i]
+            score_raw = each_edge_loss[i]
+            event_index = int(batch.global_event_index[i]) if hasattr(batch, "global_event_index") else event_count + i
+            src_type = int(batch.src_type[i]) if hasattr(batch, "src_type") else None
+            dst_type = int(batch.dst_type[i]) if hasattr(batch, "dst_type") else None
+
+            if is_mstc:
+                loss_type = float(outputs["loss_type"][i])
+                loss_time_src = float(outputs["loss_time_src"][i])
+                loss_time_dst = float(outputs["loss_time_dst"][i])
+                loss_time = float(outputs["loss_time"][i])
+                src_time_target = int(outputs["src_time_target"][i]) if outputs["src_time_target"].numel() else None
+                dst_time_target = int(outputs["dst_time_target"][i]) if outputs["dst_time_target"].numel() else None
+                src_time_prediction = int(outputs["src_time_logits"][i].argmax()) if outputs["src_time_logits"].numel() else None
+                dst_time_prediction = int(outputs["dst_time_logits"][i].argmax()) if outputs["dst_time_logits"].numel() else None
+            else:
+                loss_type = float(score_raw)
+                loss_time_src = loss_time_dst = loss_time = 0.0
+                src_time_target = dst_time_target = None
+                src_time_prediction = dst_time_prediction = None
 
             temp_dic = {
-                'loss': float(loss),
+                'event_index': event_index,
+                'time': t_var,
                 'srcnode': srcnode,
                 'dstnode': dstnode,
                 'srcmsg': srcmsg,
                 'dstmsg': dstmsg,
+                'src_type': src_type,
+                'dst_type': dst_type,
                 'edge_type': edge_type,
-                'time': t_var,
+                'edge_type_index': int(edge_type_indices[i]),
+                'loss': float(score_raw),
+                'loss_type': loss_type,
+                'loss_time_src': loss_time_src,
+                'loss_time_dst': loss_time_dst,
+                'loss_time': loss_time,
+                'score_raw': float(score_raw),
+                'src_time_target': src_time_target,
+                'dst_time_target': dst_time_target,
+                'src_time_prediction': src_time_prediction,
+                'dst_time_prediction': dst_time_prediction,
             }
             edge_list.append(temp_dic)
 
@@ -206,7 +241,13 @@ def main(cfg):
     for trained_model in all_trained_models:
         log(f"Evaluation with model {trained_model}...")
         torch.cuda.empty_cache()
-        model = build_model(data_sample=test_data[0], device=device, cfg=cfg, max_node_num=max_node_num)
+        time_gap_statistics = None
+        if cfg.model.variant == "mstc" and cfg.detection.gnn_training.decoder.time_gap.enabled:
+            time_gap_statistics = fit_time_gap_statistics(train_data)
+        model = build_model(
+            data_sample=test_data[0], device=device, cfg=cfg, max_node_num=max_node_num,
+            time_gap_statistics=time_gap_statistics,
+        )
         model = load_model(model, os.path.join(gnn_models_dir, trained_model))
 
         if cfg._from_weights:
@@ -220,7 +261,10 @@ def main(cfg):
         #   4. test (no reset) 鈥?sees train + val history
         # Val and test must NOT reset/replay between them.
         # ------------------------------------------------------------------ #
-        if hasattr(model, 'encoder') and hasattr(model.encoder, 'reset_state'):
+        if isinstance(model, MSTCOrthrus):
+            model.reset_state()
+            log(f"    [replay] reset_state() called for {trained_model}")
+        elif hasattr(model, 'encoder') and hasattr(model.encoder, 'reset_state'):
             model.encoder.reset_state()
             log(f"    [replay] reset_state() called for {trained_model}")
 

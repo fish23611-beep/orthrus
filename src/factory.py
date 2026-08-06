@@ -1,5 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+from mstc.time_gap import TimeGapStatistics
 
 from provnet_utils import *
 from config import *
@@ -10,35 +13,44 @@ from data_utils import *
 from temporal import LastAggregator, LastNeighborLoader
 
 
-def build_model(data_sample, device, cfg, max_node_num):
-    """
-    Builds and loads the initial model into memory.
-    The `data_sample` is required to infer the shape of the layers.
-    """
+def build_model(data_sample, device, cfg, max_node_num, time_gap_statistics=None):
+    """Build the selected baseline or C4 MSTC model."""
     msg_dim, edge_dim, in_dim = get_dimensions_from_data_sample(data_sample)
 
-    graph_reindexer = GraphReindexer(
-        num_nodes=max_node_num,
-        device=device,
+    graph_reindexer = GraphReindexer(num_nodes=max_node_num, device=device)
+    encoder = encoder_factory(
+        cfg, msg_dim=msg_dim, in_dim=in_dim, edge_dim=edge_dim,
+        graph_reindexer=graph_reindexer, device=device, max_node_num=max_node_num,
     )
-    
-    encoder = encoder_factory(cfg, msg_dim=msg_dim, in_dim=in_dim, edge_dim=edge_dim, graph_reindexer=graph_reindexer, device=device, max_node_num=max_node_num)
-    decoder = decoder_factory(cfg, in_dim=in_dim, device=device, max_node_num=max_node_num)
-    model = model_factory(encoder, decoder, cfg, in_dim=in_dim, graph_reindexer=graph_reindexer, device=device, max_node_num=max_node_num)
-    
-    return model
+    decoders = decoder_factory(cfg, in_dim=in_dim, device=device, max_node_num=max_node_num)
+    return model_factory(
+        encoder, decoders, cfg, in_dim=in_dim, graph_reindexer=graph_reindexer,
+        device=device, max_node_num=max_node_num, time_gap_statistics=time_gap_statistics,
+    )
 
-def model_factory(encoder, decoders, cfg, in_dim, graph_reindexer, device, max_node_num):
-    return Orthrus(
-        encoder=encoder,
-        decoders=decoders,
-        num_nodes=max_node_num,
-        device=device,
-        in_dim=in_dim,
-        out_dim=cfg.detection.gnn_training.node_out_dim,
-        use_contrastive_learning="predict_edge_contrastive" in cfg.detection.gnn_training.decoder.used_methods,
-        graph_reindexer=graph_reindexer,
-    ).to(device)
+def model_factory(encoder, decoders, cfg, in_dim, graph_reindexer, device, max_node_num, time_gap_statistics=None):
+    variant = getattr(getattr(cfg, "model", None), "variant", "orthrus_baseline")
+    if variant == "orthrus_baseline":
+        return Orthrus(
+            encoder=encoder,
+            decoders=decoders,
+            num_nodes=max_node_num,
+            device=device,
+            in_dim=in_dim,
+            out_dim=cfg.detection.gnn_training.node_out_dim,
+            use_contrastive_learning="predict_edge_contrastive" in cfg.detection.gnn_training.decoder.used_methods,
+            graph_reindexer=graph_reindexer,
+        ).to(device)
+    if variant == "mstc":
+        return MSTCOrthrus(
+            encoder=encoder,
+            edge_decoder=decoders[0] if decoders else None,
+            time_gap_decoder=time_gap_decoder_factory(cfg),
+            time_gap_statistics=time_gap_statistics,
+            lambda_time=cfg.detection.gnn_training.decoder.time_gap.lambda_time,
+            graph_reindexer=graph_reindexer,
+        ).to(device)
+    raise ValueError(f"Unknown model.variant: {variant}")
 
 def encoder_factory(cfg, msg_dim, in_dim, edge_dim, graph_reindexer, device, max_node_num):
     node_hid_dim = cfg.detection.gnn_training.node_hid_dim
@@ -92,6 +104,8 @@ def encoder_factory(cfg, msg_dim, in_dim, edge_dim, graph_reindexer, device, max
 
 def decoder_factory(cfg, in_dim, device, max_node_num):
     node_out_dim = cfg.detection.gnn_training.node_out_dim
+    if not cfg.detection.gnn_training.decoder.predict_edge_type.enabled:
+        return []
 
     decoders = []
     for method in map(lambda x: x.strip(), cfg.detection.gnn_training.decoder.used_methods.split(",")):
@@ -117,6 +131,22 @@ def decoder_factory(cfg, in_dim, device, max_node_num):
             raise ValueError(f"Invalid decoder {method}")
         
     return decoders
+
+def time_gap_decoder_factory(cfg):
+    """Build the optional C4 decoder without affecting baseline decoders."""
+    time_cfg = cfg.detection.gnn_training.decoder.time_gap
+    if not time_cfg.enabled:
+        return None
+    return TimeGapDecoder(
+        in_dim=cfg.detection.gnn_training.node_out_dim,
+        hidden_dim=time_cfg.hidden_dim,
+        num_classes=time_cfg.num_classes,
+    )
+
+
+def fit_time_gap_statistics(train_data):
+    """Fit C4 bucket boundaries once from chronological training data only."""
+    return TimeGapStatistics().fit(train_data)
 
 def batch_loader_factory(cfg, data, graph_reindexer):
     return custom_temporal_data_loader(data, batch_size=cfg.detection.gnn_training.encoder.batch_size)

@@ -112,12 +112,19 @@ TASK_ARGS = {
                "decoder": {
                     "used_methods": str,
                     "predict_edge_type": {
+                         "enabled": bool,
                          "used_method": str,  # ["custom"]
                          "custom": {
                               "dropout": float,
                               "num_layers": int,  # [2 | 3]
                               "activation": str,  # ["sigmoid" | "tanh" | "relu" | "none"]
                          }
+                    },
+                    "time_gap": {
+                         "enabled": bool,
+                         "lambda_time": float,
+                         "hidden_dim": int,
+                         "num_classes": int,
                     },
                },
           },
@@ -331,6 +338,10 @@ def get_default_cfg(args):
      if getattr(args, 'skip_tracing', False):
          cfg.pipeline.run_tracing = False
 
+     # C4 model variant; the baseline remains the default.
+     cfg.model = CN()
+     cfg.model.variant = "orthrus_baseline"
+
      # Epoch / model selection
      cfg.model_selection = CN()
      cfg.model_selection.method = "min_val_mean_edge_loss"  # ["min_val_mean_edge_loss", "last_epoch"]
@@ -379,12 +390,21 @@ def get_default_cfg(args):
 
      create_cfg_recursive(cfg, TASK_ARGS)
 
+     # C4 defaults keep existing configs on the baseline/type-only path.
+     cfg.detection.gnn_training.decoder.predict_edge_type.enabled = True
+     cfg.detection.gnn_training.decoder.time_gap.enabled = False
+     cfg.detection.gnn_training.decoder.time_gap.lambda_time = 0.3
+     cfg.detection.gnn_training.decoder.time_gap.hidden_dim = 128
+     cfg.detection.gnn_training.decoder.time_gap.num_classes = 6
+
      return cfg
 
 def get_runtime_required_args(return_unknown_args=False, args=None):
      parser = argparse.ArgumentParser()
      parser.add_argument('dataset', type=str, help="Name of the dataset")
      parser.add_argument('--model', type=str, help="Name of the model (Orthrus)")
+     parser.add_argument('--model.variant', type=str, choices=["orthrus_baseline", "mstc"], default=None,
+                         help="Model implementation variant.")
      parser.add_argument('--wandb', action="store_true", help="Whether to submit logs to wandb")
      parser.add_argument('--exp', type=str, default="", help="Name of the experiment")
      parser.add_argument('--tags', type=str, default="", help="Name of the tag to use. Tags are used to group runs together")
