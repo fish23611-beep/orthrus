@@ -12,11 +12,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import pytest
 import torch
 from torch_geometric.data import Data, TemporalData
+from torch_geometric.loader import TemporalDataLoader
 
 import unittest.mock
 sys.modules["encoders"] = unittest.mock.MagicMock()
 
-from src.data_utils import _inject_event_indices, _inject_full_data_event_fields, SPLIT_NAME_TO_INDEX
+from src.data_utils import _inject_event_indices, _inject_full_data_event_fields, SPLIT_NAME_TO_INDEX, custom_temporal_data_loader
 
 
 # --------------------------------------------------------------------------- #
@@ -525,9 +526,12 @@ def test_per_event_split_dtype_shape():
     val = [_make_window_full_emb(torch.tensor([0]), torch.tensor([1]), torch.tensor([10]))[0]]
     test = [_make_window_full_emb(torch.tensor([0, 1, 2]), torch.tensor([1, 2, 0]), torch.tensor([20, 21, 22]))[0]]
     full = _inject_all(train, val, test, FakeCfg())
+    assert isinstance(full.split, torch.Tensor)
     assert full.split.dtype == torch.long
-    assert full.split.shape[0] == 6
-    assert full.split.shape == full_data.shape == (6,)
+    assert full.split.shape == (6,)
+    assert torch.equal(full.split[:2], torch.tensor([0, 0], dtype=torch.long))
+    assert torch.equal(full.split[2:3], torch.tensor([1], dtype=torch.long))
+    assert torch.equal(full.split[3:], torch.tensor([2, 2, 2], dtype=torch.long))
     assert torch.equal(full.split, full.event_split)
 
 
@@ -582,16 +586,35 @@ def test_full_data_split_preserved_in_save_load(tmp_path):
 
 def test_full_data_split_in_temporal_data_loader():
     """Per-event split is preserved through TemporalDataLoader batching."""
-    train = [_make_window_full_emb(torch.tensor([0, 1, 2]), torch.tensor([1, 2, 0]), torch.tensor([0, 10, 20]))[0]]
-    full = _inject_all(train, [], [], FakeCfg())
+    from torch_geometric.data import TemporalData
+    train = [_make_window_full_emb(torch.tensor([0, 1]), torch.tensor([1, 2]), torch.tensor([0, 10]))[0]]
+    val = [_make_window_full_emb(torch.tensor([0]), torch.tensor([1]), torch.tensor([20]))[0]]
+    test = [_make_window_full_emb(torch.tensor([0, 1]), torch.tensor([1, 2]), torch.tensor([30, 40]))[0]]
+    full = _inject_all(train, val, test, FakeCfg())
 
-    loader = torch.utils.data.DataLoader(full, batch_size=2)
-    batches = list(loader)
-    assert len(batches) == 2
-    # First batch
-    assert torch.equal(batches[0].split, torch.tensor([0, 0]))
-    # Second batch
-    assert torch.equal(batches[1].split, torch.tensor([0]))
+    # Convert Data -> TemporalData for the loader
+    full_temporal = TemporalData(
+        src=full.src,
+        dst=full.dst,
+        t=full.t,
+        msg=full.msg,
+        edge_type=full.edge_type,
+        src_type=full.src_type,
+        dst_type=full.dst_type,
+        edge_type_index=full.edge_type_index,
+        global_event_index=full.global_event_index,
+        split=full.split,
+        event_split=full.event_split,
+    )
+    # batch_size=5 loads all 5 events in one batch
+    loader = custom_temporal_data_loader(full_temporal, batch_size=5)
+    batch = next(iter(loader))
+    assert hasattr(batch, "split")
+    assert batch.split.dtype == torch.long
+    # batch.split should match full.split for all events
+    assert torch.equal(batch.split, full.split)
+    assert torch.equal(batch.split, torch.tensor([0, 0, 1, 2, 2], dtype=torch.long))
+    assert torch.equal(batch.t, full.t)
 
 
 def test_empty_window_has_empty_split():
