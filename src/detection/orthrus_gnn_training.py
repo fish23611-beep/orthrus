@@ -56,7 +56,14 @@ def main(cfg):
     train_data, _, _, full_data, max_node_num = load_all_datasets(cfg)
 
     time_gap_statistics = None
-    if cfg.model.variant == "mstc" and cfg.detection.gnn_training.decoder.time_gap.enabled:
+    model_variant = getattr(getattr(cfg, "model", None), "variant", None)
+    time_gap_cfg = getattr(
+        getattr(getattr(cfg, "detection", None), "gnn_training", None),
+        "decoder",
+        None,
+    )
+    time_gap_enabled = getattr(getattr(time_gap_cfg, "time_gap", None), "enabled", False) if time_gap_cfg is not None else False
+    if model_variant == "mstc" and time_gap_enabled:
         time_gap_statistics = fit_time_gap_statistics(train_data)
     model = build_model(
         data_sample=train_data[0], device=device, cfg=cfg, max_node_num=max_node_num,
