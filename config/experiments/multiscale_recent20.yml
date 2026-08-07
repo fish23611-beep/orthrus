@@ -1,0 +1,105 @@
+# C5 recent-20 config: MSTC model with recent (LastNeighborLoader) context mode
+# This is the C4 configuration used for comparison with multiscale variants
+
+pipeline:
+  mode: detection_only
+  run_tracing: false
+
+model:
+  variant: mstc
+
+testing:
+  include_node_messages: false
+
+logging:
+  wandb_mode: disabled
+
+graph_construction:
+  build_graphs:
+    used_method: orthrus
+    use_all_files: true
+    time_window_size: 15.0
+    use_hashed_label: true
+    node_label_features:
+      subject: type, path, cmd_line
+      file: type, path
+      netflow: type, remote_ip, remote_port
+
+edge_featurization:
+  embed_nodes:
+    emb_dim: 128
+    used_method: feature_word2vec
+    use_seed: true
+    feature_word2vec:
+      show_epoch_loss: true
+      window_size: 5
+      min_count: 1
+      use_skip_gram: true
+      num_workers: 6
+      epochs: 50
+      compute_loss: true
+      negative: 5
+      use_node_types: false
+      use_cmd: true
+      use_port: false
+      decline_rate: 30
+  embed_edges:
+    to_remove: true
+
+detection:
+  gnn_training:
+    used_method: orthrus
+    use_seed: true
+    num_epochs: 6
+    lr: 0.00001
+    weight_decay: 0.00001
+    node_hid_dim: 128
+    node_out_dim: 64
+    encoder:
+      use_node_type_in_node_feats: true
+      neighbor_sampling: []
+      edge_features: edge_type
+      use_node_feats_in_gnn: true
+      neighbor_size: 20
+      temporal_dim: 100
+      batch_size: 1024
+      context:
+        mode: recent
+      graph_attention:
+        dropout: 0.5
+        activation: relu
+        num_heads: 8
+    decoder:
+      used_methods: predict_edge_type
+      predict_edge_type:
+        used_method: custom
+        custom:
+          dropout: 0.0
+          num_layers: 2
+          activation: relu
+      time_gap:
+        enabled: false
+        lambda_time: 0.3
+        hidden_dim: 128
+        num_classes: 6
+
+  gnn_testing:
+    threshold_method: max_val_loss
+  evaluation:
+    viz_malicious_nodes: false
+    ground_truth_version: darpa
+    used_method: node_evaluation
+    node_evaluation:
+      threshold_method: max_val_loss
+      use_dst_node_loss: true
+      use_kmeans: true
+      kmeans_top_K: 20
+
+attack_reconstruction:
+  tracing:
+    used_method: depimpact
+    depimpact:
+      used_method: component
+      score_method: degree
+      workers: 8
+      visualize: false

@@ -64,6 +64,7 @@ def _make_encoder(
     use_scale_embedding: bool = False,
     edge_features: tuple[str, ...] = ("edge_type", "msg"),
     fake: FakeGraphEncoder | None = None,
+    fusion: str | None = "gated",
 ) -> tuple[MultiScaleOrthrusEncoder, MultiScaleNeighborLoader, FakeGraphEncoder]:
     store = HistoryStore(num_nodes=8, candidate_capacity=capacity, device="cpu")
     loader = MultiScaleNeighborLoader(
@@ -85,6 +86,7 @@ def _make_encoder(
         edge_features=edge_features,
         gate_hidden_dim=7,
         use_scale_embedding=use_scale_embedding,
+        fusion=fusion,
     )
     return encoder, loader, graph
 
@@ -289,3 +291,146 @@ def test_real_graph_transformer_integration_backward():
     grads = [parameter.grad for parameter in graph.parameters() if parameter.grad is not None]
     assert grads
     assert all(torch.isfinite(grad).all() for grad in grads)
+
+
+# =============================================================================
+# Equal Fusion Tests (C5-B3)
+# =============================================================================
+
+def test_equal_fusion_three_scales_all_valid():
+    """All three scales non-empty → equal weights [1/3, 1/3, 1/3]."""
+    full = _full_data()
+    full.src[0], full.dst[0], full.t[0] = 0, 1, 90
+    full.src[1], full.dst[1], full.t[1] = 0, 2, 60
+    full.src[2], full.dst[2], full.t[2] = 0, 3, 10
+    encoder, loader, _ = _make_encoder(fusion="equal")
+    loader.history_store.insert(torch.tensor([0, 0, 0]), torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]), torch.tensor([90, 60, 10]))
+    h_src, h_dst = _forward(encoder, full, _batch(t=(100,), event_ids=(3,)))
+    weights = encoder.get_last_gate_weights()
+    assert weights is not None
+    assert weights.shape == (1, 3)
+    torch.testing.assert_close(weights[0], torch.tensor([1/3, 1/3, 1/3]), atol=1e-6, rtol=1e-6)
+    assert torch.isfinite(weights).all()
+
+
+def test_equal_fusion_two_scales_valid_short_and_long():
+    """Short and long valid, medium empty → weights [1/2, 0, 1/2]."""
+    full = _full_data()
+    full.src[0], full.dst[0], full.t[0] = 0, 1, 90
+    full.src[2], full.dst[2], full.t[2] = 0, 3, 10
+    encoder, loader, _ = _make_encoder(fusion="equal", budgets=(4, 0, 4))
+    loader.history_store.insert(torch.tensor([0, 0]), torch.tensor([1, 3]), torch.tensor([0, 2]), torch.tensor([90, 10]))
+    h_src, h_dst = _forward(encoder, full, _batch(t=(100,), event_ids=(3,)))
+    weights = encoder.get_last_gate_weights()
+    assert weights is not None
+    assert weights.shape == (1, 3)
+    torch.testing.assert_close(weights[0], torch.tensor([0.5, 0.0, 0.5]), atol=1e-6, rtol=1e-6)
+    assert torch.isfinite(weights).all()
+
+
+def test_equal_fusion_only_long_scale_valid():
+    """Only long scale valid → weights [0, 0, 1]."""
+    full = _full_data()
+    full.src[2], full.dst[2], full.t[2] = 0, 3, 10
+    encoder, loader, _ = _make_encoder(fusion="equal", budgets=(0, 0, 4))
+    loader.history_store.insert(torch.tensor([0]), torch.tensor([3]), torch.tensor([2]), torch.tensor([10]))
+    h_src, h_dst = _forward(encoder, full, _batch(t=(100,), event_ids=(3,)))
+    weights = encoder.get_last_gate_weights()
+    assert weights is not None
+    assert weights.shape == (1, 3)
+    torch.testing.assert_close(weights[0], torch.tensor([0.0, 0.0, 1.0]), atol=1e-6, rtol=1e-6)
+    assert torch.isfinite(weights).all()
+
+
+def test_equal_fusion_all_empty_no_nan_inf():
+    """All three scales empty → fallback to current projection, no NaN/Inf."""
+    encoder, _, _ = _make_encoder(fusion="equal")
+    batch = _batch()
+    h_src, h_dst = _forward(encoder, _full_data(), batch)
+    expected_src = encoder.current_src_out_proj(encoder.src_linear(batch["x"][0]))
+    expected_dst = encoder.current_dst_out_proj(encoder.dst_linear(batch["x"][1]))
+    assert torch.allclose(h_src, expected_src)
+    assert torch.allclose(h_dst, expected_dst)
+    assert torch.isfinite(torch.cat([h_src, h_dst])).all()
+    weights = encoder.get_last_gate_weights()
+    assert torch.equal(weights, torch.zeros(1, 3))
+
+
+def test_equal_fusion_weights_normalize_to_one():
+    """For any case with at least one valid scale, weights sum to 1."""
+    full = _full_data()
+    full.src[0], full.dst[0], full.t[0] = 0, 1, 90
+    full.src[1], full.dst[1], full.t[1] = 0, 2, 60
+    full.src[2], full.dst[2], full.t[2] = 0, 3, 10
+    encoder, loader, _ = _make_encoder(fusion="equal")
+    loader.history_store.insert(torch.tensor([0, 0, 0]), torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]), torch.tensor([90, 60, 10]))
+    h_src, h_dst = _forward(encoder, full, _batch(t=(100,), event_ids=(3,)))
+    weights = encoder.get_last_gate_weights()
+    scale_mask = encoder.get_last_scale_mask()
+    has_scale = scale_mask.any(dim=-1)
+    torch.testing.assert_close(weights.sum(dim=-1)[has_scale], torch.ones(has_scale.sum()), atol=1e-6, rtol=1e-6)
+
+
+def test_equal_fusion_empty_scale_weights_strictly_zero():
+    """Empty scales get exactly 0 weight, not a tiny epsilon."""
+    full = _full_data()
+    full.src[0], full.dst[0], full.t[0] = 0, 1, 90
+    full.src[2], full.dst[2], full.t[2] = 0, 3, 10
+    encoder, loader, _ = _make_encoder(fusion="equal", budgets=(4, 0, 4))
+    loader.history_store.insert(torch.tensor([0, 0]), torch.tensor([1, 3]), torch.tensor([0, 2]), torch.tensor([90, 10]))
+    h_src, h_dst = _forward(encoder, full, _batch(t=(100,), event_ids=(3,)))
+    weights = encoder.get_last_gate_weights()
+    scale_mask = encoder.get_last_scale_mask()
+    empty_mask = ~scale_mask
+    assert (weights[empty_mask] == 0.0).all(), "Empty scales should have exactly 0 weight"
+
+
+def test_equal_fusion_regression_gated_still_uses_gate():
+    """fusion='gated' still uses gate MLP (not equal) and outputs finite weights."""
+    full = _full_data()
+    full.src[0], full.dst[0], full.t[0] = 0, 1, 90
+    full.src[1], full.dst[1], full.t[1] = 0, 2, 60
+    full.src[2], full.dst[2], full.t[2] = 0, 3, 10
+    encoder, loader, _ = _make_encoder(fusion="gated")
+    loader.history_store.insert(torch.tensor([0, 0, 0]), torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]), torch.tensor([90, 60, 10]))
+    h_src, h_dst = _forward(encoder, full, _batch(t=(100,), event_ids=(3,)))
+    weights = encoder.get_last_gate_weights()
+    assert weights is not None
+    assert torch.isfinite(weights).all()
+    assert weights.shape == (1, 3)
+    has_scale = encoder.get_last_scale_mask().any(dim=-1)
+    torch.testing.assert_close(weights.sum(dim=-1)[has_scale], torch.ones(1), atol=1e-6, rtol=1e-6)
+    assert list(encoder.gate_mlp.parameters()), "gate_mlp should have parameters (not replaced by equal)"
+
+
+def test_equal_fusion_invalid_fusion_raises():
+    """fusion='abc' must raise ValueError."""
+    with pytest.raises(ValueError, match="Invalid fusion"):
+        MultiScaleOrthrusEncoder(
+            shared_graph_encoder=FakeGraphEncoder(5, 4),
+            neighbor_loader=MultiScaleNeighborLoader(
+                history_store=HistoryStore(num_nodes=8, candidate_capacity=20, device="cpu"),
+                tau_short_ns=20, tau_medium_ns=50, tau_max_ns=100,
+                short_budget=4, medium_budget=4, long_budget=4,
+            ),
+            in_dim=3, temporal_dim=5, node_out_dim=4,
+            edge_features=("edge_type", "msg"),
+            gate_hidden_dim=7,
+            fusion="abc",
+        )
+
+
+def test_equal_fusion_backward_pass():
+    """Equal fusion backward pass produces finite gradients."""
+    full = _full_data()
+    full.src[0], full.dst[0], full.t[0] = 0, 1, 90
+    full.src[1], full.dst[1], full.t[1] = 0, 2, 60
+    full.src[2], full.dst[2], full.t[2] = 0, 3, 10
+    encoder, loader, graph = _make_encoder(fusion="equal")
+    loader.history_store.insert(torch.tensor([0, 0, 0]), torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]), torch.tensor([90, 60, 10]))
+    h_src, h_dst = _forward(encoder, full, _batch(t=(100,), event_ids=(3,)))
+    (h_src.square().mean() + h_dst.square().mean()).backward()
+    assert torch.isfinite(torch.cat([h_src, h_dst])).all()
+    for name, param in encoder.named_parameters():
+        if param.grad is not None:
+            assert torch.isfinite(param.grad).all(), f"Non-finite gradient on {name}"

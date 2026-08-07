@@ -39,6 +39,7 @@ class MultiScaleOrthrusEncoder(nn.Module):
         gate_hidden_dim: int = 64,
         use_scale_embedding: bool = False,
         encoder: Optional[nn.Module] = None,
+        fusion: Optional[str] = None,
     ) -> None:
         super().__init__()
         if shared_graph_encoder is None:
@@ -59,6 +60,7 @@ class MultiScaleOrthrusEncoder(nn.Module):
         self.temporal_dim = int(temporal_dim)
         self.node_out_dim = int(node_out_dim)
         self.use_node_feats_in_gnn = bool(use_node_feats_in_gnn)
+        self.requires_global_event_index = True  # Capability flag for factory/model
         if isinstance(edge_features, str):
             edge_features = edge_features.split(",")
         self.edge_features = tuple(feature.strip() for feature in edge_features)
@@ -73,6 +75,11 @@ class MultiScaleOrthrusEncoder(nn.Module):
             nn.Linear(gate_hidden_dim, 3),
         )
         self.use_scale_embedding = bool(use_scale_embedding)
+        self.fusion = str(fusion).strip().lower() if fusion is not None else "gated"
+        if self.fusion not in ("gated", "equal"):
+            raise ValueError(
+                f"Invalid fusion={fusion!r}. Expected 'gated' or 'equal'."
+            )
         if self.use_scale_embedding:
             self.scale_embedding = nn.Embedding(3, self.temporal_dim)
 
@@ -278,14 +285,23 @@ class MultiScaleOrthrusEncoder(nn.Module):
         h_src_stack = torch.stack(scale_src, dim=1)
         h_dst_stack = torch.stack(scale_dst, dim=1)
         non_empty_scale_mask = torch.stack(scale_masks, dim=1)
-        gate_input = torch.cat(
-            [h_src_stack[:, 0], h_dst_stack[:, 0], h_src_stack[:, 1], h_dst_stack[:, 1],
-             h_src_stack[:, 2], h_dst_stack[:, 2], current_src_out, current_dst_out], dim=-1
-        )
-        gate_weights = _masked_softmax_with_fallback(self.gate_mlp(gate_input), non_empty_scale_mask)
-        h_src = (gate_weights.unsqueeze(-1) * h_src_stack).sum(dim=1)
-        h_dst = (gate_weights.unsqueeze(-1) * h_dst_stack).sum(dim=1)
         all_empty = ~non_empty_scale_mask.any(dim=-1)
+        if self.fusion == "gated":
+            gate_input = torch.cat(
+                [h_src_stack[:, 0], h_dst_stack[:, 0], h_src_stack[:, 1], h_dst_stack[:, 1],
+                 h_src_stack[:, 2], h_dst_stack[:, 2], current_src_out, current_dst_out], dim=-1
+            )
+            gate_weights = _masked_softmax_with_fallback(self.gate_mlp(gate_input), non_empty_scale_mask)
+            h_src = (gate_weights.unsqueeze(-1) * h_src_stack).sum(dim=1)
+            h_dst = (gate_weights.unsqueeze(-1) * h_dst_stack).sum(dim=1)
+        elif self.fusion == "equal":
+            weights = non_empty_scale_mask.float()
+            denom = weights.sum(dim=-1, keepdim=True)
+            safe_denom = torch.where(denom > 0, denom, torch.ones_like(denom))
+            weights = torch.where(denom > 0, weights / safe_denom, torch.zeros_like(weights))
+            gate_weights = weights
+            h_src = (weights.unsqueeze(-1) * h_src_stack).sum(dim=1)
+            h_dst = (weights.unsqueeze(-1) * h_dst_stack).sum(dim=1)
         h_src = torch.where(all_empty.unsqueeze(-1), current_src_out, h_src)
         h_dst = torch.where(all_empty.unsqueeze(-1), current_dst_out, h_dst)
         self.last_gate_weights = gate_weights.detach().clone()

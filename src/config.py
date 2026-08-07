@@ -108,6 +108,20 @@ TASK_ARGS = {
                          "activation": str,
                          "num_heads": int,
                     },
+                    "context": {
+                         "mode": str,  # ["recent" | "multiscale"]
+                         "multiscale": {
+                              "enabled": bool,
+                              "candidate_capacity": int,
+                              "history_device": str,
+                              "scale_quantiles": list,
+                              "neighbor_budgets": list,
+                              "share_encoder": bool,
+                              "fusion": str,  # ["gated" | "equal"]
+                              "use_scale_embedding": bool,
+                              "gate_hidden_dim": int,
+                         },
+                    },
                },
                "decoder": {
                     "used_methods": str,
@@ -397,6 +411,18 @@ def get_default_cfg(args):
      cfg.detection.gnn_training.decoder.time_gap.hidden_dim = 128
      cfg.detection.gnn_training.decoder.time_gap.num_classes = 6
 
+     # C5 defaults: recent context preserves baseline behavior by default.
+     cfg.detection.gnn_training.encoder.context.mode = "recent"
+     cfg.detection.gnn_training.encoder.context.multiscale.enabled = False
+     cfg.detection.gnn_training.encoder.context.multiscale.candidate_capacity = 64
+     cfg.detection.gnn_training.encoder.context.multiscale.history_device = "cpu"
+     cfg.detection.gnn_training.encoder.context.multiscale.scale_quantiles = [0.50, 0.90, 0.99]
+     cfg.detection.gnn_training.encoder.context.multiscale.neighbor_budgets = [8, 8, 8]
+     cfg.detection.gnn_training.encoder.context.multiscale.share_encoder = True
+     cfg.detection.gnn_training.encoder.context.multiscale.fusion = "gated"
+     cfg.detection.gnn_training.encoder.context.multiscale.use_scale_embedding = False
+     cfg.detection.gnn_training.encoder.context.multiscale.gate_hidden_dim = 64
+
      return cfg
 
 def get_runtime_required_args(return_unknown_args=False, args=None):
@@ -404,7 +430,8 @@ def get_runtime_required_args(return_unknown_args=False, args=None):
      parser.add_argument('dataset', type=str, help="Name of the dataset")
      parser.add_argument('--model', type=str, help="Name of the model (Orthrus)")
      parser.add_argument('--model.variant', type=str, choices=["orthrus_baseline", "mstc"], default=None,
-                         help="Model implementation variant.")
+                        help="Model implementation variant.")
+     # Note: detection.gnn_training.encoder.context.mode is added automatically by add_cfg_args_to_parser
      parser.add_argument('--wandb', action="store_true", help="Whether to submit logs to wandb")
      parser.add_argument('--exp', type=str, default="", help="Name of the experiment")
      parser.add_argument('--tags', type=str, default="", help="Name of the tag to use. Tags are used to group runs together")

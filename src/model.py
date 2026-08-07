@@ -45,8 +45,7 @@ class Orthrus(nn.Module):
                 edge_feats=batch.edge_feats if hasattr(batch, "edge_feats") else None,
                 full_data=full_data,
                 inference=inference,
-
-                edge_types= batch.edge_type
+                edge_types=batch.edge_type,
             )
 
             h_src, h_dst = (h[edge_index[0]], h[edge_index[1]]) \
@@ -132,6 +131,16 @@ class MSTCOrthrus(nn.Module):
             )
 
         with torch.set_grad_enabled(train_mode):
+            batch_global_event_index = getattr(batch, "global_event_index", None)
+            encoder_kwargs = dict(edge_types=batch.edge_type)
+            # Capability-based check: only pass global_event_index if encoder requires it
+            if getattr(self.encoder, "requires_global_event_index", False):
+                if batch_global_event_index is None:
+                    raise ValueError(
+                        "This encoder requires batch.global_event_index, "
+                        "but it is not present on the batch."
+                    )
+                encoder_kwargs["global_event_index"] = batch_global_event_index
             h = self.encoder(
                 edge_index=edge_index,
                 t=batch.t,
@@ -140,7 +149,7 @@ class MSTCOrthrus(nn.Module):
                 edge_feats=batch.edge_feats if hasattr(batch, "edge_feats") else None,
                 full_data=full_data,
                 inference=inference,
-                edge_types=batch.edge_type,
+                **encoder_kwargs,
             )
             h_src, h_dst = (h[edge_index[0]], h[edge_index[1]]) if isinstance(h, torch.Tensor) else h
             if x[0].shape[0] != batch_size:

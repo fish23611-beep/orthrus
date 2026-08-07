@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mstc.time_gap import TimeGapStatistics
+from mstc.history_store import HistoryStore
+from mstc.multiscale_sampler import MultiScaleNeighborLoader, log_seconds_boundaries_to_ns
+from mstc.multiscale_encoder import MultiScaleOrthrusEncoder
 
 from provnet_utils import *
 from config import *
@@ -52,19 +55,36 @@ def model_factory(encoder, decoders, cfg, in_dim, graph_reindexer, device, max_n
         ).to(device)
     raise ValueError(f"Unknown model.variant: {variant}")
 
+def _build_graph_encoder(cfg, in_dim, edge_dim, temporal_dim, node_hid_dim, node_out_dim, num_heads, activation_fn, dropout):
+    """Build the shared GraphTransformer used by both recent and multiscale encoders."""
+    return GraphTransformer(
+        in_dim=in_dim,
+        hid_dim=node_hid_dim,
+        out_dim=node_out_dim,
+        edge_dim=edge_dim or None,
+        activation=activation_fn,
+        dropout=dropout,
+        num_heads=num_heads,
+    )
+
+
 def encoder_factory(cfg, msg_dim, in_dim, edge_dim, graph_reindexer, device, max_node_num):
     node_hid_dim = cfg.detection.gnn_training.node_hid_dim
     node_out_dim = cfg.detection.gnn_training.node_out_dim
     temporal_dim = cfg.detection.gnn_training.encoder.temporal_dim
-    
-    # If edge features are used, we set them here
-    edge_dim = 0
+    dropout = cfg.detection.gnn_training.encoder.graph_attention.dropout
+    activation_str = cfg.detection.gnn_training.encoder.graph_attention.activation
+    num_heads = cfg.detection.gnn_training.encoder.graph_attention.num_heads
+    use_node_feats_in_gnn = cfg.detection.gnn_training.encoder.use_node_feats_in_gnn
+
+    # Edge dimension
+    edge_dim_agg = 0
     edge_features = list(map(lambda x: x.strip(), cfg.detection.gnn_training.encoder.edge_features.split(",")))
     for edge_feat in edge_features:
         if edge_feat == "edge_type":
-            edge_dim += cfg.dataset.num_edge_types
+            edge_dim_agg += cfg.dataset.num_edge_types
         elif edge_feat == "msg":
-            edge_dim += msg_dim
+            edge_dim_agg += msg_dim
         elif edge_feat == "none":
             pass
         else:
@@ -72,35 +92,68 @@ def encoder_factory(cfg, msg_dim, in_dim, edge_dim, graph_reindexer, device, max
 
     original_in_dim = in_dim
     in_dim = temporal_dim
-    
-    encoder = GraphTransformer(
-        in_dim=in_dim,
-        hid_dim=node_hid_dim,
-        out_dim=node_out_dim,
-        edge_dim=edge_dim or None,
-        activation=activation_fn_factory(cfg.detection.gnn_training.encoder.graph_attention.activation),
-        dropout=cfg.detection.gnn_training.encoder.graph_attention.dropout,
-        num_heads=cfg.detection.gnn_training.encoder.graph_attention.num_heads,
-    )
-    neighbor_size = cfg.detection.gnn_training.encoder.neighbor_size
-    use_node_feats_in_gnn = cfg.detection.gnn_training.encoder.use_node_feats_in_gnn
+    activation_fn = activation_fn_factory(activation_str)
 
-    neighbor_loader = LastNeighborLoader(max_node_num, size=neighbor_size, device=device)
+    context_mode = getattr(cfg.detection.gnn_training.encoder, "context", None)
+    mode = getattr(context_mode, "mode", "recent") if context_mode else "recent"
+    multiscale_enabled = getattr(context_mode, "multiscale", None) and getattr(context_mode.multiscale, "enabled", False)
 
-    encoder = OrthrusEncoder(
-        encoder=encoder,
-        neighbor_loader=neighbor_loader,
-        in_dim=original_in_dim,
-        temporal_dim=temporal_dim,
-        use_node_feats_in_gnn=use_node_feats_in_gnn,
-        graph_reindexer=graph_reindexer,
-        edge_features=edge_features,
-        device=device,
-        num_nodes=max_node_num,
-        edge_dim=edge_dim,
-    )
+    if mode == "recent":
+        graph_encoder = _build_graph_encoder(
+            cfg, in_dim, edge_dim_agg, temporal_dim, node_hid_dim, node_out_dim, num_heads, activation_fn, dropout
+        )
+        neighbor_loader = LastNeighborLoader(max_node_num, size=cfg.detection.gnn_training.encoder.neighbor_size, device=device)
+        return OrthrusEncoder(
+            encoder=graph_encoder,
+            neighbor_loader=neighbor_loader,
+            in_dim=original_in_dim,
+            temporal_dim=temporal_dim,
+            use_node_feats_in_gnn=use_node_feats_in_gnn,
+            graph_reindexer=graph_reindexer,
+            edge_features=edge_features,
+            device=device,
+            num_nodes=max_node_num,
+            edge_dim=edge_dim_agg,
+        )
 
-    return encoder
+    elif mode == "multiscale":
+        if not multiscale_enabled:
+            raise ValueError("context.mode=multiscale requires multiscale.enabled=True")
+        ms_cfg = context_mode.multiscale
+        tau_short_ns, tau_medium_ns, tau_max_ns = log_seconds_boundaries_to_ns(ms_cfg.scale_quantiles)
+        history_store = HistoryStore(
+            num_nodes=max_node_num,
+            candidate_capacity=int(ms_cfg.candidate_capacity),
+            device=str(ms_cfg.history_device),
+        )
+        neighbor_loader = MultiScaleNeighborLoader(
+            history_store=history_store,
+            tau_short_ns=tau_short_ns,
+            tau_medium_ns=tau_medium_ns,
+            tau_max_ns=tau_max_ns,
+            short_budget=int(ms_cfg.neighbor_budgets[0]),
+            medium_budget=int(ms_cfg.neighbor_budgets[1]),
+            long_budget=int(ms_cfg.neighbor_budgets[2]),
+        )
+        graph_encoder = _build_graph_encoder(
+            cfg, in_dim, edge_dim_agg, temporal_dim, node_hid_dim, node_out_dim, num_heads, activation_fn, dropout
+        )
+        return MultiScaleOrthrusEncoder(
+            shared_graph_encoder=graph_encoder,
+            neighbor_loader=neighbor_loader,
+            in_dim=original_in_dim,
+            temporal_dim=temporal_dim,
+            node_out_dim=node_out_dim,
+            use_node_feats_in_gnn=use_node_feats_in_gnn,
+            edge_features=edge_features,
+            device=device,
+            gate_hidden_dim=int(ms_cfg.gate_hidden_dim),
+            use_scale_embedding=bool(ms_cfg.use_scale_embedding),
+            fusion=str(ms_cfg.fusion).strip().lower() if hasattr(ms_cfg, "fusion") else "gated",
+        )
+
+    else:
+        raise ValueError(f"Unknown context.mode: {mode!r}. Expected 'recent' or 'multiscale'.")
 
 def decoder_factory(cfg, in_dim, device, max_node_num):
     node_out_dim = cfg.detection.gnn_training.node_out_dim
