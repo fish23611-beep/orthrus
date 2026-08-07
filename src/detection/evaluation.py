@@ -25,7 +25,11 @@ def standard_evaluation(cfg, evaluation_fn):
     test_losses_dir = os.path.join(cfg.detection.gnn_testing._edge_losses_dir, "test")
     val_losses_dir = os.path.join(cfg.detection.gnn_testing._edge_losses_dir, "val")
 
-    tw_to_malicious_nodes = compute_tw_labels(cfg)
+    tw_to_malicious_nodes = (
+        compute_tw_labels(cfg)
+        if cfg.model.variant == "orthrus_baseline"
+        else {}
+    )
 
     # Collect per-epoch stats so we can pick the best one
     epoch_results = []   # list of (model_epoch_dir, stats)
@@ -115,12 +119,47 @@ def standard_evaluation(cfg, evaluation_fn):
     wandb.log(best_stats)
 
 
+def mstc_evaluation_main(val_tw_path, test_tw_path, model_epoch_dir, cfg, **kwargs):
+    """Inject legacy GT and metric providers into the lightweight C6 runner."""
+    from mstc.calibration_runner import (
+        load_event_records_from_csv,
+        load_event_records_from_csv_directory,
+        run_calibration,
+    )
+    from mstc.evaluation_runner import mstc_evaluation_main as run_mstc_evaluation
+    from mstc.node_evaluation import get_mstc_node_predictions_from_cfg
+
+    class CalibrationModule:
+        load_event_records_from_csv = staticmethod(load_event_records_from_csv)
+        load_event_records_from_csv_directory = staticmethod(
+            load_event_records_from_csv_directory
+        )
+        run_calibration = staticmethod(run_calibration)
+
+    result = run_mstc_evaluation(
+        val_tw_path,
+        test_tw_path,
+        model_epoch_dir,
+        cfg,
+        calibration_module=CalibrationModule,
+        node_prediction_fn=get_mstc_node_predictions_from_cfg,
+        ground_truth_fn=get_ground_truth_nids,
+        classifier_evaluation_fn=classifier_evaluation,
+    )
+    return result["stats"]
+
+
 def main(cfg):
     method = cfg.detection.evaluation.used_method.strip()
-    if method == "node_evaluation":
-        standard_evaluation(cfg, evaluation_fn=node_evaluation.main)
-    else:
+    variant = cfg.model.variant
+    if method != "node_evaluation":
         raise ValueError(f"Invalid evaluation method {cfg.detection.evaluation.used_method}")
+    if variant == "orthrus_baseline":
+        standard_evaluation(cfg, evaluation_fn=node_evaluation.main)
+    elif variant == "mstc":
+        standard_evaluation(cfg, evaluation_fn=mstc_evaluation_main)
+    else:
+        raise ValueError(f"Invalid model variant {variant}")
 
 
 if __name__ == "__main__":
