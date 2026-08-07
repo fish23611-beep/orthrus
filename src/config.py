@@ -692,6 +692,17 @@ def _validate_dataset_view_mode(mode: str) -> str:
     return mode_str
 
 
+def _validate_calibration_method(method: str) -> str:
+    valid_methods = ("global_empirical", "relation_triplet", "hierarchical_relation")
+    method_str = str(method).strip().lower()
+    if method_str not in valid_methods:
+        raise ValueError(
+            "Invalid calibration.method=%r. Allowed values: %s"
+            % (method, ", ".join(valid_methods))
+        )
+    return method_str
+
+
 def get_yml_cfg(args):
      # Checks that CLI args are OK
      check_args(args)
@@ -747,6 +758,9 @@ def get_yml_cfg(args):
 
      if hasattr(cfg, "dataset_view") and hasattr(cfg.dataset_view, "mode"):
          cfg.dataset_view.mode = _validate_dataset_view_mode(cfg.dataset_view.mode)
+
+     if hasattr(cfg, "calibration") and hasattr(cfg.calibration, "method"):
+         cfg.calibration.method = _validate_calibration_method(cfg.calibration.method)
 
      if hasattr(cfg, "pipeline") and hasattr(cfg.pipeline, "mode"):
          cfg.pipeline.mode = _validate_pipeline_mode(cfg.pipeline.mode)

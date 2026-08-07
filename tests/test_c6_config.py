@@ -191,3 +191,21 @@ def test_kmeans_one_test_node_fails_without_calling_legacy(monkeypatch):
             _events({"validation": 1.0}), _events({"only": 2.0}),
             include_dst=False, threshold_method="kmeans",
         )
+
+
+def test_calibration_method_validation_and_experiment_overlays():
+    import yaml
+    from config import _validate_calibration_method
+
+    expected = {
+        "calibration_global_p.yml": "global_empirical",
+        "calibration_relation.yml": "relation_triplet",
+        "calibration_hierarchical.yml": "hierarchical_relation",
+    }
+    overlay_dir = Path(__file__).resolve().parents[1] / "config" / "experiments"
+    for filename, method in expected.items():
+        assert _validate_calibration_method(method) == method
+        payload = yaml.safe_load((overlay_dir / filename).read_text(encoding="utf-8"))
+        assert payload == {"calibration": {"method": method}}
+    with pytest.raises(ValueError, match="calibration.method"):
+        _validate_calibration_method("unsupported")

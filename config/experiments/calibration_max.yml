@@ -1,0 +1,3 @@
+# C6 node-threshold comparison: maximum normal validation node score.
+node_threshold:
+  method: max_validation

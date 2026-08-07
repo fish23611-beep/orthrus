@@ -1,0 +1,4 @@
+# C6 node-threshold comparison: high normal validation-node quantile.
+node_threshold:
+  method: validation_quantile
+  quantile: 0.999

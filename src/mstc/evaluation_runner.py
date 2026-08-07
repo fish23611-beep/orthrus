@@ -9,6 +9,11 @@ from typing import Any, Callable
 import numpy as np
 
 
+_SUPPORTED_CALIBRATION_METHODS = frozenset(
+    {"global_empirical", "relation_triplet", "hierarchical_relation"}
+)
+
+
 def run_mstc_epoch(
     val_tw_path: str | Path,
     test_tw_path: str | Path,
@@ -22,7 +27,7 @@ def run_mstc_epoch(
     val_path, test_path = Path(val_tw_path), Path(test_tw_path)
     if val_path.name != model_epoch_dir or test_path.name != model_epoch_dir:
         raise ValueError("validation and test raw artifacts must match model_epoch_dir")
-    if cfg.calibration.method != "hierarchical_relation":
+    if cfg.calibration.method not in _SUPPORTED_CALIBRATION_METHODS:
         raise ValueError(f"Unsupported C6 calibration method: {cfg.calibration.method}")
     validation_records = calibration_module.load_event_records_from_csv_directory(val_path)
     test_records = calibration_module.load_event_records_from_csv_directory(test_path)
@@ -34,6 +39,7 @@ def run_mstc_epoch(
         min_triplet_samples=cfg.calibration.min_triplet_samples,
         min_type_pair_samples=cfg.calibration.min_type_pair_samples,
         epsilon=cfg.calibration.epsilon,
+        method=cfg.calibration.method,
     )
     validation_calibrated = calibration_module.load_event_records_from_csv(output_dir / "validation_calibrated.csv")
     test_calibrated = calibration_module.load_event_records_from_csv(output_dir / "test_calibrated.csv")

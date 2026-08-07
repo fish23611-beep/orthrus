@@ -1,0 +1,3 @@
+# C6 relation-triplet calibration ablation.
+calibration:
+  method: relation_triplet

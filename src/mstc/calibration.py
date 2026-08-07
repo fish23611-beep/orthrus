@@ -17,6 +17,12 @@ import numpy as np
 
 
 CalibrationLevel = Literal["triplet", "type_pair", "global"]
+CalibrationMethod = Literal[
+    "global_empirical", "relation_triplet", "hierarchical_relation"
+]
+_CALIBRATION_METHODS = frozenset(
+    {"global_empirical", "relation_triplet", "hierarchical_relation"}
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +48,7 @@ class HierarchicalRelationCalibrator:
         min_triplet_samples: int = 100,
         min_type_pair_samples: int = 200,
         epsilon: float = 1.0e-12,
+        method: CalibrationMethod = "hierarchical_relation",
     ) -> None:
         self.min_triplet_samples = self._validate_min_samples(
             min_triplet_samples, "min_triplet_samples"
@@ -50,6 +57,7 @@ class HierarchicalRelationCalibrator:
             min_type_pair_samples, "min_type_pair_samples"
         )
         self.epsilon = self._validate_epsilon(epsilon)
+        self.method = self._validate_method(method)
         self.triplet_scores: dict[tuple[int, int, int], np.ndarray] = {}
         self.type_pair_scores: dict[tuple[int, int], np.ndarray] = {}
         self.global_scores = np.array([], dtype=np.float64)
@@ -71,6 +79,18 @@ class HierarchicalRelationCalibrator:
         if not np.isfinite(epsilon) or not 0.0 < epsilon <= 1.0:
             raise ValueError("epsilon must be a finite float in (0, 1]")
         return epsilon
+
+
+    @staticmethod
+    def _validate_method(method: str) -> CalibrationMethod:
+        method_str = str(method).strip().lower()
+        if method_str not in _CALIBRATION_METHODS:
+            raise ValueError(
+                "method must be one of: global_empirical, relation_triplet, "
+                "hierarchical_relation"
+            )
+        return method_str  # type: ignore[return-value]
+
 
     @staticmethod
     def _required(record: Mapping[str, Any], field: str) -> Any:
@@ -158,10 +178,17 @@ class HierarchicalRelationCalibrator:
     def _select_reference(
         self, event: _Event, *, leave_one_out: bool
     ) -> tuple[np.ndarray, CalibrationLevel]:
+        if self.method == "global_empirical":
+            return self.global_scores, "global"
+
         adjustment = 1 if leave_one_out else 0
         triplet = self.triplet_scores.get(event.triplet_key)
         if triplet is not None and triplet.size - adjustment >= self.min_triplet_samples:
             return triplet, "triplet"
+
+        if self.method == "relation_triplet":
+            return self.global_scores, "global"
+
         type_pair = self.type_pair_scores.get(event.type_pair_key)
         if type_pair is not None and type_pair.size - adjustment >= self.min_type_pair_samples:
             return type_pair, "type_pair"

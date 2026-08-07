@@ -1,0 +1,3 @@
+# C6 calibrated event-score path implemented by HierarchicalRelationCalibrator.
+calibration:
+  method: hierarchical_relation

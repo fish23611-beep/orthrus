@@ -210,6 +210,7 @@ def run_calibration(
     min_triplet_samples: int = 100,
     min_type_pair_samples: int = 200,
     epsilon: float = 1e-12,
+    method: str = "hierarchical_relation",
 ) -> dict[str, Any]:
     """Run calibration on validation and test records.
 
@@ -229,6 +230,9 @@ def run_calibration(
         Minimum samples required for type_pair-level calibration.
     epsilon : float
         Epsilon value for log transformation to prevent log(0).
+    method : str
+        Reference-selection ablation: global_empirical, relation_triplet, or
+        hierarchical_relation.
 
     Returns
     -------
@@ -262,6 +266,7 @@ def run_calibration(
         min_triplet_samples=min_triplet_samples,
         min_type_pair_samples=min_type_pair_samples,
         epsilon=epsilon,
+        method=method,
     )
     calibrator.fit(validation_records)
 
@@ -367,6 +372,7 @@ def _build_summary(
     test_global_count = test_levels.get("global", 0)
 
     summary: dict[str, Any] = {
+        "calibration_method": calibrator.method,
         "calibration_parameters": {
             "min_triplet_samples": min_triplet_samples,
             "min_type_pair_samples": min_type_pair_samples,

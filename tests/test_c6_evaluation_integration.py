@@ -98,7 +98,7 @@ def test_runner_orders_calibration_prediction_ground_truth_metrics_and_passes_cf
         classifier_evaluation_fn=metrics,
     )
     assert [calls[0][0], *calls[1:]] == ["calibration", "node_prediction", "ground_truth", "metrics"]
-    assert calls[0][1] == {"min_triplet_samples": 7, "min_type_pair_samples": 9, "epsilon": 1e-7}
+    assert calls[0][1] == {"min_triplet_samples": 7, "min_type_pair_samples": 9, "epsilon": 1e-7, "method": "hierarchical_relation"}
     assert result["prediction_result"]["test_node_predictions"] == {"t": 1}
     assert (result["output_dir"] / "node_predictions.csv").exists()
     assert (val / "events.csv").read_bytes() == raw
@@ -286,3 +286,19 @@ def test_real_b2_b6_synthetic_smoke(tmp_path):
     assert set(result["prediction_result"]["test_node_predictions"]) == {"t11", "t12", "t13"}
     assert (val / "events.csv").read_bytes() == val_before
     assert (test / "events.csv").read_bytes() == test_before
+
+
+@pytest.mark.parametrize(
+    "method", ["global_empirical", "relation_triplet", "hierarchical_relation"]
+)
+def test_evaluation_runner_passes_each_calibration_method_to_b2(tmp_path, method):
+    val, test, _ = epoch_paths(tmp_path)
+    calibration = FakeCalibration()
+    cfg = make_cfg(tmp_path)
+    cfg.calibration.method = method
+    evaluation_runner.run_mstc_epoch(
+        val, test, "model_epoch_1", cfg,
+        calibration_module=calibration,
+        node_prediction_fn=lambda *args: {"test_node_scores": {}, "test_node_predictions": {}},
+    )
+    assert calibration.calls[0][1]["method"] == method

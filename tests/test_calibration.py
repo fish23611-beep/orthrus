@@ -136,3 +136,79 @@ def test_edge_type_alias_is_accepted():
     records = [{"score_raw": 1.0, "src_type": 1, "edge_type": 2, "dst_type": 3}]
     result = _fit(records, min_triplet_samples=1).calibrate(records)[0]
     assert result["calibration_level"] == "triplet"
+
+
+def test_global_empirical_always_uses_global_reference():
+    records = [
+        _record(1.0, src=1, edge=1, dst=1),
+        _record(5.0, src=2, edge=2, dst=2),
+        _record(9.0, src=3, edge=3, dst=3),
+    ]
+    calibrator = HierarchicalRelationCalibrator(
+        min_triplet_samples=1, min_type_pair_samples=1, method="global_empirical"
+    ).fit(records)
+    results = calibrator.calibrate([
+        _record(5.0, src=1, edge=1, dst=1),
+        _record(5.0, src=99, edge=98, dst=97),
+    ])
+    assert [result["calibration_level"] for result in results] == ["global", "global"]
+    assert results[0]["empirical_p"] == pytest.approx(results[1]["empirical_p"])
+
+
+def test_global_empirical_loo_removes_only_current_event_once():
+    records = [
+        _record(1.0, src=1, edge=1, dst=1),
+        _record(5.0, src=2, edge=2, dst=2),
+        _record(5.0, src=3, edge=3, dst=3),
+    ]
+    transformed = HierarchicalRelationCalibrator(
+        method="global_empirical"
+    ).fit(records).transform_val_with_loo(records)
+    # For either score-5 event, one (and only one) equal-score event remains:
+    # (1 + 1) / (2 + 1) under the unchanged add-one formula.
+    assert transformed[1]["empirical_p"] == pytest.approx(2.0 / 3.0)
+    assert transformed[1]["calibration_level"] == "global"
+
+
+def test_relation_triplet_uses_triplet_when_sufficient():
+    records = [
+        _record(1.0, src=1, edge=2, dst=3),
+        _record(2.0, src=1, edge=2, dst=3),
+        _record(3.0, src=4, edge=5, dst=6),
+    ]
+    result = HierarchicalRelationCalibrator(
+        min_triplet_samples=2, min_type_pair_samples=2, method="relation_triplet"
+    ).fit(records).calibrate([_record(2.5, src=1, edge=2, dst=3)])[0]
+    assert result["calibration_level"] == "triplet"
+
+
+def test_relation_triplet_falls_back_to_global_not_type_pair():
+    records = [
+        _record(9.0, src=1, edge=1, dst=2),
+        _record(1.0, src=1, edge=2, dst=2),
+        _record(2.0, src=1, edge=3, dst=2),
+        _record(3.0, src=1, edge=4, dst=2),
+        _record(4.0, src=8, edge=8, dst=8),
+    ]
+    query = [_record(9.0, src=1, edge=1, dst=2)]
+    relation = HierarchicalRelationCalibrator(
+        min_triplet_samples=2, min_type_pair_samples=3, method="relation_triplet"
+    ).fit(records).calibrate(query)[0]
+    hierarchical = HierarchicalRelationCalibrator(
+        min_triplet_samples=2, min_type_pair_samples=3
+    ).fit(records).calibrate(query)[0]
+    assert relation["calibration_level"] == "global"
+    assert hierarchical["calibration_level"] == "type_pair"
+    assert relation["score_calibrated"] != pytest.approx(hierarchical["score_calibrated"])
+
+
+def test_relation_triplet_loo_checks_count_after_removing_current_event():
+    records = [
+        _record(1.0, src=1, edge=2, dst=3),
+        _record(2.0, src=1, edge=2, dst=3),
+    ]
+    calibrator = HierarchicalRelationCalibrator(
+        min_triplet_samples=2, min_type_pair_samples=1, method="relation_triplet"
+    ).fit(records)
+    assert calibrator.calibrate([_record(1.5, src=1, edge=2, dst=3)])[0]["calibration_level"] == "triplet"
+    assert {record["calibration_level"] for record in calibrator.transform_val_with_loo(records)} == {"global"}

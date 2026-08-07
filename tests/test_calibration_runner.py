@@ -550,3 +550,38 @@ class Test15Determinism:
         for r1, r2 in zip(csv1, csv2):
             assert float(r1["score_calibrated"]) == pytest.approx(float(r2["score_calibrated"]))
             assert r1["calibration_level"] == r2["calibration_level"]
+
+
+@pytest.mark.parametrize(
+    ("method", "allowed_levels"),
+    [
+        ("global_empirical", {"global"}),
+        ("relation_triplet", {"triplet", "global"}),
+        ("hierarchical_relation", {"triplet", "type_pair", "global"}),
+    ],
+)
+def test_runner_supports_all_calibration_methods_and_records_summary(
+    tmp_path, method, allowed_levels
+):
+    validation = [
+        _record(1.0, event_index=0),
+        _record(2.0, event_index=1),
+        _record(3.0, event_index=2),
+    ]
+    testing = [_record(2.5, event_index=100)]
+    output = tmp_path / method
+    summary = run_calibration(
+        validation, testing, output,
+        min_triplet_samples=2, min_type_pair_samples=2, method=method,
+    )
+    assert summary["calibration_method"] == method
+    assert all((output / name).exists() for name in (
+        "calibrator.pkl", "calibration_summary.json",
+        "validation_calibrated.csv", "test_calibrated.csv",
+    ))
+    levels = {
+        record["calibration_level"]
+        for record in load_event_records_from_csv(output / "validation_calibrated.csv")
+        + load_event_records_from_csv(output / "test_calibrated.csv")
+    }
+    assert levels <= allowed_levels

@@ -1,0 +1,3 @@
+# C6 legacy comparison: delegate node labels to the existing KMeans adapter.
+node_threshold:
+  method: kmeans
