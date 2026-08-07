@@ -1,0 +1,3 @@
+# C6-B8 ablation overlay: remove all events touching netflow nodes.
+dataset_view:
+  mode: host_only

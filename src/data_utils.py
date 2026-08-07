@@ -226,9 +226,15 @@ def load_all_datasets(cfg):
     train_data = load_data_set(cfg, path=cfg.edge_featurization.embed_edges._edge_embeds_dir, split="train")
     val_data = load_data_set(cfg, path=cfg.edge_featurization.embed_edges._edge_embeds_dir, split="val")
     test_data = load_data_set(cfg, path=cfg.edge_featurization.embed_edges._edge_embeds_dir, split="test")
+    # C6-B8: transform each window before any full-data/history indices exist.
+    from mstc.dataset_views import apply_dataset_view
+    view_mode = cfg.dataset_view.mode
+    train_data = [apply_dataset_view(data, view_mode) for data in train_data]
+    val_data = [apply_dataset_view(data, view_mode) for data in val_data]
+    test_data = [apply_dataset_view(data, view_mode) for data in test_data]
 
     all_msg, all_t, all_edge_types, all_src, all_dst = [], [], [], [], []
-    max_node = 0
+    max_node = -1
     for dataset in [train_data, val_data, test_data]:
         for data in dataset:
             all_msg.append(data.msg)
@@ -236,7 +242,8 @@ def load_all_datasets(cfg):
             all_edge_types.append(data.edge_type)
             all_src.append(data.src)
             all_dst.append(data.dst)
-            max_node = max(max_node, torch.cat([data.src, data.dst]).max().item())
+            if data.src.numel() > 0:
+                max_node = max(max_node, torch.cat([data.src, data.dst]).max().item())
 
     all_msg = torch.cat(all_msg)
     all_t = torch.cat(all_t)
@@ -250,7 +257,7 @@ def load_all_datasets(cfg):
         src=all_src,
         dst=all_dst,
     )
-    max_node = max_node + 1
+    max_node = max_node + 1 if max_node >= 0 else 0
     print(f"Max node in {cfg.dataset.name}: {max_node}")
 
     full_data = _inject_full_data_event_fields(train_data, val_data, test_data, full_data)

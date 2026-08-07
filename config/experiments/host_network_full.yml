@@ -1,0 +1,3 @@
+# C6-B8 baseline-compatible runtime input view.
+dataset_view:
+  mode: host_network_full

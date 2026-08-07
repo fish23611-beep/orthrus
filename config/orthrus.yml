@@ -98,3 +98,7 @@ node_aggregation:
 node_threshold:
   method: validation_quantile
   quantile: 0.999
+
+# C6-B8 runtime host/network input view. Full is baseline-compatible.
+dataset_view:
+  mode: host_network_full

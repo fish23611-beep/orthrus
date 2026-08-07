@@ -192,6 +192,9 @@ C6_CONFIG_ARGS = {
           "method": str,
           "quantile": float,
      },
+     "dataset_view": {
+          "mode": str,
+     },
 }
 
 CONFIG_ARGS = {**TASK_ARGS, **C6_CONFIG_ARGS}
@@ -452,6 +455,8 @@ def get_default_cfg(args):
      cfg.calibration.min_triplet_samples = 100
      cfg.calibration.min_type_pair_samples = 200
      cfg.calibration.epsilon = 1.0e-12
+     # C6-B8 preserves baseline input unless a view is explicitly selected.
+     cfg.dataset_view.mode = "host_network_full"
      cfg.node_aggregation.method = "topk_mean"
      cfg.node_aggregation.topk = 5
      cfg.node_aggregation.include_dst = True
@@ -679,6 +684,13 @@ def _validate_corpus_scope(scope: str) -> str:
             f"Invalid semantic_features.corpus_scope={scope!r}. Allowed values: {', '.join(valid_scopes)}"
         )
     return scope_str
+def _validate_dataset_view_mode(mode: str) -> str:
+    valid_modes = ("host_only", "host_network_structure", "host_network_full")
+    mode_str = str(mode).strip().lower()
+    if mode_str not in valid_modes:
+        raise ValueError("Invalid dataset_view.mode=%r. Allowed values: %s" % (mode, ", ".join(valid_modes)))
+    return mode_str
+
 
 def get_yml_cfg(args):
      # Checks that CLI args are OK
@@ -732,6 +744,9 @@ def get_yml_cfg(args):
      # C2: Validate new configuration options
      if hasattr(cfg, "logging") and hasattr(cfg.logging, "wandb_mode"):
          cfg.logging.wandb_mode = _validate_wandb_mode(cfg.logging.wandb_mode)
+
+     if hasattr(cfg, "dataset_view") and hasattr(cfg.dataset_view, "mode"):
+         cfg.dataset_view.mode = _validate_dataset_view_mode(cfg.dataset_view.mode)
 
      if hasattr(cfg, "pipeline") and hasattr(cfg.pipeline, "mode"):
          cfg.pipeline.mode = _validate_pipeline_mode(cfg.pipeline.mode)
