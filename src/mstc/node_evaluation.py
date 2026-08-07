@@ -42,6 +42,17 @@ NodeThresholdMethod = _thr_mod.NodeThresholdMethod
 
 # Type aliases
 MSTCAggregationMethod = Literal["mean", "max", "topk_mean", "topk_sum"]
+MSTCNodeThresholdMethod = Literal["validation_quantile", "max_validation", "kmeans"]
+
+
+def get_legacy_compute_kmeans_labels():
+    """Load the existing ORTHRUS KMeans implementation without copying it."""
+    src_root = str(Path(__file__).resolve().parents[1])
+    if src_root not in sys.path:
+        sys.path.insert(0, src_root)
+    from detection.evaluation_utils import compute_kmeans_labels
+
+    return compute_kmeans_labels
 
 
 def load_calibrated_events_from_csv(
@@ -81,8 +92,9 @@ def get_mstc_node_predictions(
     topk: int = 5,
     include_dst: bool = True,
     score_field: str = "score_calibrated",
-    threshold_method: NodeThresholdMethod = "validation_quantile",
+    threshold_method: MSTCNodeThresholdMethod = "validation_quantile",
     threshold_quantile: float = 0.999,
+    legacy_kmeans_topk: int = 20,
 ) -> dict[str, Any]:
     """Compute MSTC node scores and predictions from calibrated event records.
 
@@ -162,14 +174,7 @@ def get_mstc_node_predictions(
             "Cannot compute a valid threshold."
         )
 
-    # Step 2: Compute threshold from validation node scores only
-    threshold = compute_node_threshold(
-        validation_node_scores,
-        method=threshold_method,
-        quantile=threshold_quantile,
-    )
-
-    # Step 3: Aggregate test events → test node scores
+    # Step 2: Aggregate test events → test node scores
     test_node_scores: dict[Hashable, float]
     if test_event_records and len(test_event_records) > 0:
         test_node_scores = aggregator.aggregate_events(
@@ -183,12 +188,44 @@ def get_mstc_node_predictions(
         # Empty test: return empty predictions
         test_node_scores = {}
 
-    # Step 4: Apply threshold to test node scores → predictions
+    # Step 3: select predictions. KMeans is a legacy comparison path: it
+    # clusters test node scores and has no validation-derived scalar.
     test_node_predictions: dict[Hashable, int]
-    if test_node_scores:
-        test_node_predictions = apply_node_threshold(test_node_scores, threshold)
+    if threshold_method == "kmeans":
+        threshold = None
+        if not test_node_scores:
+            test_node_predictions = {}
+        else:
+            if (
+                not isinstance(legacy_kmeans_topk, int)
+                or isinstance(legacy_kmeans_topk, bool)
+                or legacy_kmeans_topk < 2
+            ):
+                raise ValueError("legacy_kmeans_topk must be an integer of at least 2")
+            if len(test_node_scores) < 2:
+                raise ValueError("legacy KMeans requires at least two test nodes")
+            legacy_results = {
+                node_id: {"score": score, "y_hat": 0}
+                for node_id, score in test_node_scores.items()
+            }
+            legacy_kmeans = get_legacy_compute_kmeans_labels()
+            updated_results = legacy_kmeans(legacy_results, legacy_kmeans_topk)
+            updated_results = legacy_results if updated_results is None else updated_results
+            test_node_predictions = {
+                node_id: int(result["y_hat"])
+                for node_id, result in updated_results.items()
+            }
     else:
-        test_node_predictions = {}
+        threshold = compute_node_threshold(
+            validation_node_scores,
+            method=threshold_method,
+            quantile=threshold_quantile,
+        )
+        test_node_predictions = (
+            apply_node_threshold(test_node_scores, threshold)
+            if test_node_scores
+            else {}
+        )
 
     # Build metadata
     metadata = {
@@ -198,6 +235,8 @@ def get_mstc_node_predictions(
         "score_field": score_field,
         "threshold_method": threshold_method,
         "threshold_quantile": threshold_quantile,
+        "legacy_kmeans_topk": legacy_kmeans_topk if threshold_method == "kmeans" else None,
+        "prediction_mode": "legacy_kmeans" if threshold_method == "kmeans" else "validation_threshold",
         "num_validation_nodes": len(validation_node_scores),
         "num_test_nodes": len(test_node_scores),
         "num_test_predictions": sum(test_node_predictions.values()),
@@ -211,6 +250,25 @@ def get_mstc_node_predictions(
         "test_node_predictions": test_node_predictions,
         "metadata": metadata,
     }
+
+
+def get_mstc_node_predictions_from_cfg(
+    validation_event_records: list[dict[str, Any]] | None,
+    test_event_records: list[dict[str, Any]] | None,
+    cfg: Any,
+) -> dict[str, Any]:
+    """Read only C6 algorithm settings from cfg and call the parameterized core."""
+    return get_mstc_node_predictions(
+        validation_event_records,
+        test_event_records,
+        aggregation_method=cfg.node_aggregation.method,
+        topk=cfg.node_aggregation.topk,
+        include_dst=cfg.node_aggregation.include_dst,
+        score_field=cfg.node_aggregation.score_field,
+        threshold_method=cfg.node_threshold.method,
+        threshold_quantile=cfg.node_threshold.quantile,
+        legacy_kmeans_topk=cfg.detection.evaluation.node_evaluation.kmeans_top_K,
+    )
 
 
 def get_mstc_node_predictions_from_paths(

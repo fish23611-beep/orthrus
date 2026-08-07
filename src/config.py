@@ -172,6 +172,30 @@ TASK_ARGS = {
           {},
 }
 
+# C6 post-processing settings are not pipeline tasks and must not take part in
+# task-path hashing. They are nevertheless included in defaults, YAML validation,
+# and automatic CLI argument registration.
+C6_CONFIG_ARGS = {
+     "calibration": {
+          "method": str,
+          "min_triplet_samples": int,
+          "min_type_pair_samples": int,
+          "epsilon": float,
+     },
+     "node_aggregation": {
+          "method": str,
+          "topk": int,
+          "include_dst": bool,
+          "score_field": str,
+     },
+     "node_threshold": {
+          "method": str,
+          "quantile": float,
+     },
+}
+
+CONFIG_ARGS = {**TASK_ARGS, **C6_CONFIG_ARGS}
+
 DATASET_DEFAULT_CONFIG = {
      "THEIA_E5": {
           "raw_dir": "/data/",  # NOTE: /path/to/json/files/
@@ -402,7 +426,7 @@ def get_default_cfg(args):
                else:
                     setattr(cfg, task, None)
 
-     create_cfg_recursive(cfg, TASK_ARGS)
+     create_cfg_recursive(cfg, CONFIG_ARGS)
 
      # C4 defaults keep existing configs on the baseline/type-only path.
      cfg.detection.gnn_training.decoder.predict_edge_type.enabled = True
@@ -422,6 +446,18 @@ def get_default_cfg(args):
      cfg.detection.gnn_training.encoder.context.multiscale.fusion = "gated"
      cfg.detection.gnn_training.encoder.context.multiscale.use_scale_embedding = False
      cfg.detection.gnn_training.encoder.context.multiscale.gate_hidden_dim = 64
+
+     # C6 defaults are safe for the baseline variant but do not select MSTC evaluation.
+     cfg.calibration.method = "hierarchical_relation"
+     cfg.calibration.min_triplet_samples = 100
+     cfg.calibration.min_type_pair_samples = 200
+     cfg.calibration.epsilon = 1.0e-12
+     cfg.node_aggregation.method = "topk_mean"
+     cfg.node_aggregation.topk = 5
+     cfg.node_aggregation.include_dst = True
+     cfg.node_aggregation.score_field = "score_calibrated"
+     cfg.node_threshold.method = "validation_quantile"
+     cfg.node_threshold.quantile = 0.999
 
      return cfg
 
@@ -456,7 +492,7 @@ def get_runtime_required_args(return_unknown_args=False, args=None):
                               "Default: ./artifacts (or ORTHRUS_ARTIFACT_ROOT if set).")
 
      # All args in the cfg can be also set in the arg parser from CLI
-     parser = add_cfg_args_to_parser(TASK_ARGS, parser)
+     parser = add_cfg_args_to_parser(CONFIG_ARGS, parser)
 
      try:
           args, unknown_args = parser.parse_known_args(args)
@@ -581,7 +617,7 @@ def validate_yml_file(yml_file: str):
                          if not isinstance(sub_config, sub_tasks):
                               raise TypeError(f"Parameter '{' > '.join(path + [key])}' should be of type {sub_tasks.__name__}.")
 
-     validate_config(user_config, TASK_ARGS)
+     validate_config(user_config, CONFIG_ARGS)
      print(f"YAML configuration file \"{yml_file.split('/')[-1]}\" is valid")
 
 def check_args(args):

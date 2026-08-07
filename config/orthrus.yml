@@ -80,3 +80,21 @@ attack_reconstruction :
       score_method: degree
       workers: 8
       visualize: False
+
+# C6 post-processing contract. Existing baseline evaluation remains selected
+# unless a later pipeline stage explicitly calls the MSTC evaluation helper.
+calibration:
+  method: hierarchical_relation
+  min_triplet_samples: 100
+  min_type_pair_samples: 200
+  epsilon: 1.0e-12
+
+node_aggregation:
+  method: topk_mean
+  topk: 5
+  include_dst: True
+  score_field: score_calibrated
+
+node_threshold:
+  method: validation_quantile
+  quantile: 0.999
