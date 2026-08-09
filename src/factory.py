@@ -68,6 +68,54 @@ def _build_graph_encoder(cfg, in_dim, edge_dim, temporal_dim, node_hid_dim, node
     )
 
 
+def _build_graphsage_encoder(cfg, in_dim, edge_dim, temporal_dim, node_hid_dim, node_out_dim, num_heads, activation_fn, dropout):
+    """Build the shared GraphSAGEBackbone used by both recent and multiscale encoders.
+
+    GraphSAGE does not consume edge features, so the ``edge_dim`` argument is
+    accepted but ignored. ``num_heads`` is also unused because GraphSAGE has no
+    multi-head attention; it is kept in the signature for parity with
+    :func:`_build_graph_encoder`.
+    """
+    del edge_dim, num_heads
+    return GraphSAGEBackbone(
+        in_dim=in_dim,
+        hid_dim=node_hid_dim,
+        out_dim=node_out_dim,
+        activation=activation_fn,
+        dropout=dropout,
+    )
+
+
+
+def _build_semantic_mlp_encoder(in_dim, node_hid_dim, node_out_dim, activation_fn, dropout):
+    """Build the stateless current-event Semantic MLP encoder."""
+    return SemanticMLPEncoder(
+        SemanticMLPBackbone(
+            in_dim=in_dim,
+            hid_dim=node_hid_dim,
+            out_dim=node_out_dim,
+            activation=activation_fn,
+            dropout=dropout,
+        )
+    )
+
+
+def _resolve_backbone(cfg):
+    """Resolve the encoder backbone name from cfg, defaulting to 'graph_transformer'."""
+    encoder_cfg = getattr(getattr(cfg, "detection", None), "gnn_training", None)
+    encoder_cfg = getattr(encoder_cfg, "encoder", None)
+    backbone = getattr(encoder_cfg, "backbone", None)
+    if backbone is None:
+        return "graph_transformer"
+    backbone = str(backbone).strip().lower()
+    if backbone in ("graph_transformer", "graphsage", "semantic_mlp"):
+        return backbone
+    raise ValueError(
+        f"Unknown encoder.backbone={backbone!r}. "
+        "Expected 'graph_transformer', 'graphsage', or 'semantic_mlp'."
+    )
+
+
 def encoder_factory(cfg, msg_dim, in_dim, edge_dim, graph_reindexer, device, max_node_num):
     node_hid_dim = cfg.detection.gnn_training.node_hid_dim
     node_out_dim = cfg.detection.gnn_training.node_out_dim
@@ -97,11 +145,32 @@ def encoder_factory(cfg, msg_dim, in_dim, edge_dim, graph_reindexer, device, max
     context_mode = getattr(cfg.detection.gnn_training.encoder, "context", None)
     mode = getattr(context_mode, "mode", "recent") if context_mode else "recent"
     multiscale_enabled = getattr(context_mode, "multiscale", None) and getattr(context_mode.multiscale, "enabled", False)
+    backbone = _resolve_backbone(cfg)
 
-    if mode == "recent":
+
+    if backbone == "semantic_mlp":
+        if mode != "none":
+            raise ValueError("backbone='semantic_mlp' requires context.mode='none'")
+        return _build_semantic_mlp_encoder(
+            original_in_dim, node_hid_dim, node_out_dim, activation_fn, dropout
+        )
+
+    if backbone == "graph_transformer":
         graph_encoder = _build_graph_encoder(
             cfg, in_dim, edge_dim_agg, temporal_dim, node_hid_dim, node_out_dim, num_heads, activation_fn, dropout
         )
+    elif backbone == "graphsage":
+        graph_encoder = _build_graphsage_encoder(
+            cfg, in_dim, edge_dim_agg, temporal_dim, node_hid_dim, node_out_dim, num_heads, activation_fn, dropout
+        )
+        # GraphSAGE does not consume edge features; force-disable at the encoder
+        # level so we do not pay the cost of gathering/building them upstream.
+        edge_features = ["none"]
+        edge_dim_agg = 0
+    else:
+        raise ValueError(f"Unknown backbone: {backbone!r}")
+
+    if mode == "recent":
         neighbor_loader = LastNeighborLoader(max_node_num, size=cfg.detection.gnn_training.encoder.neighbor_size, device=device)
         return OrthrusEncoder(
             encoder=graph_encoder,
@@ -134,9 +203,6 @@ def encoder_factory(cfg, msg_dim, in_dim, edge_dim, graph_reindexer, device, max
             short_budget=int(ms_cfg.neighbor_budgets[0]),
             medium_budget=int(ms_cfg.neighbor_budgets[1]),
             long_budget=int(ms_cfg.neighbor_budgets[2]),
-        )
-        graph_encoder = _build_graph_encoder(
-            cfg, in_dim, edge_dim_agg, temporal_dim, node_hid_dim, node_out_dim, num_heads, activation_fn, dropout
         )
         return MultiScaleOrthrusEncoder(
             shared_graph_encoder=graph_encoder,

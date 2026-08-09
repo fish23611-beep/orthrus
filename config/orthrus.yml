@@ -40,6 +40,7 @@ detection:
     node_hid_dim: 128
     node_out_dim: 64
     encoder:
+      backbone: graph_transformer
       use_node_type_in_node_feats: True
       neighbor_sampling: []
       edge_features: edge_type

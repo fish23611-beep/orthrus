@@ -1,0 +1,8 @@
+# C7 GraphTransformer backbone control overlay for MSTC experiments.
+model:
+  variant: mstc
+
+detection:
+  gnn_training:
+    encoder:
+      backbone: graph_transformer

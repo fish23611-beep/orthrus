@@ -1,0 +1,9 @@
+# C7 GraphSAGE backbone overlay for MSTC cross-backbone experiments.
+# GraphSAGE intentionally ignores edge features; no GraphSAGE edge_dim exists.
+model:
+  variant: mstc
+
+detection:
+  gnn_training:
+    encoder:
+      backbone: graphsage

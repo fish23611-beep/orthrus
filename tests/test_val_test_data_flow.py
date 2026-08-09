@@ -37,6 +37,7 @@ def _make_cfg(tmp_path):
             method="min_val_mean_edge_loss",
             legacy_test_selection_enabled=False,
         ),
+        model=SimpleNamespace(variant="orthrus_baseline"),
     )
 
 

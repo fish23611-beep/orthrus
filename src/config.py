@@ -96,6 +96,7 @@ TASK_ARGS = {
                "node_hid_dim": int,
                "node_out_dim": int,
                "encoder": {
+                    "backbone": str,  # C7: ["graph_transformer" | "graphsage" | "semantic_mlp"]
                     "use_node_type_in_node_feats": bool,
                     "neighbor_sampling": list,  # [[] | [int, ..., int]]
                     "edge_features": str,  # ["edge_type", "msg", "time_encoding", "none"]
@@ -109,7 +110,7 @@ TASK_ARGS = {
                          "num_heads": int,
                     },
                     "context": {
-                         "mode": str,  # ["recent" | "multiscale"]
+                         "mode": str,  # ["none" | "recent" | "multiscale"]
                          "multiscale": {
                               "enabled": bool,
                               "candidate_capacity": int,
@@ -439,6 +440,7 @@ def get_default_cfg(args):
      cfg.detection.gnn_training.decoder.time_gap.num_classes = 6
 
      # C5 defaults: recent context preserves baseline behavior by default.
+     cfg.detection.gnn_training.encoder.backbone = "graph_transformer"
      cfg.detection.gnn_training.encoder.context.mode = "recent"
      cfg.detection.gnn_training.encoder.context.multiscale.enabled = False
      cfg.detection.gnn_training.encoder.context.multiscale.candidate_capacity = 64

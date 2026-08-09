@@ -1,0 +1,12 @@
+# C7 stateless Semantic MLP overlay for the non-graph MSTC baseline.
+model:
+  variant: mstc
+
+detection:
+  gnn_training:
+    encoder:
+      backbone: semantic_mlp
+      context:
+        mode: none
+        multiscale:
+          enabled: false
