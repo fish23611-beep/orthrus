@@ -1,4 +1,4 @@
-"""Static contracts for the six C8-F Colab notebooks."""
+"""Static contracts for the six C8-F Colab notebooks + All-in-One Master Notebook."""
 from __future__ import annotations
 
 import json
@@ -22,6 +22,7 @@ NOTEBOOK_NAMES = (
     "03_train_main_models.ipynb",
     "04_run_ablations.ipynb",
     "05_collect_results.ipynb",
+    "ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb",
 )
 ENTRYPOINTS = (
     "src/experiments/run_experiment.py",
@@ -29,6 +30,9 @@ ENTRYPOINTS = (
     "src/experiments/collect_results.py",
     "src/experiments/export_tables.py",
 )
+MASTER_NOTEBOOK_NAME = "ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb"
+REQUIRED_FROZEN_TAG = "mstc-pids-c1-c8-exp-v1"
+REQUIRED_COMMIT = "0a7ab00bb0900df5afd4ecb01359ab10ad37c60e"
 
 
 def _read_notebook(path: Path):
@@ -111,3 +115,178 @@ def test_notebooks_are_orchestration_only(notebooks):
         assert "training.main" not in source, name
         assert "optimizer.step(" not in source, name
         assert "loss.backward(" not in source, name
+
+
+# ================================================================================
+# Master Notebook Specific Tests
+# ================================================================================
+
+def test_master_notebook_exists():
+    """Master Notebook must exist."""
+    master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
+    assert master_path.is_file(), f"Master Notebook not found: {master_path}"
+
+
+def test_master_notebook_is_valid_nbformat():
+    """Master Notebook must be a valid nbformat 4 document."""
+    master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
+    notebook = _read_notebook(master_path)
+    assert notebook["nbformat"] >= 4, MASTER_NOTEBOOK_NAME
+    assert notebook["cells"], MASTER_NOTEBOOK_NAME
+
+
+def test_master_notebook_has_required_cells():
+    """Master Notebook must have cells for all major sections."""
+    master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
+    notebook = _read_notebook(master_path)
+    source = _source(notebook)
+
+    # Check for key section markers in markdown cells
+    required_sections = [
+        "全局参数",  # Global parameters
+        "Google Drive",  # Drive mount
+        "冻结代码版本",  # Frozen code version
+        "GPU",  # GPU verification
+        "依赖安装",  # Dependency installation
+        "环境记录",  # Environment recording
+        "THEIA 数据检查",  # Data check
+        "PostgreSQL",  # Database
+        "Preprocessing",  # Preprocessing
+        "Baseline Smoke",  # Baseline smoke
+        "主模型矩阵",  # Main matrix
+        "消融",  # Ablation
+        "结果收集",  # Result collection
+    ]
+
+    for section in required_sections:
+        assert section in source, f"Missing section in Master Notebook: {section}"
+
+
+def test_master_notebook_references_frozen_tag():
+    """Master Notebook must reference the frozen tag."""
+    master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
+    notebook = _read_notebook(master_path)
+    source = _source(notebook)
+
+    assert REQUIRED_FROZEN_TAG in source, \
+        f"Master Notebook must reference frozen tag: {REQUIRED_FROZEN_TAG}"
+    assert REQUIRED_COMMIT in source, \
+        f"Master Notebook must reference expected commit: {REQUIRED_COMMIT}"
+
+
+def test_master_notebook_references_all_entrypoints():
+    """Master Notebook must reference all experiment entrypoints."""
+    master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
+    notebook = _read_notebook(master_path)
+    source = _source(notebook)
+
+    for entrypoint in ENTRYPOINTS:
+        assert entrypoint in source, \
+            f"Master Notebook must reference {entrypoint}"
+
+
+def test_master_notebook_supports_both_theia_datasets():
+    """Master Notebook must support both THEIA_E3 and THEIA_E5."""
+    master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
+    notebook = _read_notebook(master_path)
+    source = _source(notebook)
+
+    assert "THEIA_E3" in source, "Master Notebook must support THEIA_E3"
+    assert "THEIA_E5" in source, "Master Notebook must support THEIA_E5"
+
+
+def test_master_notebook_has_google_drive_paths():
+    """Master Notebook must define Google Drive paths."""
+    master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
+    notebook = _read_notebook(master_path)
+    source = _source(notebook)
+
+    assert "DRIVE_ROOT" in source, "Master Notebook must define DRIVE_ROOT"
+    assert "ARTIFACT_ROOT" in source, "Master Notebook must define ARTIFACT_ROOT"
+    assert "/content/drive/MyDrive" in source, \
+        "Master Notebook must use Google Drive paths"
+
+
+def test_master_notebook_has_postgresql_restore():
+    """Master Notebook must have PostgreSQL restore capability."""
+    master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
+    notebook = _read_notebook(master_path)
+    source = _source(notebook)
+
+    assert "RESTORE_DATABASE" in source, \
+        "Master Notebook must have RESTORE_DATABASE flag"
+    assert "pg_restore" in source, \
+        "Master Notebook must use pg_restore"
+
+
+def test_master_notebook_has_ablation_groups():
+    """Master Notebook must define ablation experiment groups."""
+    master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
+    notebook = _read_notebook(master_path)
+    source = _source(notebook)
+
+    # Check for key ablation group names
+    assert "ablation" in source, "Master Notebook must support ablation group"
+    assert "multiscale" in source, "Master Notebook must support multiscale group"
+    assert "time" in source, "Master Notebook must support time group"
+    assert "calibration" in source, "Master Notebook must support calibration group"
+
+
+def test_master_notebook_has_all_switches():
+    """Master Notebook must have all experiment switches."""
+    master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
+    notebook = _read_notebook(master_path)
+    source = _source(notebook)
+
+    required_switches = [
+        "RUN_PREPROCESS",
+        "RUN_BASELINE_SMOKE",
+        "RUN_MAIN_MATRIX",
+        "RUN_ABLATIONS",
+        "RUN_COLLECT_EXPORT",
+        "RUN_MANUAL_RESUME",
+    ]
+
+    for switch in required_switches:
+        assert switch in source, f"Master Notebook must have {switch} switch"
+
+
+def test_master_notebook_no_todo_placeholder():
+    """Master Notebook must not contain TODO/FIXME/PLACEHOLDER."""
+    master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
+    notebook = _read_notebook(master_path)
+
+    unfinished = re.compile(
+        r"\b(?:TODO|FIXME|PLACEHOLDER|implement later)\b",
+        re.IGNORECASE
+    )
+    source = _source(notebook)
+    assert not unfinished.search(source), \
+        f"Master Notebook contains unfinished placeholders"
+
+    for cell in notebook["cells"]:
+        if cell.get("cell_type") == "code":
+            assert cell.get("outputs", []) == [], MASTER_NOTEBOOK_NAME
+            assert cell.get("execution_count") is None, MASTER_NOTEBOOK_NAME
+
+
+def test_master_notebook_no_secrets_or_paths():
+    """Master Notebook must not contain secrets or personal paths."""
+    master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
+    notebook = _read_notebook(master_path)
+    source = _source(notebook)
+
+    forbidden = (
+        re.compile(r"ghp_[A-Za-z0-9]+"),
+        re.compile(r"github_pat_[A-Za-z0-9_]+"),
+        re.compile(r"WANDB_API_KEY\s*=\s*['\"][^'$\"]+"),
+        re.compile(r"ORTHRUS_DB_PASSWORD\s*=\s*['\"][^'$\"]+"),
+        re.compile(r"[A-Za-z]:\\(?:Code|Users)\\", re.IGNORECASE),
+        re.compile(r"/Users/[^/\s]+/"),
+        re.compile(r"/home/[^/\s]+/"),
+    )
+
+    for pattern in forbidden:
+        match = pattern.search(source)
+        assert not match, \
+            f"Master Notebook contains forbidden pattern: {pattern.pattern}"

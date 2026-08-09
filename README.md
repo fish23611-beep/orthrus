@@ -305,30 +305,50 @@ direction.
 
 ### Colab notebook order
 
-```text
-00_colab_environment
-  ↓
-01_preprocess_theia
-  ↓
-02_baseline_smoke_test
-  ↓
-03_train_main_models
-  ↓
-04_run_ablations
-  ↓
-05_collect_results
+#### Recommended: All-in-One Master Notebook
+
+**正式 Colab 实验推荐使用**：
+```
+notebooks/ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb
 ```
 
-Set `DATASET = "THEIA_E3"` or `"THEIA_E5"` in each notebook's parameter cell.
-If complete preprocessing artifacts and metadata already exist, `01` reports
-what it found and may be skipped before entering detection-only mode. The
-notebooks are orchestration/UI layers over the production CLIs; they do not
-contain a second training or result-aggregation implementation.
+这是一个单一的 Master Notebook，在同一个 Colab Runtime 中依次支持：
 
-Known validation limits for C8: the notebook JSON and static contracts are
-tested, but the six notebooks have not been fully executed in a real Colab
-session; GPU execution and the real THEIA five-seed experiments are also not
-claimed as validated.
+- Google Drive 挂载与目录创建
+- 冻结代码版本 checkout（固定到 `mstc-pids-c1-c8-exp-v1`）
+- GPU/CUDA 验证
+- Python/PyG 依赖幂等安装
+- 环境记录
+- THEIA 数据检查
+- PostgreSQL 安装/启动/恢复
+- Preprocessing
+- Baseline smoke test
+- 主模型矩阵（ORTHRUS-ano + MSTC-PIDS Full）
+- 消融与专项实验
+- Checkpoint resume
+- 结果收集与导出
+
+**优势**：
+- 单一 Runtime，无需切换 Notebook
+- Drive 持久化 artifacts、checkpoints、metrics、results
+- PostgreSQL 生命周期内保持
+- PyG 只安装一次
+- 幂等安装策略
+
+#### Legacy: Component/Reference Notebooks
+
+原 00～05 保留为模块化参考/开发说明：
+
+```
+notebooks/00_colab_environment.ipynb
+notebooks/01_preprocess_theia.ipynb
+notebooks/02_baseline_smoke_test.ipynb
+notebooks/03_train_main_models.ipynb
+notebooks/04_run_ablations.ipynb
+notebooks/05_collect_results.ipynb
+```
+
+**注意**：这些 Notebook 各自可能连接新的 Colab Runtime，不推荐作为正式实验的主要运行方式。
 
 
 ### Weights & Biases interface
