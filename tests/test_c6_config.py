@@ -206,6 +206,6 @@ def test_calibration_method_validation_and_experiment_overlays():
     for filename, method in expected.items():
         assert _validate_calibration_method(method) == method
         payload = yaml.safe_load((overlay_dir / filename).read_text(encoding="utf-8"))
-        assert payload == {"calibration": {"method": method}}
+        assert payload["calibration"]["method"] == method
     with pytest.raises(ValueError, match="calibration.method"):
         _validate_calibration_method("unsupported")

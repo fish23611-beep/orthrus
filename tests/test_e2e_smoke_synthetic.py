@@ -151,7 +151,7 @@ def test_training_main_runs_batches_and_saves_each_epoch_checkpoint(
     assert load_datasets.call_count == 1
     assert build_model.call_count == 1
     assert optimizer_factory.call_count == 1
-    assert cuda_memory.call_count == epochs
+    assert cuda_memory.call_count == 0  # CPU paths must not call CUDA memory APIs
     assert len(model.batch_losses) == epochs
     assert bool(torch.isfinite(torch.tensor(model.batch_losses)).all())
     assert model.backward_calls == epochs
@@ -276,7 +276,7 @@ def test_testing_main_dispatches_val_then_test_for_checkpoint(
         uninitialized_model, os.path.join(str(models_dir), checkpoint)
     )
     assert replay.call_count == 1
-    assert empty_cache.call_count == 1
+    assert empty_cache.call_count == 0  # CPU paths must not call CUDA APIs
     assert len(calls) == 2
     assert [call["split"] for call in calls] == ["val", "test"]
     assert calls[0]["data"] is val_graph

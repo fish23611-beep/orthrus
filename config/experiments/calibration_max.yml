@@ -1,3 +1,45 @@
-# C6 node-threshold comparison: maximum normal validation node score.
+# Raw-score maximum-validation threshold.
+pipeline:
+  mode: detection_only
+  run_tracing: false
+model:
+  variant: mstc
+logging:
+  wandb_mode: disabled
+detection:
+  gnn_training:
+    encoder:
+      backbone: graph_transformer
+      neighbor_size: 24
+      context:
+        mode: multiscale
+        multiscale:
+          enabled: true
+          candidate_capacity: 64
+          history_device: cpu
+          scale_quantiles: [0.50, 0.90, 0.99]
+          neighbor_budgets: [8, 8, 8]
+          share_encoder: true
+          fusion: gated
+          use_scale_embedding: false
+          gate_hidden_dim: 64
+    decoder:
+      predict_edge_type:
+        enabled: true
+      time_gap:
+        enabled: true
+        lambda_time: 0.3
+        hidden_dim: 128
+        num_classes: 6
+calibration:
+  method: hierarchical_relation
+node_aggregation:
+  method: topk_mean
+  topk: 5
+  include_dst: true
+  score_field: score_raw
 node_threshold:
   method: max_validation
+  quantile: 0.999
+dataset_view:
+  mode: host_network_full

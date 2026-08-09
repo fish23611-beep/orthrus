@@ -113,6 +113,224 @@ When run once, datasets are preprocessed and stored in the `ROOT_ARTIFACT_DIR` p
 python src/orthrus.py CADETS_E3 --run_from_training
 ```
 
+
+## MSTC-PIDS experiment workflow (C8)
+
+This section documents the current experiment interfaces. The paper scope for
+this matrix is `THEIA_E3` and `THEIA_E5`. The code and synthetic/test coverage
+support both datasets, but the full real-data, five-seed matrix has not been run
+as part of C8.
+
+### Environment, data, and detection-only mode
+
+The Dockerfile remains the reference environment. For Colab, run the notebooks
+in the order listed below; `00_colab_environment.ipynb` preserves Colab's
+existing PyTorch/CUDA installation when it is compatible and installs PyG for
+that detected combination. Set the portable roots once:
+
+```bash
+export ORTHRUS_ARTIFACT_ROOT=/path/to/persistent/artifacts
+export ORTHRUS_DATA_ROOT=/path/to/datasets
+```
+
+Initial THEIA preprocessing may require a restored PostgreSQL database. Database
+credentials are read from `ORTHRUS_DB_HOST`, `ORTHRUS_DB_PORT`,
+`ORTHRUS_DB_USER`, and `ORTHRUS_DB_PASSWORD`; do not place credentials in YAML or
+notebooks. Once the TemporalData/preprocessing artifacts, metadata cache,
+configuration, and code are available, `train`, `test`, and `evaluate` run in
+`detection_only` mode without PostgreSQL. This does not mean that preprocessing
+itself is database-free.
+
+Word2Vec corpus scope is either `official_full_dataset` or `train_only`.
+Separately trained E3 and E5 Word2Vec spaces are not a zero-shot transfer setup
+and must not be reported as one.
+
+### Single experiments
+
+MSTC-PIDS Full:
+
+```bash
+python src/experiments/run_experiment.py \
+  --dataset THEIA_E3 \
+  --config config/experiments/mstc_full.yml \
+  --seed 0 \
+  --artifact-root "$ORTHRUS_ARTIFACT_ROOT"
+```
+
+ORTHRUS-ano baseline:
+
+```bash
+python src/experiments/run_experiment.py \
+  --dataset THEIA_E3 \
+  --config config/experiments/baseline.yml \
+  --seed 0 \
+  --artifact-root "$ORTHRUS_ARTIFACT_ROOT"
+```
+
+Both commands execute the configured detection-only pipeline. Preprocessing
+artifacts must already exist; the experiment YAML files intentionally do not
+start PostgreSQL or preprocessing.
+
+### Checkpoint resume and inference
+
+A structured training resume includes `train` in `--stages`:
+
+```bash
+python src/experiments/run_experiment.py \
+  --dataset THEIA_E3 \
+  --config config/experiments/mstc_full.yml \
+  --seed 0 \
+  --artifact-root "$ORTHRUS_ARTIFACT_ROOT" \
+  --stages train,test,evaluate \
+  --checkpoint /path/to/checkpoint.pt
+```
+
+Test/evaluate-only uses the same flag but omits `train`:
+
+```bash
+python src/experiments/run_experiment.py \
+  --dataset THEIA_E3 \
+  --config config/experiments/mstc_full.yml \
+  --seed 0 \
+  --artifact-root "$ORTHRUS_ARTIFACT_ROOT" \
+  --stages test,evaluate \
+  --checkpoint /path/to/checkpoint.pt
+```
+
+Structured checkpoints save model, optimizer, epoch, configuration hash, and
+Python/NumPy/Torch RNG state (plus scheduler state when present). Temporal
+history is deliberately reconstructed by chronological replay. Legacy
+`state_dict.pkl`/model-only checkpoints remain compatible with inference, but
+they are not complete training-resume checkpoints.
+
+### Experiment matrix
+
+The matrix runner uses stable dataset × config × seed identities, skips valid
+completed markers by default, records failures, and continues with later runs:
+
+```bash
+python src/experiments/run_matrix.py \
+  --datasets THEIA_E3,THEIA_E5 \
+  --configs config/experiments/baseline.yml,config/experiments/mstc_full.yml \
+  --seeds 0,1,2,3,4 \
+  --artifact-root "$ORTHRUS_ARTIFACT_ROOT"
+```
+
+Do not automatically shrink batch size, candidate capacity, neighbor budgets,
+or hidden dimensions after OOM. In the causal micro-batch path these changes can
+alter context. Record the run as failed, choose one revised configuration
+manually, and rerun every fair comparison with that same configuration.
+
+### Authoritative experiment mapping
+
+Main results:
+
+| Reported model | Configuration |
+|---|---|
+| ORTHRUS-ano | `baseline.yml` |
+| Semantic MLP | `backbone_mlp.yml` |
+| GraphSAGE baseline | `backbone_graphsage_baseline.yml` |
+| MSTC-PIDS Full | `mstc_full.yml` |
+| GraphSAGE + MSTC | `backbone_graphsage.yml` |
+
+A0–A6:
+
+| ID | Configuration | Exact meaning |
+|---|---|---|
+| A0 | `baseline.yml` | ORTHRUS-ano baseline |
+| A1 | `ablation_no_multiscale.yml` | Recent-24 |
+| A2 | `ablation_no_gate.yml` | equal fusion |
+| A3 | `ablation_no_time.yml` | `lambda_time=0` |
+| A4 | `ablation_no_calibration.yml` | raw score + validation threshold |
+| A5 | `ablation_no_topk.yml` | mean aggregation |
+| A6 | `mstc_full.yml` | full model |
+
+The remaining formal groups are direct YAML lists, not notebook-side model
+definitions:
+
+| Group | Configurations |
+|---|---|
+| Multi-scale | `multiscale_recent20.yml`, `multiscale_recent24.yml`, `multiscale_single_window.yml`, `multiscale_equal.yml`, `multiscale_gate.yml` |
+| Time task | `time_type_only.yml`, `time_time_only.yml`, `time_joint.yml` |
+| Calibration | `calibration_max.yml`, `calibration_quantile.yml`, `calibration_kmeans.yml`, `calibration_global_p.yml`, `calibration_relation.yml`, `calibration_hierarchical.yml` |
+| Backbone | `backbone_graphtransformer.yml`, `backbone_graphsage_baseline.yml`, `backbone_graphsage.yml`, `backbone_mlp.yml` |
+| Dataset view | `host_only.yml`, `host_network_structure.yml`, `host_network_full.yml` |
+| Efficiency | `baseline.yml`, `efficiency_multiscale.yml`, `efficiency_multiscale_time.yml`, `mstc_full.yml` |
+
+### Artifacts and result collection
+
+A direct single run uses the following layout. Stage directories are created
+lazily:
+
+```text
+<artifact-root>/<dataset>/runs/<model-variant>/seed_<seed>/
+  environment.json
+  config_resolved.yml
+  runtime.json
+  checkpoints/
+  edge_scores/
+  node_scores/metrics.json
+```
+
+A matrix isolates configs with a path-derived config ID and owns separate run
+status/result metadata:
+
+```text
+<artifact-root>/
+  matrix_artifacts/<config-id>/<dataset>/runs/<model-variant>/seed_<seed>/...
+  results/
+    run_status/<dataset>/<config-id>/seed_<seed>/run_status.json
+    matrix_summary.json
+    all_runs.csv
+    main_results.csv
+    ablation_results.csv
+    calibration_results.csv
+    efficiency_results.csv
+```
+
+Collect raw run records and then export paper tables:
+
+```bash
+python src/experiments/collect_results.py \
+  --artifact-root "$ORTHRUS_ARTIFACT_ROOT"
+
+python src/experiments/export_tables.py \
+  --artifact-root "$ORTHRUS_ARTIFACT_ROOT"
+```
+
+Failed seeds are listed and are not inserted as zero into mean/std. Undefined
+metrics remain NaN. Standard deviation is the sample standard deviation
+(`ddof=1`), and each metric's best value follows its declared higher/lower
+direction.
+
+### Colab notebook order
+
+```text
+00_colab_environment
+  ↓
+01_preprocess_theia
+  ↓
+02_baseline_smoke_test
+  ↓
+03_train_main_models
+  ↓
+04_run_ablations
+  ↓
+05_collect_results
+```
+
+Set `DATASET = "THEIA_E3"` or `"THEIA_E5"` in each notebook's parameter cell.
+If complete preprocessing artifacts and metadata already exist, `01` reports
+what it found and may be skipped before entering detection-only mode. The
+notebooks are orchestration/UI layers over the production CLIs; they do not
+contain a second training or result-aggregation implementation.
+
+Known validation limits for C8: the notebook JSON and static contracts are
+tested, but the six notebooks have not been fully executed in a real Colab
+session; GPU execution and the real THEIA five-seed experiments are also not
+claimed as validated.
+
+
 ### Weights & Biases interface
 
 W&B is used as the default interface to visualize and historize experiments. First log into your account from the CLI using:

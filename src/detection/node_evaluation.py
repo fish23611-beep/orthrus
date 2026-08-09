@@ -1,4 +1,5 @@
 from collections import defaultdict
+import json
 
 import torch
 import numpy as np
@@ -7,6 +8,10 @@ import wandb
 from provnet_utils import *
 from config import *
 from .evaluation_utils import *
+from mstc.metrics import (
+    compute_attack_detection_rate, compute_classification_metrics, compute_fp_per_million,
+)
+from labelling import get_GP_of_each_attack
 
 
 def get_node_predictions(val_tw_path, test_tw_path, cfg):
@@ -119,7 +124,18 @@ def main(val_tw_path, test_tw_path, model_epoch_dir, cfg, tw_to_malicious_nodes,
     plot_dor_recall_curve(pred_scores, y_truth, dor_img_file)
     plot_simple_scores(pred_scores, y_truth, simple_scores_img_file)
     plot_scores_with_paths(pred_scores, y_truth, nodes, max_val_loss_tw, tw_to_malicious_nodes, scores_img_file, cfg)
+    # C8 standard metrics use explicit NaN for undefined edge cases.  Keep the
+    # legacy evaluator invocation for its existing logging/auxiliary statistics.
     stats = classifier_evaluation(y_truth, y_preds, pred_scores)
+    c8_metrics = compute_classification_metrics(y_truth, y_preds, pred_scores)
+    stats.update(c8_metrics)
+    stats["fp_per_million"] = compute_fp_per_million(
+        int(c8_metrics["fp"]), int(c8_metrics["tn"]) + int(c8_metrics["fp"]),
+    )
+    attack_to_nodes = get_GP_of_each_attack(cfg)
+    stats["attack_detection_rate"] = compute_attack_detection_rate(
+        attack_to_nodes, (node for node, prediction in zip(nodes, y_preds) if prediction),
+    )
 
     fp_in_malicious_tw_ratio = analyze_false_positives(y_truth, y_preds, pred_scores, max_val_loss_tw, nodes, tw_to_malicious_nodes)
     stats["fp_in_malicious_tw_ratio"] = fp_in_malicious_tw_ratio
@@ -128,7 +144,28 @@ def main(val_tw_path, test_tw_path, model_epoch_dir, cfg, tw_to_malicious_nodes,
     results_file = os.path.join(out_dir, f"result_{model_epoch_dir}.pth")
     stats_file = os.path.join(out_dir, f"stats_{model_epoch_dir}.pth")
 
+    runtime_dir = getattr(cfg, "_run_dir", None)
+    if not isinstance(runtime_dir, (str, os.PathLike)) or not os.fspath(runtime_dir):
+        runtime_dir = os.path.dirname(out_dir)
+    try:
+        with open(os.path.join(runtime_dir, "runtime.json"), encoding="utf-8") as handle:
+            runtime = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        runtime = {}
+    testing_runtime = runtime.get("testing", {}) if isinstance(runtime, dict) else {}
+    model_runtime = runtime.get("model", {}) if isinstance(runtime, dict) else {}
+    stats["parameter_count"] = model_runtime.get("parameter_count")
+    stats["events_per_second"] = testing_runtime.get("events_per_second")
+    stats["peak_gpu_memory_mb"] = testing_runtime.get("peak_gpu_memory_mb")
+    stats["peak_cpu_memory_mb"] = testing_runtime.get("peak_cpu_memory_mb")
+
     torch.save(results, results_file)
     torch.save(stats, stats_file)
+    for metrics_path in (
+        os.path.join(out_dir, f"metrics_{model_epoch_dir}.json"),
+        os.path.join(out_dir, "metrics.json"),
+    ):
+        with open(metrics_path, "w", encoding="utf-8") as handle:
+            json.dump(stats, handle, indent=2, allow_nan=True)
 
     return stats

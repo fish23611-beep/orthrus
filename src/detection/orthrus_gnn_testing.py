@@ -1,4 +1,4 @@
-﻿from tqdm import tqdm
+from tqdm import tqdm
 
 from encoders import OrthrusEncoder
 from model import MSTCOrthrus
@@ -8,6 +8,8 @@ from config import *
 from model import *
 from factory import *
 import torch
+
+from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime
 
 
 @torch.no_grad()
@@ -128,6 +130,7 @@ def test(
 
     # log(
     #     f'Time: {time_interval}, Loss: {tot_loss:.4f}, Nodes_count: {len(unique_nodes)}, Edges_count: {event_count}, Cost Time: {(end - start):.2f}s')
+    return {"processed_event_count": event_count, "test_seconds": end - start}
 
 
 @torch.no_grad()
@@ -232,15 +235,31 @@ def main(cfg):
 
     train_data, val_data, test_data, full_data, max_node_num = load_all_datasets(cfg)
 
-    # For each model trained at a given epoch, we test
+    # For each model trained at a given epoch, we test. C8-B may inject one
+    # explicit inference checkpoint (a checkpoint directory or checkpoint file).
     gnn_models_dir = cfg.detection.gnn_training._trained_models_dir
-    all_trained_models = ["model_epoch_1"] if cfg._from_weights else listdir_sorted(gnn_models_dir)
+    inference_checkpoint = getattr(cfg, "_inference_checkpoint", None)
+    if isinstance(inference_checkpoint, str) and inference_checkpoint:
+        checkpoint_path = os.fspath(inference_checkpoint)
+        all_trained_models = [(os.path.basename(checkpoint_path.rstrip(os.sep)) or "checkpoint", checkpoint_path)]
+    elif cfg._from_weights:
+        all_trained_models = [("model_epoch_1", os.path.join(gnn_models_dir, "model_epoch_1"))]
+    else:
+        all_trained_models = [(name, os.path.join(gnn_models_dir, name)) for name in listdir_sorted(gnn_models_dir)]
+    runtime_dir = getattr(cfg, "_run_dir", None)
+    if not isinstance(runtime_dir, (str, os.PathLike)) or not os.fspath(runtime_dir):
+        runtime_dir = os.path.dirname(gnn_models_dir)
+    dump_environment(cfg, runtime_dir)
 
     device = get_device(cfg)
-
-    for trained_model in all_trained_models:
-        log(f"Evaluation with model {trained_model}...")
+    if device.type == "cuda":
         torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device=device)
+    testing_started = time.perf_counter()
+    processed_events = 0
+
+    for trained_model, model_path in all_trained_models:
+        log(f"Evaluation with model {trained_model}...")
         time_gap_statistics = None
         model_variant = getattr(getattr(cfg, "model", None), "variant", None)
         time_gap_cfg = getattr(
@@ -255,7 +274,7 @@ def main(cfg):
             data_sample=test_data[0], device=device, cfg=cfg, max_node_num=max_node_num,
             time_gap_statistics=time_gap_statistics,
         )
-        model = load_model(model, os.path.join(gnn_models_dir, trained_model))
+        model = load_model(model, model_path)
 
         if cfg._from_weights:
             model.load_state_dict(torch.load(os.path.join(cfg._from_weights_path, f"{cfg.dataset.name}.pkl")))
@@ -286,7 +305,7 @@ def main(cfg):
             log(f"    Testing {split} set...")
             for g in tqdm(graphs, desc=f"{split} set with {trained_model}"):
                 g.to(device=device)
-                test(
+                result = test(
                     data=g,
                     full_data=full_data,
                     model=model,
@@ -296,9 +315,24 @@ def main(cfg):
                     cfg=cfg,
                     device=device,
                 )
+                if isinstance(result, dict):
+                    processed_events += int(result.get("processed_event_count", 0))
                 g.to("cpu")
 
         del model
+
+    test_seconds = time.perf_counter() - testing_started
+    peak_gpu_memory_mb = (
+        torch.cuda.max_memory_allocated(device=device) / (1024 ** 2)
+        if device.type == "cuda" else None
+    )
+    update_runtime(runtime_dir, "testing", {
+        "test_seconds": test_seconds,
+        "events_per_second": events_per_second(processed_events, test_seconds),
+        "processed_event_count": processed_events,
+        "peak_gpu_memory_mb": peak_gpu_memory_mb,
+        "peak_cpu_memory_mb": peak_cpu_memory_mb(),
+    })
 
 
 if __name__ == "__main__":

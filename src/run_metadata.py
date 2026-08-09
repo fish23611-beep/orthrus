@@ -300,7 +300,20 @@ def dump_runtime(
     if error_message:
         runtime["error_message"] = error_message
 
-    _write_json(run_dir / "runtime.json", runtime)
+    # C8 stages may already have recorded detailed runtime sections.  Preserve
+    # them when the pipeline-level summary is written at shutdown.
+    runtime_path = run_dir / "runtime.json"
+    try:
+        with runtime_path.open(encoding="utf-8") as handle:
+            previous_runtime = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        previous_runtime = {}
+    if isinstance(previous_runtime, dict):
+        for section in ("training", "testing", "model"):
+            if isinstance(previous_runtime.get(section), dict):
+                runtime[section] = previous_runtime[section]
+
+    _write_json(runtime_path, runtime)
 
 
 # --------------------------------------------------------------------------- #

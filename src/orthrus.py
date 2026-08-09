@@ -80,17 +80,21 @@ def _check_detection_only_prerequisites(stages, cfg) -> list[str]:
     if not os.path.isdir(edge_embeds):
         missing.append(f"Edge embeddings: {edge_embeds}")
 
-    # Train/checkpoint requirements
-    if "train" in stages:
-        pass  # Train will generate checkpoints
-    elif "test" in stages or "evaluate" in stages:
+    # Train produces checkpoints; an explicit inference checkpoint replaces the
+    # default run checkpoint directory for test/evaluate-only invocations.
+    inference_checkpoint = getattr(cfg, "_inference_checkpoint", None)
+    has_inference_checkpoint = (
+        isinstance(inference_checkpoint, str) and bool(inference_checkpoint)
+    )
+    if "train" not in stages and ("test" in stages or "evaluate" in stages) and not has_inference_checkpoint:
         checkpoint_dir = cfg.detection.gnn_training._trained_models_dir
         if not os.path.isdir(checkpoint_dir):
             missing.append(f"Checkpoints: {checkpoint_dir}")
         elif not os.listdir(checkpoint_dir):
             missing.append(f"Checkpoints directory empty: {checkpoint_dir}")
 
-    if "evaluate" in stages:
+    # Test produces the edge scores consumed by evaluate in the same pipeline.
+    if "evaluate" in stages and "test" not in stages:
         edge_scores_dir = cfg.detection.gnn_testing._edge_losses_dir
         if not os.path.isdir(edge_scores_dir):
             missing.append(f"Edge scores: {edge_scores_dir}")
@@ -114,7 +118,12 @@ def _check_artifact_prerequisites(stages, cfg):
     train_run = "train" in stages
     test_run = "test" in stages
 
-    if "test" in stages and not train_run:
+    inference_checkpoint = getattr(cfg, "_inference_checkpoint", None)
+    has_inference_checkpoint = (
+        isinstance(inference_checkpoint, str)
+        and bool(inference_checkpoint)
+    )
+    if "test" in stages and not train_run and not has_inference_checkpoint:
         train_path = cfg.detection.gnn_training._trained_models_dir
         if not isinstance(train_path, (str, os.PathLike)):
             raise FileNotFoundError(
@@ -308,30 +317,17 @@ def main(cfg, args, **kwargs):
     return time_consumption
 
 
-if __name__ == '__main__':
-    import wandb
+def run(args):
+    """Resolve runtime services and execute the standard ORTHRUS pipeline.
 
-    args, unknown_args = get_runtime_required_args(return_unknown_args=True)
-
-    if len(unknown_args) > 0:
-        raise argparse.ArgumentTypeError(f"Unknown args {unknown_args}")
-
-    # ------------------------------------------------------------------ #
-    # 0. W&B mode resolution
-    # ------------------------------------------------------------------ #
-    # Pre-create cfg so we can read logging.wandb_mode before full init.
+    This is the reusable form of the historical ``__main__`` block. Keeping
+    orchestration here ensures alternate CLIs share configuration resolution,
+    artifact paths, metadata, W&B handling, and the single pipeline entry.
+    """
     cfg_pre = get_yml_cfg(args)
     wandb_mode = resolve_wandb_mode(cfg_pre, args)
-
-    # ------------------------------------------------------------------ #
-    # 1. Artifact root + run dir resolution
-    # ------------------------------------------------------------------ #
-    # Parse stages for artifact path resolution
     stages = _parse_stages(args.stages, args.run_from_training)
 
-    # Resolve artifact paths.  create_dirs=True so stage sub-directories are created.
-    # If cfg fields are invalid, ValueError is raised;
-    # the caller is responsible for providing valid cfg in production.
     cli_root = getattr(args, "artifact_root", None)
     env_root = os.environ.get("ORTHRUS_ARTIFACT_ROOT", None)
     run_dir = resolve_artifact_paths(
@@ -341,33 +337,21 @@ if __name__ == '__main__':
         create_dirs=True,
     )
 
-    # ------------------------------------------------------------------ #
-    # 2. Write run metadata (environment + resolved config)
-    # ------------------------------------------------------------------ #
     cfg_pre._run_start_time = datetime.now(timezone.utc).isoformat()
     dump_environment(run_dir)
     dump_config(cfg_pre, run_dir)
-
-    # ------------------------------------------------------------------ #
-    # 3. W&B initialisation
-    # ------------------------------------------------------------------ #
     init_wandb(cfg_pre, args, wandb_mode)
 
-    # ------------------------------------------------------------------ #
-    # 4. Run pipeline
-    # ------------------------------------------------------------------ #
     try:
         timing = main(cfg_pre, args)
         status = "completed"
         error_msg = None
+        return timing
     except Exception as exc:
         status = "failed"
         error_msg = f"{type(exc).__name__}: {exc}"
         raise
     finally:
-        # ------------------------------------------------------------------ #
-        # 5. Write runtime.json and clean up
-        # ------------------------------------------------------------------ #
         dump_runtime(
             cfg_pre,
             run_dir,
@@ -378,3 +362,11 @@ if __name__ == '__main__':
             error_message=error_msg if "error_msg" in dir() else None,
         )
         wandb_finish()
+
+
+if __name__ == '__main__':
+    args, unknown_args = get_runtime_required_args(return_unknown_args=True)
+
+    if len(unknown_args) > 0:
+        raise argparse.ArgumentTypeError(f"Unknown args {unknown_args}")
+    run(args)

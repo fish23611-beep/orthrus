@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import os
 import hashlib
 import pathlib
@@ -93,6 +93,7 @@ TASK_ARGS = {
                "num_epochs": int,
                "lr": float,
                "weight_decay": float,
+               "resume_checkpoint": str,
                "node_hid_dim": int,
                "node_out_dim": int,
                "encoder": {
@@ -432,6 +433,9 @@ def get_default_cfg(args):
 
      create_cfg_recursive(cfg, CONFIG_ARGS)
 
+     # C8-A resume path is optional and excluded from the checkpoint config hash.
+     cfg.detection.gnn_training.resume_checkpoint = None
+
      # C4 defaults keep existing configs on the baseline/type-only path.
      cfg.detection.gnn_training.decoder.predict_edge_type.enabled = True
      cfg.detection.gnn_training.decoder.time_gap.enabled = False
@@ -472,6 +476,8 @@ def get_runtime_required_args(return_unknown_args=False, args=None):
      parser = argparse.ArgumentParser()
      parser.add_argument('dataset', type=str, help="Name of the dataset")
      parser.add_argument('--model', type=str, help="Name of the model (Orthrus)")
+     parser.add_argument('--config', type=str, default=None, metavar='PATH',
+                         help="Explicit YAML configuration file. When omitted, uses config/<model>.yml.")
      parser.add_argument('--model.variant', type=str, choices=["orthrus_baseline", "mstc"], default=None,
                         help="Model implementation variant.")
      # Note: detection.gnn_training.encoder.context.mode is added automatically by add_cfg_args_to_parser
@@ -636,13 +642,35 @@ def check_args(args):
      if args.dataset not in available_datasets:
           raise ValueError(f"Unknown dataset {args.dataset}. Available datasets are {available_datasets}")
 
-def check_task_dependency_graph(yml_file: str):
-     with open(yml_file, 'r') as file:
-          user_config = yaml.safe_load(file)
+def check_task_dependency_graph(yml_file: str, base_yml_file: str = None):
+     """Validate pipeline dependencies after resolving an experiment overlay.
 
-     subtasks = [j for i in user_config.values() for j in i]
+     Experiment YAML files intentionally describe only their experimental
+     difference. Their omitted pipeline fields are inherited from
+     ``config/orthrus.yml``; validating an overlay in isolation incorrectly
+     rejected valid backbone and time-task configurations.
+     """
+     with open(yml_file, 'r') as file:
+          user_config = yaml.safe_load(file) or {}
+
+     if base_yml_file is not None:
+          with open(base_yml_file, 'r') as file:
+               base_config = yaml.safe_load(file) or {}
+     else:
+          base_config = {}
+
+     # The dependency graph contains only pipeline subtasks. Select those
+     # declared by the base configuration or the overlay, not arbitrary
+     # values such as ``model.variant``.
+     subtasks = set()
+     for task, task_subtasks in TASK_ARGS.items():
+          for source in (base_config, user_config):
+               section = source.get(task, {}) if isinstance(source, dict) else {}
+               if isinstance(section, dict):
+                    subtasks.update(name for name in section if name in task_subtasks)
+
      deps = TASK_DEPENDENCIES
-     subtask_set = set(subtasks)
+     subtask_set = subtasks
 
      def has_all_dependencies(task):
           return all(dependency in subtask_set and has_all_dependencies(dependency)
@@ -650,7 +678,7 @@ def check_task_dependency_graph(yml_file: str):
 
      dependencies_ok = all(has_all_dependencies(subtask) for subtask in subtasks)
      if dependencies_ok:
-          print(f"Task dependency graph is valid: {subtasks}")
+          print(f"Task dependency graph is valid: {sorted(subtasks)}")
           # log("\nYAML configuration")
           # log(user_config)
      else:
@@ -712,16 +740,40 @@ def get_yml_cfg(args):
      # Inits with default configurations
      cfg = get_default_cfg(args)
 
-     # Checks that all configurations are valid (not set to None)
+     # Experiment YAML files are overlays. Resolve the project baseline first
+     # so every runnable experiment inherits a complete ORTHRUS configuration.
      root_path = pathlib.Path(__file__).parent.parent.resolve()
-     yml_file = f"{root_path}/config/{args.model}.yml"
-     validate_yml_file(yml_file)
+     base_yml_file = root_path / "config" / "orthrus.yml"
 
-     # Overrides default config with config from yml file
-     cfg.merge_from_file(yml_file)
+     # Checks that all configurations are valid (not set to None)
+     config_path = getattr(args, "config", None)
+     if config_path is None:
+          yml_file = base_yml_file
+     else:
+          yml_file = pathlib.Path(config_path).expanduser()
+          if not yml_file.is_file():
+               raise FileNotFoundError(
+                    f"Config file does not exist or is not a regular file: {yml_file}"
+               )
+          yml_file = yml_file.resolve()
+     validate_yml_file(str(yml_file))
+
+     # Internal defaults < base config < experiment YAML < dotted CLI args.
+     # Avoid merging the base file twice for the legacy default invocation.
+     if yml_file != base_yml_file:
+          cfg.merge_from_file(str(base_yml_file))
+     cfg.merge_from_file(str(yml_file))
 
 # Overwrites args to the cfg
      overwrite_cfg_with_args(cfg, args)
+
+     # C8-B runtime checkpoint routing. These values are supplied by the
+     # unified experiment wrapper and intentionally do not alter legacy CLI
+     # behaviour when absent.
+     resume_checkpoint = getattr(args, "resume_checkpoint", None)
+     if resume_checkpoint is not None:
+          cfg.detection.gnn_training.resume_checkpoint = resume_checkpoint
+     cfg._inference_checkpoint = getattr(args, "inference_checkpoint", None)
 
      # Handle --artifact-root explicitly (non-dotted CLI arg, not processed by overwrite_cfg_with_args)
      artifact_root_raw = getattr(args, "artifact_root", None)
@@ -771,7 +823,7 @@ def get_yml_cfg(args):
          cfg.semantic_features.corpus_scope = _validate_corpus_scope(cfg.semantic_features.corpus_scope)
 
      # Checks args after all overrides are applied
-     check_task_dependency_graph(yml_file)
+     check_task_dependency_graph(str(yml_file), str(base_yml_file))
 
      # Based on the defined restart args, computes a unique path on disk
      # to store the files of each task

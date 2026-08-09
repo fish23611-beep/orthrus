@@ -1,6 +1,7 @@
 import os
 
 import pickle
+import warnings
 import torch
 from torch_geometric.data import Data, TemporalData
 from torch_geometric.loader import TemporalDataLoader
@@ -483,27 +484,97 @@ class GraphReindexer:
 
         return x, edge_index
 
-def save_model(model, path: str, neigh_loader: bool=True):
+def save_training_checkpoint(model, optimizer, epoch: int, path: str, *, cfg=None, scheduler=None):
+    """Persist all state needed for deterministic training resume.
+
+    Temporal history is intentionally excluded: C1/C5 replay reconstructs it
+    from chronological training data before validation/testing.
     """
-    Saves only the required weights and tensors on disk.
-    Using torch.save() directly on the model is very long (up to 10min),
-    so we select only the tensors we want to save/load.
-    """
+    from mstc.experiment_utils import capture_rng_state, stable_config_hash
+
+    if optimizer is None:
+        raise ValueError("optimizer is required for a complete training checkpoint")
+    checkpoint = {
+        "format_version": 2,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": int(epoch),
+        "config_hash": stable_config_hash(cfg) if cfg is not None else None,
+        **capture_rng_state(),
+    }
+    if scheduler is not None:
+        checkpoint["scheduler_state_dict"] = scheduler.state_dict()
+    torch.save(checkpoint, os.path.join(path, "checkpoint.pt"), pickle_protocol=pickle.HIGHEST_PROTOCOL)
+    return checkpoint
+
+
+def load_training_checkpoint(model, path: str, *, optimizer=None, scheduler=None, cfg=None,
+                             map_location=None, restore_rng: bool=True):
+    """Load a structured checkpoint, with clear legacy model-only fallback."""
+    from mstc.experiment_utils import restore_rng_state, stable_config_hash
+
+    checkpoint_path = path if os.path.isfile(path) else os.path.join(path, "checkpoint.pt")
+    if not os.path.isfile(checkpoint_path):
+        legacy_path = path if os.path.isfile(path) else os.path.join(path, "state_dict.pkl")
+        legacy_state = torch.load(legacy_path, map_location=map_location, weights_only=False)
+        model.load_state_dict(legacy_state)
+        warnings.warn(
+            "Loaded legacy model-state-only checkpoint; it supports inference but not training resume.",
+            UserWarning,
+        )
+        return {"epoch": None, "complete": False, "config_hash": None}
+
+    checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+    if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+        model.load_state_dict(checkpoint)
+        warnings.warn(
+            "Loaded legacy model-state-only checkpoint; it supports inference but not training resume.",
+            UserWarning,
+        )
+        return {"epoch": None, "complete": False, "config_hash": None}
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    required = {
+        "optimizer_state_dict", "epoch", "python_random_state", "numpy_random_state",
+        "torch_cpu_rng_state", "config_hash",
+    }
+    missing = required.difference(checkpoint)
+    if optimizer is not None:
+        if missing:
+            raise ValueError("checkpoint is not complete enough to resume training; missing " + ", ".join(sorted(missing)))
+        if cfg is not None and checkpoint["config_hash"] != stable_config_hash(cfg):
+            raise ValueError("checkpoint config_hash does not match the current resolved configuration")
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if scheduler is not None:
+            if "scheduler_state_dict" not in checkpoint:
+                raise ValueError("checkpoint has no scheduler state for the supplied scheduler")
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if restore_rng:
+            restore_rng_state(checkpoint)
+    return {"epoch": checkpoint.get("epoch"), "complete": not missing, "config_hash": checkpoint.get("config_hash")}
+
+
+def save_model(model, path: str, neigh_loader: bool=True, *, optimizer=None, epoch=None, cfg=None, scheduler=None):
+    """Save legacy model weights and, when supplied, a complete training checkpoint."""
     os.makedirs(path, exist_ok=True)
-
     torch.save(model.state_dict(), os.path.join(path, "state_dict.pkl"), pickle_protocol=pickle.HIGHEST_PROTOCOL)
-
+    if optimizer is not None and epoch is not None:
+        save_training_checkpoint(model, optimizer, epoch, path, cfg=cfg, scheduler=scheduler)
     if neigh_loader and isinstance(model.encoder, OrthrusEncoder):
         torch.save(model.encoder.neighbor_loader, os.path.join(path, "neighbor_loader.pkl"), pickle_protocol=pickle.HIGHEST_PROTOCOL)
 
+
 def load_model(model, path: str, neigh_loader: bool=True):
-    """
-    Loads weights and tensors from disk into a model.
-    """
-    model.load_state_dict(
-        torch.load(os.path.join(path, "state_dict.pkl")))
-
-    if neigh_loader and isinstance(model.encoder, OrthrusEncoder):
-        model.encoder.neighbor_loader = torch.load(os.path.join(path, "neighbor_loader.pkl"))
-
+    """Load weights for inference from structured or legacy checkpoints."""
+    if os.path.isfile(path):
+        load_training_checkpoint(model, path, restore_rng=False)
+        return model
+    structured_path = os.path.join(path, "checkpoint.pt")
+    if os.path.isfile(structured_path):
+        load_training_checkpoint(model, path, restore_rng=False)
+    else:
+        model.load_state_dict(torch.load(os.path.join(path, "state_dict.pkl"), weights_only=False))
+    neighbor_loader_path = os.path.join(path, "neighbor_loader.pkl")
+    if neigh_loader and isinstance(model.encoder, OrthrusEncoder) and os.path.isfile(neighbor_loader_path):
+        model.encoder.neighbor_loader = torch.load(neighbor_loader_path, weights_only=False)
     return model

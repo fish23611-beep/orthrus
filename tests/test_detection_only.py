@@ -104,6 +104,37 @@ class TestCheckDetectionOnlyPrerequisites:
         
         assert any("Graphs directory" in m for m in missing)
 
+    def test_explicit_checkpoint_and_test_stage_satisfy_downstream_prerequisites(self, tmp_path):
+        """An explicit inference checkpoint plus test supplies evaluate inputs."""
+        graphs_dir = tmp_path / "graphs"
+        graphs_dir.mkdir()
+        (graphs_dir / "graph_1.pt").touch()
+        w2v_dir = tmp_path / "word2vec"
+        w2v_dir.mkdir()
+        edges_dir = tmp_path / "edges"
+        edges_dir.mkdir()
+        checkpoint = tmp_path / "checkpoint.pt"
+        checkpoint.touch()
+
+        cfg = SimpleNamespace(
+            _inference_checkpoint=str(checkpoint),
+            graph_construction=SimpleNamespace(
+                build_graphs=SimpleNamespace(_graphs_dir=str(graphs_dir))
+            ),
+            edge_featurization=SimpleNamespace(
+                embed_nodes=SimpleNamespace(
+                    feature_word2vec=SimpleNamespace(_model_dir=str(w2v_dir))
+                ),
+                embed_edges=SimpleNamespace(_edge_embeds_dir=str(edges_dir)),
+            ),
+            detection=SimpleNamespace(
+                gnn_training=SimpleNamespace(_trained_models_dir=str(tmp_path / "missing_checkpoints")),
+                gnn_testing=SimpleNamespace(_edge_losses_dir=str(tmp_path / "missing_scores")),
+            ),
+        )
+
+        assert orthrus._check_detection_only_prerequisites(["test", "evaluate"], cfg) == []
+
     def test_train_only_does_not_require_checkpoints(self, tmp_path):
         """Train-only stage does not require checkpoints."""
         graphs_dir = tmp_path / "graphs"

@@ -1,0 +1,25 @@
+# Simple GraphSAGE baseline, deliberately without MSTC modules.
+pipeline:
+  mode: detection_only
+  run_tracing: false
+model:
+  variant: orthrus_baseline
+logging:
+  wandb_mode: disabled
+detection:
+  gnn_training:
+    encoder:
+      backbone: graphsage
+      neighbor_size: 20
+      context:
+        mode: recent
+        multiscale:
+          enabled: false
+    decoder:
+      predict_edge_type:
+        enabled: true
+      time_gap:
+        enabled: false
+        lambda_time: 0.3
+        hidden_dim: 128
+        num_classes: 6

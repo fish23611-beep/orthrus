@@ -1,7 +1,11 @@
-# C7 stateless Semantic MLP overlay for the non-graph MSTC baseline.
+# Stateless non-graph Semantic MLP baseline.
+pipeline:
+  mode: detection_only
+  run_tracing: false
 model:
-  variant: mstc
-
+  variant: orthrus_baseline
+logging:
+  wandb_mode: disabled
 detection:
   gnn_training:
     encoder:
@@ -10,3 +14,11 @@ detection:
         mode: none
         multiscale:
           enabled: false
+    decoder:
+      predict_edge_type:
+        enabled: true
+      time_gap:
+        enabled: false
+        lambda_time: 0.3
+        hidden_dim: 128
+        num_classes: 6
