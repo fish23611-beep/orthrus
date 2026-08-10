@@ -192,7 +192,7 @@ def _check_artifact_prerequisites(stages, cfg):
 # Preprocess substage execution
 # ---------------------------------------------------------------------------
 
-def _check_preprocess_substage_prerequisites(substage, cfg):
+def _check_preprocess_substage_prerequisites(substage, cfg, completed_substages=()):
     """
     Check prerequisites for running a specific preprocess substage.
     
@@ -200,20 +200,24 @@ def _check_preprocess_substage_prerequisites(substage, cfg):
         substage: one of "build_graphs", "embed_nodes", "embed_edges"
         cfg: configuration object
         
+        completed_substages: substages successfully completed in this invocation
     Raises:
         FileNotFoundError: if prerequisites are not met
     """
+    completed_substages = set(completed_substages)
     if substage == "embed_nodes":
         # embed_nodes needs database access (checked at runtime)
         pass
     elif substage == "embed_edges":
         # embed_edges needs graphs and Word2Vec model
-        if not check_preprocess_stage_complete(cfg, "build_graphs"):
+        if ("build_graphs" not in completed_substages and
+                not check_preprocess_stage_complete(cfg, "build_graphs")):
             raise FileNotFoundError(
                 f"Substage 'embed_edges' requires completed 'build_graphs' stage. "
                 f"Run 'build_graphs' first, or full 'preprocess' pipeline."
             )
-        if not check_preprocess_stage_complete(cfg, "embed_nodes"):
+        if ("embed_nodes" not in completed_substages and
+                not check_preprocess_stage_complete(cfg, "embed_nodes")):
             raise FileNotFoundError(
                 f"Substage 'embed_edges' requires completed 'embed_nodes' stage. "
                 f"Run 'embed_nodes' first, or full 'preprocess' pipeline."
@@ -234,6 +238,7 @@ def _run_preprocess_substages(cfg, substages):
     timings = {}
     peak_rss = 0.0
     
+    completed_substages = set()
     log("=" * 40)
     log("Starting bounded-memory preprocessing")
     _log_memory("preprocess start")
@@ -248,15 +253,16 @@ def _run_preprocess_substages(cfg, substages):
             if substage == "build_graphs":
                 build_orthrus_graphs.main(cfg)
             elif substage == "embed_nodes":
-                _check_preprocess_substage_prerequisites(substage, cfg)
+                _check_preprocess_substage_prerequisites(substage, cfg, completed_substages)
                 build_feature_word2vec.main(cfg)
             elif substage == "embed_edges":
-                _check_preprocess_substage_prerequisites(substage, cfg)
+                _check_preprocess_substage_prerequisites(substage, cfg, completed_substages)
                 embed_edges_feature_word2vec.main(cfg)
             else:
                 raise ValueError(f"Unknown substage: {substage}")
             
             t_end = time_module.time()
+            completed_substages.add(substage)
             rss_end = _get_memory_usage_mb()
             rss_peak = max(rss_start, rss_end, _get_memory_usage_mb())
             peak_rss = max(peak_rss, rss_peak)

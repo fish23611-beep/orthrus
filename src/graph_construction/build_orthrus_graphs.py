@@ -219,43 +219,29 @@ def gen_edge_fused_tw_streaming(cur, nodeid2msg, logger, cfg, event_fetch_size=8
         
         logger.info(f"Streaming events for day {day}: {date_start} to {date_stop}")
         
-        # Streaming event buffer - holds filtered events for semantic batching
-        filtered_events = []
-        pending_events = []  # Events fetched but not yet filtered
+        # Keep the frozen implementation's semantic batches while allowing the
+        # database fetch size to vary independently. At most one incomplete
+        # semantic batch plus the current time-window's events are retained;
+        # importantly, this does not materialize the full day's event table.
+        def filtered_semantic_batches():
+            batch = []
+            for event in stream_event_table(cur, sql, event_fetch_size):
+                if event[2] not in include_edge_type:
+                    continue
+                batch.append(event)
+                if len(batch) == BATCH:
+                    yield batch
+                    batch = []
+            if batch:
+                yield batch
+
         graph_count = 0
-        
-        # Stream events from database
-        for raw_event in stream_event_table(cur, sql, event_fetch_size):
-            pending_events.append(raw_event)
-            
-            # Process pending events when buffer is large enough
-            # This ensures we don't hold raw rows for too long
-            if len(pending_events) >= event_fetch_size:
-                for evt in pending_events:
-                    (src_node, src_index_id, operation, dst_node, dst_index_id, 
-                     event_uuid, timestamp_rec, _id) = evt
-                    if operation in include_edge_type:
-                        filtered_events.append(evt)
-                pending_events.clear()
-        
-        # Process remaining events
-        for evt in pending_events:
-            (src_node, src_index_id, operation, dst_node, dst_index_id, 
-             event_uuid, timestamp_rec, _id) = evt
-            if operation in include_edge_type:
-                filtered_events.append(evt)
-        pending_events.clear()
-        
-        if not filtered_events:
-            logger.info(f"No events for day {day}")
-            continue
-        
-        # Process filtered events in semantic batches
-        start_time = filtered_events[0][-2]
+        start_time = None
         temp_list = []
-        
-        for i in range(0, len(filtered_events), BATCH):
-            batch = filtered_events[i:i + BATCH]
+
+        for batch in filtered_semantic_batches():
+            if start_time is None:
+                start_time = batch[0][-2]
             
             for j in batch:
                 temp_list.append(j)
@@ -377,8 +363,11 @@ def gen_edge_fused_tw_streaming(cur, nodeid2msg, logger, cfg, event_fetch_size=8
                 if cfg._test_mode:
                     return
 
+        if start_time is None:
+            logger.info(f"No events for day {day}")
+
         # End of day cleanup
-        filtered_events.clear()
+        temp_list.clear()
         gc.collect()
         
         logger.info(f"Day {day} completed: {graph_count} graphs created")

@@ -139,7 +139,13 @@ def check_preprocess_stage_complete(cfg, stage):
     graphs_dir = cfg.graph_construction.build_graphs._graphs_dir
     
     # Check completion marker first (new mechanism)
-    marker_path = _get_completion_marker_path(graphs_dir, stage)
+    marker_base_dir = graphs_dir
+    if stage == "embed_nodes":
+        marker_base_dir = cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir
+    elif stage == "embed_edges":
+        marker_base_dir = cfg.edge_featurization.embed_edges._edge_embeds_dir
+
+    marker_path = _get_completion_marker_path(marker_base_dir, stage)
     if os.path.isfile(marker_path):
         return True
     
@@ -151,19 +157,38 @@ def check_preprocess_stage_complete(cfg, stage):
         # Count graph files recursively (exclude markers and temp files)
         # Note: frozen version saved graphs WITHOUT .pt suffix (time_interval format)
         # New version also doesn't add .pt suffix (uses atomic rename pattern)
-        # So we look for any non-temp file in graph subdirectories
-        graph_files = []
-        for root, dirs, files in os.walk(graphs_dir):
-            for f in files:
-                # Graph files may or may not have .pt suffix
-                # Exclude completion markers and temp files
-                if f.startswith('.preprocess_') or f.endswith('.tmp'):
-                    continue
-                # Graph subdirectories are named graph_N, files inside are time_intervals
-                # or optionally have .pt suffix in some legacy scenarios
-                if 'graph_' in root:
-                    graph_files.append(f)
-        return len(graph_files) > 0
+        def has_graph_file(folder):
+            if not os.path.isdir(folder):
+                return False
+            return any(
+                not name.startswith('.preprocess_') and not name.endswith('.tmp')
+                for name in os.listdir(folder)
+                if os.path.isfile(os.path.join(folder, name))
+            )
+
+        # A marker-free frozen run is complete only when every configured
+        # graph split has an artifact. This preserves compatibility with its
+        # suffixless time-window filenames without treating a partial run as
+        # complete. Minimal/older configs without split metadata retain the
+        # historical "any graph_N folder" fallback.
+        expected_folders = []
+        dataset = getattr(cfg, "dataset", None)
+        if dataset is not None:
+            for attr in ("train_files", "val_files", "test_files"):
+                values = getattr(dataset, attr, None)
+                if isinstance(values, (list, tuple)):
+                    expected_folders.extend(values)
+        expected_folders = list(dict.fromkeys(expected_folders))
+        if expected_folders:
+            return all(
+                has_graph_file(os.path.join(graphs_dir, folder))
+                for folder in expected_folders
+            )
+
+        for name in os.listdir(graphs_dir):
+            if name.startswith("graph_") and has_graph_file(os.path.join(graphs_dir, name)):
+                return True
+        return False
     
     elif stage == "embed_nodes":
         # Check for Word2Vec model

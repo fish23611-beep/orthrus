@@ -87,15 +87,23 @@ def update_notebook(nb):
             cell = nb['cells'][end_idx]
             if cell.get('cell_type') == 'markdown':
                 source = ''.join(cell.get('source', []))
-                if source.startswith('## '):
+                if any(line.startswith('## ') for line in source.splitlines()):
                     break
             end_idx += 1
+
+        resource_idx = find_cell_index(nb, '资源预检：显示系统资源状态')
+        if resource_idx != -1:
+            nb['cells'].pop(resource_idx)
+            if resource_idx < end_idx:
+                end_idx -= 1
         
         # Insert resource pre-check cell before next section
         resource_check_cell = create_code_cell('''# ============================================================================
 # 资源预检：显示系统资源状态
 # ============================================================================
 import psutil
+import os
+import subprocess
 import shutil
 
 print("=" * 60)
@@ -121,8 +129,9 @@ else:
 for path in ["/content", str(DRIVE_ROOT)]:
     if os.path.exists(path):
         usage = shutil.disk_usage(path)
+        used_percent = usage.used / usage.total * 100
         print(f"\\n{path} 磁盘: 总计 {usage.total / (1024**3):.1f} GB, "
-              f"可用 {usage.free / (1024**3):.1f} GB ({usage.percent}% used)")
+              f"可用 {usage.free / (1024**3):.1f} GB ({used_percent:.1f}% used)")
 
 print("=" * 60)
 print("资源预检完成")
@@ -169,47 +178,45 @@ print("=" * 60)
     preprocess_cell_idx = find_cell_index(nb, 'RUN_PREPROCESS=False')
     
     if preprocess_cell_idx != -1:
-        preprocess_cell = nb['cells'][preprocess_cell_idx]
-        source = ''.join(preprocess_cell['source'])
-        
-        # Update the command to include --preprocess-substages
-        if '--preprocess-substages' not in source:
-            # Update command line
-            source = source.replace(
-                '"--stages", "preprocess", "--skip-tracing"',
-                '"--stages", "preprocess", "--preprocess-substages", PREPROCESS_SUBSTAGES, "--skip-tracing"'
-            )
-            
-            # Add pre-check for completion markers
-            if 'completion marker' not in source:
-                # Add marker checking logic
-                marker_check = '''
-# C8.1: 检查 completion markers 以支持增量运行
-graphs_dir = ARTIFACT_ROOT / "graphs"
-build_marker = graphs_dir / ".preprocess_build_graphs_complete"
-embed_nodes_marker = ARTIFACT_ROOT / "word2vec" / ".preprocess_embed_nodes_complete"
-embed_edges_marker = ARTIFACT_ROOT / "edge_embeds" / ".preprocess_embed_edges_complete"
+        preprocess_source = '''import subprocess
+import sys
+from pathlib import Path
 
-# 显示当前状态
-print(f"build_graphs marker: {'✓' if build_marker.exists() else '✗'}")
-print(f"embed_nodes marker: {'✓' if embed_nodes_marker.exists() else '✗'}")
-print(f"embed_edges marker: {'✓' if embed_edges_marker.exists() else '✗'}")
+if not RUN_PREPROCESS:
+    print("RUN_PREPROCESS=False，跳过预处理。")
+    if not artifacts_complete:
+        print("⚠️  警告: 预处理产物不完整")
+elif artifacts_complete and not FORCE_PREPROCESS:
+    print("检测到完整产物，跳过预处理。")
+else:
+    print("=" * 60)
+    print("开始预处理")
+    print("=" * 60)
 
-# 如果运行的是 build_graphs 但已有完整产物，跳过其他阶段
-if PREPROCESS_SUBSTAGES == "build_graphs,embed_nodes,embed_edges":
-    if build_marker.exists() and embed_nodes_marker.exists() and embed_edges_marker.exists():
-        print("检测到完整预处理产物，跳过预处理。")
-        print("如需强制重新运行，请设置 FORCE_PREPROCESS = True")
-        FORCE_PREPROCESS = False
+    graphs_dir = Path(cfg.graph_construction.build_graphs._graphs_dir)
+    word2vec_dir = Path(cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir)
+    edge_embeds_dir = Path(cfg.edge_featurization.embed_edges._edge_embeds_dir)
+    markers = {
+        "build_graphs": graphs_dir / ".preprocess_build_graphs_complete",
+        "embed_nodes": word2vec_dir / ".preprocess_embed_nodes_complete",
+        "embed_edges": edge_embeds_dir / ".preprocess_embed_edges_complete",
+    }
+    print("Preprocessing stage status:")
+    for stage, marker in markers.items():
+        print(f"  {stage}: {'✓' if marker.exists() else '✗'}")
+
+    command = [
+        sys.executable, str(PROJECT_ROOT / "src/orthrus.py"), DATASET,
+        "--config", str(PREPROCESS_CONFIG), "--stages", "preprocess",
+        "--preprocess-substages", PREPROCESS_SUBSTAGES, "--skip-tracing",
+        "--artifact-root", str(ARTIFACT_ROOT),
+    ]
+    subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+    print("预处理完成")
+    print("=" * 60)
 '''
-                # Find a good insertion point (before the command)
-                if 'command = [' in source:
-                    # Insert marker check before the command
-                    parts = source.split('command = [')
-                    source = parts[0] + marker_check + '\ncommand = [' + parts[1]
-            
-            preprocess_cell['source'] = [source]
-            print(f"Updated preprocess cell at index {preprocess_cell_idx}")
+        nb['cells'][preprocess_cell_idx]['source'] = [preprocess_source]
+        print(f"Updated preprocess cell at index {preprocess_cell_idx}")
     
     # =========================================================================
     # 5. Update artifacts check to use markers
