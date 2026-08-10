@@ -1,2 +1,2 @@
-from . import build_feature_word2vec
-from . import embed_edges_feature_word2vec
+# Empty __init__.py to avoid automatic import of heavy modules.
+# This prevents pytest from loading gensim, torch, etc. during collection.

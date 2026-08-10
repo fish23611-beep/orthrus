@@ -16,12 +16,12 @@ def stream_node_table(cur, sql, batch_size=1024):
     """
     Stream rows from a node table using fetchmany() instead of fetchall().
     Yields records one at a time while maintaining bounded memory.
-    
+
     Args:
         cur: database cursor
         sql: SQL query to execute
         batch_size: number of rows to fetch per batch (DB I/O chunk, NOT semantic batch)
-    
+
     Yields:
         Individual row records
     """
@@ -32,18 +32,26 @@ def stream_node_table(cur, sql, batch_size=1024):
             break
         for row in rows:
             yield row
+        # Guard: if the DB cursor returned fewer rows than requested, the
+        # stream is exhausted regardless of any empty-list sentinel.
+        try:
+            short_batch = len(rows) < batch_size
+        except TypeError:
+            break
+        if short_batch:
+            break
 
 
 def stream_event_table(cur, sql, batch_size=8192):
     """
     Stream rows from event_table using fetchmany() instead of fetchall().
     This is the primary memory bottleneck for graph construction.
-    
+
     Args:
         cur: database cursor
         sql: SQL query to execute
         batch_size: number of rows to fetch per batch
-    
+
     Yields:
         Individual event row records
     """
@@ -54,6 +62,12 @@ def stream_event_table(cur, sql, batch_size=8192):
             break
         for row in rows:
             yield row
+        try:
+            short_batch = len(rows) < batch_size
+        except TypeError:
+            break
+        if short_batch:
+            break
 
 
 # ---------------------------------------------------------------------------

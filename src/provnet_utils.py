@@ -38,9 +38,20 @@ import re
 from config import *
 import hashlib
 import glob
+
+# Lazy NLTK download: only download punkt when actually needed, not at import time.
+# This avoids blocking pytest sessions and improves import performance.
+def _ensure_nltk_punkt():
+    """Ensure NLTK punkt tokenizer data is available."""
+    try:
+        import nltk.data
+        nltk.data.find("tokenizers/punkt")
+    except (ImportError, LookupError):
+        import nltk
+        nltk.download("punkt", quiet=True)
+
+
 from nltk.tokenize import word_tokenize
-import nltk
-nltk.download('punkt')
 
 def stringtomd5(originstr):
     originstr = originstr.encode("utf-8")
@@ -440,13 +451,16 @@ def get_indexid2msg_streaming(cur, use_cmd=True, use_port=False, batch_size=1024
     return indexid2msg
 
 def tokenize_subject(sentence: str):
+    _ensure_nltk_punkt()
     new_sentence = re.sub(r'\\+', '/', sentence)
     return word_tokenize(new_sentence.replace('/', ' / '))
     # return word_tokenize(sentence.replace('/',' ').replace('=',' = ').replace(':',' : '))
 def tokenize_file(sentence: str):
+    _ensure_nltk_punkt()
     new_sentence = re.sub(r'\\+', '/', sentence)
     return word_tokenize(new_sentence.replace('/',' / '))
 def tokenize_netflow(sentence: str):
+    _ensure_nltk_punkt()
     return word_tokenize(sentence.replace(':',' : ').replace('.',' . '))
 
 def log(msg: str, *args):

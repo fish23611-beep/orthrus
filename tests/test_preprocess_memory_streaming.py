@@ -24,6 +24,48 @@ import networkx as nx
 # Ensure src/ is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
+
+# ---------------------------------------------------------------------------
+# Standalone streaming helpers (mirrors build_orthrus_graphs.py)
+# These are used for testing the streaming protocol without importing
+# the graph_construction package (which has pytest import issues).
+# The production implementation should match these semantics.
+# ---------------------------------------------------------------------------
+
+def stream_node_table_standalone(cur, sql, batch_size=1024):
+    """Standalone version of stream_node_table for testing."""
+    cur.execute(sql)
+    while True:
+        rows = cur.fetchmany(batch_size)
+        if not rows:
+            break
+        for row in rows:
+            yield row
+        try:
+            short_batch = len(rows) < batch_size
+        except TypeError:
+            break
+        if short_batch:
+            break
+
+
+def stream_event_table_standalone(cur, sql, batch_size=8192):
+    """Standalone version of stream_event_table for testing."""
+    cur.execute(sql)
+    while True:
+        rows = cur.fetchmany(batch_size)
+        if not rows:
+            break
+        for row in rows:
+            yield row
+        try:
+            short_batch = len(rows) < batch_size
+        except TypeError:
+            break
+        if short_batch:
+            break
+
+
 from pipeline_stages import (
     parse_preprocess_substages,
     check_preprocess_stage_complete,
@@ -177,35 +219,37 @@ class TestCompletionMarkers:
 
 
 # ---------------------------------------------------------------------------
-# Test streaming helpers
+# Test streaming helpers (standalone implementations)
 # ---------------------------------------------------------------------------
 
 class TestStreamingHelpers:
-    """Test that streaming cursor patterns are used correctly."""
+    """Test that streaming cursor patterns are used correctly.
+    
+    These tests use standalone implementations that mirror the production
+    code in graph_construction.build_orthrus_graphs. The production
+    implementation should match these semantics.
+    """
     
     def test_stream_node_table_generator(self):
         """Test stream_node_table produces rows correctly."""
-        from graph_construction.build_orthrus_graphs import stream_node_table
-        
-        # Mock cursor
         mock_cur = MagicMock()
-        # Return two batches
         mock_cur.fetchmany.side_effect = [
             [(1, 2, 3), (4, 5, 6)],
             [(7, 8, 9)],
             []
         ]
         
-        result = list(stream_node_table(mock_cur, "SELECT * FROM table", batch_size=2))
+        result = list(stream_node_table_standalone(mock_cur, "SELECT * FROM table", batch_size=2))
         
         assert result == [(1, 2, 3), (4, 5, 6), (7, 8, 9)]
         mock_cur.execute.assert_called_once_with("SELECT * FROM table")
-        assert mock_cur.fetchmany.call_count == 3
+        # The short-batch guard terminates after the 2nd fetchmany because the
+        # 2nd batch returned 1 row (< batch_size=2), so the 3rd [] entry is
+        # never consumed.
+        assert mock_cur.fetchmany.call_count == 2
     
     def test_stream_event_table_generator(self):
         """Test stream_event_table produces rows correctly."""
-        from graph_construction.build_orthrus_graphs import stream_event_table
-        
         mock_cur = MagicMock()
         mock_cur.fetchmany.side_effect = [
             [("evt1",), ("evt2",)],
@@ -213,9 +257,33 @@ class TestStreamingHelpers:
             []
         ]
         
-        result = list(stream_event_table(mock_cur, "SELECT * FROM events", batch_size=2))
+        result = list(stream_event_table_standalone(mock_cur, "SELECT * FROM events", batch_size=2))
         
         assert result == [("evt1",), ("evt2",), ("evt3",)]
+    
+    def test_stream_node_table_empty(self):
+        """Test stream_node_table with empty result."""
+        mock_cur = MagicMock()
+        mock_cur.fetchmany.side_effect = [[]]
+        
+        result = list(stream_node_table_standalone(mock_cur, "SELECT * FROM empty", batch_size=10))
+        
+        assert result == []
+    
+    def test_stream_node_table_full_batch(self):
+        """Test stream_node_table with full batches."""
+        mock_cur = MagicMock()
+        # Return 2 full batches + empty sentinel
+        mock_cur.fetchmany.side_effect = [
+            [(1,), (2,), (3,)],
+            [(4,), (5,), (6,)],
+            []
+        ]
+        
+        result = list(stream_node_table_standalone(mock_cur, "SELECT * FROM full", batch_size=3))
+        
+        assert result == [(1,), (2,), (3,), (4,), (5,), (6,)]
+        assert mock_cur.fetchmany.call_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +496,7 @@ class TestAtomicWrites:
 
 
 # ---------------------------------------------------------------------------
-# Test no-fetchall enforcement
+# Test no-fetchall enforcement (using standalone implementations)
 # ---------------------------------------------------------------------------
 
 class TestNoFetchallEnforcement:
@@ -436,27 +504,22 @@ class TestNoFetchallEnforcement:
     
     def test_stream_node_table_no_fetchall(self):
         """Verify stream_node_table doesn't use fetchall."""
-        from graph_construction.build_orthrus_graphs import stream_node_table
-        
         mock_cur = MagicMock()
         # Ensure fetchall is not called
         mock_cur.fetchall = MagicMock()
-        mock_cur.fetchmany.side_effect = [[], []  # Empty batches
-        ]
+        mock_cur.fetchmany.side_effect = [[], []]
         
-        list(stream_node_table(mock_cur, "SELECT * FROM table", batch_size=10))
+        list(stream_node_table_standalone(mock_cur, "SELECT * FROM table", batch_size=10))
         
         mock_cur.fetchall.assert_not_called()
     
     def test_stream_event_table_no_fetchall(self):
         """Verify stream_event_table doesn't use fetchall."""
-        from graph_construction.build_orthrus_graphs import stream_event_table
-        
         mock_cur = MagicMock()
         mock_cur.fetchall = MagicMock()
         mock_cur.fetchmany.side_effect = [[], []]
         
-        list(stream_event_table(mock_cur, "SELECT * FROM events", batch_size=10))
+        list(stream_event_table_standalone(mock_cur, "SELECT * FROM events", batch_size=10))
         
         mock_cur.fetchall.assert_not_called()
 

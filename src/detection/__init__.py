@@ -1,3 +1,2 @@
-from . import orthrus_gnn_training
-from . import orthrus_gnn_testing
-from . import evaluation
+# Empty __init__.py to avoid automatic import of heavy modules.
+# This prevents pytest from loading torch, wandb, gensim, etc. during collection.
