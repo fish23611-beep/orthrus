@@ -163,11 +163,20 @@ class TestCompletionMarkers:
     def test_build_graphs_legacy_with_files(self, mock_cfg, temp_graphs_dir):
         """check_preprocess_stage_complete uses legacy detection when no marker."""
         # Create a dummy graph file in a proper graph subdirectory
+        # Test WITHOUT .pt suffix (frozen version format)
         graph_subdir = temp_graphs_dir / "graph_0"
+        graph_subdir.mkdir(exist_ok=True)
+        (graph_subdir / "2019-05-08_00:00:00~2019-05-08_00:15:00").write_text("dummy")
+        
+        # Should detect legacy artifacts (no .pt suffix)
+        assert check_preprocess_stage_complete(mock_cfg, "build_graphs") is True
+    
+    def test_build_graphs_legacy_with_pt_suffix(self, mock_cfg, temp_graphs_dir):
+        """Legacy detection also works with .pt suffix files."""
+        graph_subdir = temp_graphs_dir / "graph_1"
         graph_subdir.mkdir(exist_ok=True)
         (graph_subdir / "graph.pt").write_text("dummy")
         
-        # Should detect legacy artifacts
         assert check_preprocess_stage_complete(mock_cfg, "build_graphs") is True
     
     def test_embed_nodes_marker(self, mock_cfg, tmp_path):

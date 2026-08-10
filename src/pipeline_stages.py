@@ -149,10 +149,19 @@ def check_preprocess_stage_complete(cfg, stage):
         if not os.path.isdir(graphs_dir):
             return False
         # Count graph files recursively (exclude markers and temp files)
+        # Note: frozen version saved graphs WITHOUT .pt suffix (time_interval format)
+        # New version also doesn't add .pt suffix (uses atomic rename pattern)
+        # So we look for any non-temp file in graph subdirectories
         graph_files = []
         for root, dirs, files in os.walk(graphs_dir):
             for f in files:
-                if f.endswith('.pt') and not f.endswith('.tmp'):
+                # Graph files may or may not have .pt suffix
+                # Exclude completion markers and temp files
+                if f.startswith('.preprocess_') or f.endswith('.tmp'):
+                    continue
+                # Graph subdirectories are named graph_N, files inside are time_intervals
+                # or optionally have .pt suffix in some legacy scenarios
+                if 'graph_' in root:
                     graph_files.append(f)
         return len(graph_files) > 0
     
