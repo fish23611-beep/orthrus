@@ -112,65 +112,35 @@ def check_conflict(stages_str, run_from_training):
 # Artifact completion checks for bounded-memory preprocessing
 # ---------------------------------------------------------------------------
 
-def _get_completion_marker_path(graphs_dir, stage):
-    """Get path to completion marker for a preprocessing stage."""
+def _get_completion_marker_path(artifact_dir, stage):
+    """Return the marker written by a preprocessing stage."""
     markers = {
         "build_graphs": ".preprocess_build_graphs_complete",
         "embed_nodes": ".preprocess_embed_nodes_complete",
         "embed_edges": ".preprocess_embed_edges_complete",
+        "metadata": ".preprocess_metadata_complete",
     }
-    return os.path.join(graphs_dir, markers.get(stage, f".preprocess_{stage}_complete"))
+    return os.path.join(
+        artifact_dir, markers.get(stage, f".preprocess_{stage}_complete")
+    )
 
 
-def check_preprocess_stage_complete(cfg, stage):
-    """
-    Check if a preprocessing stage has completed successfully.
-    
-    Uses completion markers for new artifacts and falls back to checking
-    for actual artifacts in legacy scenarios.
-    
-    Args:
-        cfg: configuration object
-        stage: one of "build_graphs", "embed_nodes", "embed_edges"
-    
-    Returns:
-        bool: True if stage appears to have completed
-    """
+def _has_visible_file(folder):
+    if not os.path.isdir(folder):
+        return False
+    return any(
+        os.path.isfile(os.path.join(folder, name))
+        and not name.startswith(".preprocess_")
+        and not name.endswith(".tmp")
+        for name in os.listdir(folder)
+    )
+
+
+def _stage_artifacts_valid(cfg, stage):
     graphs_dir = cfg.graph_construction.build_graphs._graphs_dir
-    
-    # Check completion marker first (new mechanism)
-    marker_base_dir = graphs_dir
-    if stage == "embed_nodes":
-        marker_base_dir = cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir
-    elif stage == "embed_edges":
-        marker_base_dir = cfg.edge_featurization.embed_edges._edge_embeds_dir
-
-    marker_path = _get_completion_marker_path(marker_base_dir, stage)
-    if os.path.isfile(marker_path):
-        return True
-    
-    # Fallback: check for actual artifacts (legacy compatibility)
     if stage == "build_graphs":
-        # Check if graphs directory has content
         if not os.path.isdir(graphs_dir):
             return False
-        # Count graph files recursively (exclude markers and temp files)
-        # Note: frozen version saved graphs WITHOUT .pt suffix (time_interval format)
-        # New version also doesn't add .pt suffix (uses atomic rename pattern)
-        def has_graph_file(folder):
-            if not os.path.isdir(folder):
-                return False
-            return any(
-                not name.startswith('.preprocess_') and not name.endswith('.tmp')
-                for name in os.listdir(folder)
-                if os.path.isfile(os.path.join(folder, name))
-            )
-
-        # A marker-free frozen run is complete only when every configured
-        # graph split has an artifact. This preserves compatibility with its
-        # suffixless time-window filenames without treating a partial run as
-        # complete. Minimal/older configs without split metadata retain the
-        # historical "any graph_N folder" fallback.
         expected_folders = []
         dataset = getattr(cfg, "dataset", None)
         if dataset is not None:
@@ -181,49 +151,72 @@ def check_preprocess_stage_complete(cfg, stage):
         expected_folders = list(dict.fromkeys(expected_folders))
         if expected_folders:
             return all(
-                has_graph_file(os.path.join(graphs_dir, folder))
+                _has_visible_file(os.path.join(graphs_dir, folder))
                 for folder in expected_folders
             )
+        return any(
+            name.startswith("graph_")
+            and _has_visible_file(os.path.join(graphs_dir, name))
+            for name in os.listdir(graphs_dir)
+        )
 
-        for name in os.listdir(graphs_dir):
-            if name.startswith("graph_") and has_graph_file(os.path.join(graphs_dir, name)):
-                return True
-        return False
-    
-    elif stage == "embed_nodes":
-        # Check for Word2Vec model
+    if stage == "embed_nodes":
         model_dir = cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir
-        model_path = os.path.join(model_dir, "feature_word2vec.model")
-        return os.path.isfile(model_path)
-    
-    elif stage == "embed_edges":
-        # Check for edge embeddings
-        edge_embeds_dir = cfg.edge_featurization.embed_edges._edge_embeds_dir
-        if not os.path.isdir(edge_embeds_dir):
+        return os.path.isfile(os.path.join(model_dir, "feature_word2vec.model"))
+
+    if stage == "embed_edges":
+        edge_dir = cfg.edge_featurization.embed_edges._edge_embeds_dir
+        return all(
+            _has_visible_file(os.path.join(edge_dir, split))
+            for split in ("train", "val", "test")
+        )
+
+    if stage == "metadata":
+        metadata_dir = getattr(cfg, "_metadata_dir", None)
+        if not metadata_dir:
             return False
-        # Check for train/val/test subdirectories with content
-        for split in ["train", "val", "test"]:
-            split_dir = os.path.join(edge_embeds_dir, split)
-            if os.path.isdir(split_dir):
-                files = [f for f in os.listdir(split_dir) if not f.startswith('.')]
-                if files:
-                    return True
-        return False
-    
+        from mstc.metadata_cache import MetadataCache, metadata_complete
+        return metadata_complete(MetadataCache(metadata_dir))
+
     return False
 
 
+def check_preprocess_stage_complete(cfg, stage):
+    """Require a completion marker plus key artifact validation.
+
+    Marker-free graph/model/edge artifacts retain legacy compatibility, while a
+    marker can never make a partial or corrupt stage look complete.
+    """
+    if stage == "build_graphs":
+        artifact_dir = cfg.graph_construction.build_graphs._graphs_dir
+    elif stage == "embed_nodes":
+        artifact_dir = cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir
+    elif stage == "embed_edges":
+        artifact_dir = cfg.edge_featurization.embed_edges._edge_embeds_dir
+    elif stage == "metadata":
+        artifact_dir = getattr(cfg, "_metadata_dir", "")
+    else:
+        return False
+
+    valid = _stage_artifacts_valid(cfg, stage)
+    marker = _get_completion_marker_path(artifact_dir, stage)
+    if os.path.isfile(marker):
+        return valid
+    if stage == "metadata":
+        return False
+    return valid
+
+
 def check_all_preprocess_stages_complete(cfg):
-    """
-    Check if all preprocessing stages have completed.
-    
-    Args:
-        cfg: configuration object
-        
-    Returns:
-        bool: True if all stages appear complete
-    """
+    """Require all four markers and validate every stage's key artifacts."""
+    artifact_dirs = {
+        "build_graphs": cfg.graph_construction.build_graphs._graphs_dir,
+        "embed_nodes": cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir,
+        "embed_edges": cfg.edge_featurization.embed_edges._edge_embeds_dir,
+        "metadata": getattr(cfg, "_metadata_dir", ""),
+    }
     return all(
-        check_preprocess_stage_complete(cfg, stage)
-        for stage in PREPROCESS_SUBSTAGES
+        os.path.isfile(_get_completion_marker_path(artifact_dirs[stage], stage))
+        and check_preprocess_stage_complete(cfg, stage)
+        for stage in (*PREPROCESS_SUBSTAGES, "metadata")
     )

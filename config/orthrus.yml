@@ -30,6 +30,11 @@ edge_featurization:
   embed_edges:
     to_remove: True
 
+# Paper experiments train Word2Vec only on nodes appearing in training graphs.
+# Use official_full_dataset explicitly for compatibility with original ORTHRUS.
+semantic_features:
+  corpus_scope: train_only
+
 detection:
   gnn_training:
     used_method: orthrus

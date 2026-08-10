@@ -72,6 +72,7 @@ from pipeline_stages import (
     check_all_preprocess_stages_complete,
     PREPROCESS_SUBSTAGES,
 )
+from mstc.metadata_cache import MetadataCache
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +147,8 @@ class TestCompletionMarkers:
         edge_embeds_dir = tmp_path / "edge_emb"
         edge_embeds_dir.mkdir(exist_ok=True)
         cfg.edge_featurization.embed_edges._edge_embeds_dir = str(edge_embeds_dir)
+        cfg._metadata_dir = str(tmp_path / "metadata")
+        (tmp_path / "metadata").mkdir(exist_ok=True)
         
         return cfg
     
@@ -154,10 +157,14 @@ class TestCompletionMarkers:
         assert check_preprocess_stage_complete(mock_cfg, "build_graphs") is False
     
     def test_build_graphs_marker_exists(self, mock_cfg, temp_graphs_dir):
-        """check_preprocess_stage_complete returns True when marker exists."""
+        """A marker is accepted only with a key graph artifact."""
         marker_path = temp_graphs_dir / ".preprocess_build_graphs_complete"
         marker_path.write_text(datetime.now().isoformat())
-        
+        assert check_preprocess_stage_complete(mock_cfg, "build_graphs") is False
+
+        graph_dir = temp_graphs_dir / "graph_0"
+        graph_dir.mkdir()
+        (graph_dir / "window").write_text("graph")
         assert check_preprocess_stage_complete(mock_cfg, "build_graphs") is True
     
     def test_build_graphs_legacy_with_files(self, mock_cfg, temp_graphs_dir):
@@ -190,17 +197,15 @@ class TestCompletionMarkers:
         assert check_preprocess_stage_complete(mock_cfg, "embed_nodes") is True
     
     def test_embed_edges_marker(self, mock_cfg, tmp_path):
-        """Embed edges completion check uses edge embeddings."""
+        """Edge completion requires non-empty train, val, and test outputs."""
         edge_embeds_dir = tmp_path / "edge_emb"
-        
-        # No marker, no files
         assert check_preprocess_stage_complete(mock_cfg, "embed_edges") is False
-        
-        # Add train split with file
-        train_dir = edge_embeds_dir / "train"
-        train_dir.mkdir(exist_ok=True)
-        (train_dir / "graph_0.TemporalData.simple").write_text("dummy")
-        
+
+        for split in ("train", "val", "test"):
+            split_dir = edge_embeds_dir / split
+            split_dir.mkdir(exist_ok=True)
+            (split_dir / "graph.TemporalData.simple").write_text("dummy")
+        (edge_embeds_dir / ".preprocess_embed_edges_complete").write_text("done")
         assert check_preprocess_stage_complete(mock_cfg, "embed_edges") is True
     
     def test_all_stages_complete_false(self, mock_cfg):
@@ -208,22 +213,38 @@ class TestCompletionMarkers:
         assert check_all_preprocess_stages_complete(mock_cfg) is False
     
     def test_all_stages_complete_true(self, mock_cfg, temp_graphs_dir, tmp_path):
-        """check_all_preprocess_stages_complete returns True when all complete."""
-        # Mark all stages complete
-        (temp_graphs_dir / ".preprocess_build_graphs_complete").write_text("")
-        
+        """All four stages need validated files and completion markers."""
+        graph_dir = temp_graphs_dir / "graph_0"
+        graph_dir.mkdir()
+        (graph_dir / "window").write_text("graph")
+        (temp_graphs_dir / ".preprocess_build_graphs_complete").write_text("done")
+
         model_dir = tmp_path / "w2v"
-        model_dir.mkdir(exist_ok=True)
-        (model_dir / "feature_word2vec.model").write_text("")
-        
-        edge_embeds_dir = tmp_path / "edge_emb"
-        train_dir = edge_embeds_dir / "train"
-        train_dir.mkdir(exist_ok=True)
-        (train_dir / "dummy.pt").write_text("")
-        
-        # Create marker for embed_edges
-        (edge_embeds_dir / ".preprocess_embed_edges_complete").write_text("")
-        
+        (model_dir / "feature_word2vec.model").write_text("model")
+        (model_dir / ".preprocess_embed_nodes_complete").write_text("done")
+
+        edge_dir = tmp_path / "edge_emb"
+        for split in ("train", "val", "test"):
+            split_dir = edge_dir / split
+            split_dir.mkdir()
+            (split_dir / "graph").write_text("edges")
+        (edge_dir / ".preprocess_embed_edges_complete").write_text("done")
+
+        cache = MetadataCache(mock_cfg._metadata_dir)
+        cache.save_node_metadata({1: {"type": "file"}})
+        cache.save_uuid_to_node_id({"uuid": 1})
+        cache.save_node_id_to_uuid({1: "uuid"})
+        cache.save_ground_truth_nodes(set())
+        cache.save_attack_to_nodes({})
+        cache.save_time_to_malicious_nodes({})
+        cache.save_relation_mapping({})
+        cache.save_nodeid2msg({1: "file"})
+        cache.save_dataset_manifest(
+            dataset="THEIA_E3", num_node_types=3, num_edge_types=10,
+            train_files=[], val_files=[], test_files=[], word2vec_dim=128,
+            preprocess_config_hash="hash", corpus_scope="train_only",
+        )
+        (tmp_path / "metadata/.preprocess_metadata_complete").write_text("done")
         assert check_all_preprocess_stages_complete(mock_cfg) is True
 
 
@@ -881,22 +902,25 @@ def _run_substage_dispatch(selected):
     import orthrus
 
     cfg = MagicMock()
+    completed = {"metadata"}
     calls = MagicMock()
-    build_graphs = MagicMock()
-    embed_nodes = MagicMock()
-    embed_edges = MagicMock()
+    build_graphs = MagicMock(side_effect=lambda _cfg: completed.add("build_graphs"))
+    embed_nodes = MagicMock(side_effect=lambda _cfg: completed.add("embed_nodes"))
+    embed_edges = MagicMock(side_effect=lambda _cfg: completed.add("embed_edges"))
     calls.attach_mock(build_graphs, "build_graphs")
     calls.attach_mock(embed_nodes, "embed_nodes")
     calls.attach_mock(embed_edges, "embed_edges")
+    is_complete = lambda _cfg, stage: stage in completed
     with patch.object(orthrus.build_orthrus_graphs, "main", build_graphs), \
          patch.object(orthrus.build_feature_word2vec, "main", embed_nodes), \
          patch.object(orthrus.embed_edges_feature_word2vec, "main", embed_edges), \
+         patch.object(orthrus, "check_preprocess_stage_complete", side_effect=is_complete), \
+         patch.object(orthrus, "export_metadata"), \
          patch.object(orthrus, "_check_preprocess_substage_prerequisites"), \
          patch.object(orthrus, "_get_memory_usage_mb", return_value=0.0), \
          patch.object(orthrus.torch.cuda, "is_available", return_value=False):
         orthrus._run_preprocess_substages(cfg, selected)
     return cfg, calls.mock_calls
-
 
 class TestPreprocessSubstageExecution:
     def test_default_preprocess_behavior_runs_all_substages_in_order(self):
@@ -968,13 +992,13 @@ class TestArtifactAcceptanceRegressions:
         ("embed_nodes", "w2v"),
         ("embed_edges", "edge_emb"),
     ])
-    def test_completion_markers_are_read_from_writer_directories(
+    def test_completion_markers_cannot_hide_missing_artifacts(
         self, artifact_cfg, tmp_path, stage, relative_dir
     ):
         mock_cfg, _temp_graphs_dir = artifact_cfg
         marker = tmp_path / relative_dir / f".preprocess_{stage}_complete"
         marker.write_text("complete")
-        assert check_preprocess_stage_complete(mock_cfg, stage) is True
+        assert check_preprocess_stage_complete(mock_cfg, stage) is False
 
 
 if __name__ == "__main__":

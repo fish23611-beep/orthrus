@@ -480,6 +480,26 @@ def get_device(cfg):
 def get_node_to_path_and_type(cfg):
     out_path = cfg.graph_construction.build_graphs._node_id_to_path
     out_file = os.path.join(out_path, "node_to_paths.pkl")
+    metadata_dir = getattr(cfg, "_metadata_dir", None)
+    if metadata_dir:
+        from mstc.metadata_cache import MetadataCache
+        cache = MetadataCache(metadata_dir)
+        if cache.has_node_metadata():
+            result = {}
+            for node_id, meta in cache.load_node_metadata().items():
+                node_type = meta.get("type", "unknown")
+                if node_type == "netflow":
+                    path = (
+                        f"{meta.get('local_ip')}:{meta.get('local_port')}->"
+                        f"{meta.get('remote_ip')}:{meta.get('remote_port')}"
+                    )
+                else:
+                    path = str(meta.get("path") or "")
+                result[int(node_id)] = {"path": path, "type": node_type}
+                if node_type == "subject":
+                    result[int(node_id)]["cmd"] = meta.get("cmd")
+            return result
+
 
     if not os.path.exists(out_file):
         os.makedirs(out_path, exist_ok=True)

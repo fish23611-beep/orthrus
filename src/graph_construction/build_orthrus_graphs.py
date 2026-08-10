@@ -399,13 +399,15 @@ def main(cfg):
 
         gen_edge_fused_tw(cur=cur, nodeid2msg=nodeid2msg, logger=logger, cfg=cfg)
         
-        # Write completion marker
+        # Publish the marker atomically only after all graphs are durable.
         marker_path = os.path.join(
             cfg.graph_construction.build_graphs._graphs_dir, 
             ".preprocess_build_graphs_complete"
         )
-        with open(marker_path, 'w') as f:
+        marker_tmp_path = marker_path + ".tmp"
+        with open(marker_tmp_path, 'w', encoding="utf-8") as f:
             f.write(datetime.now().isoformat())
+        os.replace(marker_tmp_path, marker_path)
         logger.info(f"Build graphs complete. Marker written: {marker_path}")
         
     finally:

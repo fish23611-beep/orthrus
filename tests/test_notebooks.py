@@ -31,8 +31,7 @@ ENTRYPOINTS = (
     "src/experiments/export_tables.py",
 )
 MASTER_NOTEBOOK_NAME = "ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb"
-REQUIRED_FROZEN_TAG = "mstc-pids-c1-c8-exp-v1"
-REQUIRED_COMMIT = "0a7ab00bb0900df5afd4ecb01359ab10ad37c60e"
+REQUIRED_REPOSITORY_REF = "fix/c8-preprocess-correctness"
 
 
 def _read_notebook(path: Path):
@@ -143,35 +142,36 @@ def test_master_notebook_has_required_cells():
 
     # Check for key section markers in markdown cells
     required_sections = [
-        "全局参数",  # Global parameters
-        "Google Drive",  # Drive mount
-        "冻结代码版本",  # Frozen code version
-        "GPU",  # GPU verification
-        "依赖安装",  # Dependency installation
-        "环境记录",  # Environment recording
-        "THEIA 数据检查",  # Data check
-        "PostgreSQL",  # Database
-        "Preprocessing",  # Preprocessing
-        "Baseline Smoke",  # Baseline smoke
-        "主模型矩阵",  # Main matrix
-        "消融",  # Ablation
-        "结果收集",  # Result collection
+        "Unified parameters",
+        "Mount Drive",
+        "repository ref",
+        "Resource preflight",
+        "Install Python dependencies",
+        "environment record",
+        "persistent artifacts",
+        "PostgreSQL",
+        "Restartable preprocessing",
+        "Baseline Smoke",
+        "主模型矩阵",
+        "消融",
+        "结果收集",
     ]
 
     for section in required_sections:
         assert section in source, f"Missing section in Master Notebook: {section}"
 
 
-def test_master_notebook_references_frozen_tag():
-    """Master Notebook must reference the frozen tag."""
+def test_master_notebook_uses_one_coherent_frozen_ref_mechanism():
+    """Branch/tag checkout and strict commit verification stay coherent."""
     master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
     notebook = _read_notebook(master_path)
     source = _source(notebook)
 
-    assert REQUIRED_FROZEN_TAG in source, \
-        f"Master Notebook must reference frozen tag: {REQUIRED_FROZEN_TAG}"
-    assert REQUIRED_COMMIT in source, \
-        f"Master Notebook must reference expected commit: {REQUIRED_COMMIT}"
+    assert REQUIRED_REPOSITORY_REF in source
+    assert "EXPECTED_COMMIT" in source
+    assert "actual_commit" in source
+    assert "Commit mismatch" in source
+    assert "git describe --tags --exact-match" not in source
 
 
 def test_master_notebook_references_all_entrypoints():

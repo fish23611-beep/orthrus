@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from provnet_utils import *
 from config import *
 from tqdm import tqdm
@@ -201,6 +202,99 @@ def train_feature_word2vec(corpus, cfg, model_save_path, logger):
     log(f"Save word2vec to {model_path}")
 
 
+def collect_split_node_ids(graphs_dir, split_files):
+    """Collect node IDs that actually occur in the requested graph split."""
+    node_ids = set()
+    base_dir = Path(graphs_dir)
+    for split_name in split_files:
+        split_dir = base_dir / split_name
+        if not split_dir.is_dir():
+            raise FileNotFoundError(
+                f"Training graph split is missing: {split_dir}. "
+                "Run build_graphs before train_only Word2Vec fitting."
+            )
+        graph_paths = sorted(
+            path for path in split_dir.iterdir()
+            if path.is_file()
+            and not path.name.startswith(".preprocess_")
+            and not path.name.endswith(".tmp")
+        )
+        if not graph_paths:
+            raise FileNotFoundError(f"Training graph split has no graph files: {split_dir}")
+        for graph_path in graph_paths:
+            try:
+                graph = torch.load(graph_path, weights_only=False)
+            except TypeError:  # PyTorch versions before weights_only
+                graph = torch.load(graph_path)
+            node_ids.update(int(node_id) for node_id in graph.nodes)
+            del graph
+    return node_ids
+
+
+def _indexid2msg_from_metadata(node_metadata, use_cmd=True, use_port=False):
+    """Convert persisted metadata to the legacy ``[node_type, message]`` form."""
+    result = {}
+    for raw_node_id, meta in node_metadata.items():
+        node_id = int(raw_node_id)
+        node_type = meta.get("type")
+        if node_type == "subject":
+            message = str(meta.get("path") or "")
+            if use_cmd and meta.get("cmd"):
+                message = f"{message} {meta['cmd']}"
+        elif node_type == "file":
+            message = str(meta.get("path") or "")
+        elif node_type == "netflow":
+            message = str(meta.get("remote_ip") or "")
+            if use_port and meta.get("remote_port") is not None:
+                message = f"{message}:{meta['remote_port']}"
+        else:
+            continue
+        result[node_id] = [node_type, message]
+    return result
+
+
+def load_semantic_messages(cfg, use_cmd=True, use_port=False):
+    """Load node semantics cache-first, retaining the PostgreSQL fallback."""
+    metadata_dir = getattr(cfg, "_metadata_dir", None)
+    if metadata_dir:
+        from mstc.metadata_cache import MetadataCache
+        cache = MetadataCache(metadata_dir)
+        if cache.has_node_metadata():
+            return _indexid2msg_from_metadata(
+                cache.load_node_metadata(), use_cmd=use_cmd, use_port=use_port
+            )
+
+    cur, connect = init_database_connection(cfg)
+    try:
+        return get_indexid2msg(cur, use_cmd=use_cmd, use_port=use_port)
+    finally:
+        cur.close()
+        connect.close()
+
+
+def select_corpus_messages(indexid2msg, cfg):
+    """Apply the configured, split-aware Word2Vec corpus policy."""
+    scope = cfg.semantic_features.corpus_scope
+    if scope == "official_full_dataset":
+        return indexid2msg
+    if scope != "train_only":
+        raise ValueError(f"Unsupported semantic corpus scope: {scope!r}")
+
+    train_node_ids = collect_split_node_ids(
+        cfg.graph_construction.build_graphs._graphs_dir,
+        cfg.dataset.train_files,
+    )
+    available_ids = {int(node_id) for node_id in indexid2msg}
+    missing = train_node_ids.difference(available_ids)
+    if missing:
+        sample = sorted(missing)[:10]
+        raise KeyError(f"Missing semantic metadata for training node IDs: {sample}")
+    return {
+        node_id: message for node_id, message in indexid2msg.items()
+        if int(node_id) in train_node_ids
+    }
+
+
 def main(cfg):
     model_save_path = cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir
     os.makedirs(model_save_path, exist_ok=True)
@@ -228,33 +322,41 @@ def main(cfg):
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
 
-    log(f"Get indexid2msg from database...")
-    cur, connect = init_database_connection(cfg)
-    indexid2msg = get_indexid2msg(cur, use_cmd=use_cmd, use_port=use_port)
+    log("Loading node semantics (metadata cache first, PostgreSQL fallback)...")
+    indexid2msg = load_semantic_messages(cfg, use_cmd=use_cmd, use_port=use_port)
+    corpus_messages = select_corpus_messages(indexid2msg, cfg)
 
-    log(f"Start building and training feature word2vec model...")
+    log("Start building and training feature word2vec model...")
 
-    log("Loading and tokenizing corpus from database...")
-    corpus = load_corpus_from_database(indexid2msg=indexid2msg, use_node_types=use_node_types)
-    
+    log(f"Loading and tokenizing {cfg.semantic_features.corpus_scope} corpus...")
+    corpus = load_corpus_from_database(
+        indexid2msg=corpus_messages, use_node_types=use_node_types
+    )
+
     log(f"Corpus size: {len(corpus)} sentences")
 
-    train_feature_word2vec(corpus=corpus,
-                           cfg=cfg,
-                           model_save_path=model_save_path,
-                           logger=logger)
-    
-    # Write completion marker
-    marker_path = os.path.join(model_save_path, ".preprocess_embed_nodes_complete")
-    from datetime import datetime
-    with open(marker_path, 'w') as f:
-        f.write(datetime.now().isoformat())
+    train_feature_word2vec(
+        corpus=corpus,
+        cfg=cfg,
+        model_save_path=model_save_path,
+        logger=logger,
+    )
+
+    from mstc.metadata_cache import update_dataset_manifest
+    update_dataset_manifest(cfg)
+
+    # Marker publication is the final atomic operation for this stage.
+    marker_path = Path(model_save_path) / ".preprocess_embed_nodes_complete"
+    marker_tmp_path = marker_path.with_name(marker_path.name + ".tmp")
+    from datetime import datetime, timezone
+    marker_tmp_path.write_text(
+        datetime.now(timezone.utc).isoformat(), encoding="utf-8"
+    )
+    os.replace(marker_tmp_path, marker_path)
     log(f"Embed nodes complete. Marker written: {marker_path}")
-    
-    # Clean up
-    cur.close()
-    connect.close()
+
     del indexid2msg
+    del corpus_messages
     del corpus
 
 

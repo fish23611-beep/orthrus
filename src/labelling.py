@@ -189,8 +189,7 @@ def get_t2malicious_node(cfg) -> dict[list]:
     if cache is not None and cache.has_time_to_malicious_nodes():
         try:
             t_to_node = cache.load_time_to_malicious_nodes()
-            if t_to_node:  # Non-empty cache
-                return t_to_node
+            return t_to_node  # An empty mapping is a valid exported cache.
         except Exception:
             pass  # Fall through to DB path
 

@@ -178,6 +178,9 @@ TASK_ARGS = {
 # task-path hashing. They are nevertheless included in defaults, YAML validation,
 # and automatic CLI argument registration.
 C6_CONFIG_ARGS = {
+     "semantic_features": {
+          "corpus_scope": str,
+     },
      "calibration": {
           "method": str,
           "min_triplet_samples": int,
@@ -413,10 +416,6 @@ def get_default_cfg(args):
      cfg.testing = CN()
      cfg.testing.include_node_messages = True  # Whether to include node messages in test output
 
-     # C2: Semantic features configuration (interface only, Word2Vec logic unchanged)
-     cfg.semantic_features = CN()
-     cfg.semantic_features.corpus_scope = "official_full_dataset"  # ["official_full_dataset", "train_only"]
-
      # C2: Logging configuration
      cfg.logging = CN()
      cfg.logging.wandb_mode = "disabled"  # ["disabled", "offline", "online"]
@@ -432,6 +431,10 @@ def get_default_cfg(args):
                     setattr(cfg, task, None)
 
      create_cfg_recursive(cfg, CONFIG_ARGS)
+
+     # C8.2: paper experiments fit semantic features on training graphs only.
+     # ``official_full_dataset`` remains an explicit compatibility option.
+     cfg.semantic_features.corpus_scope = "train_only"
 
      # C8-A resume path is optional and excluded from the checkpoint config hash.
      cfg.detection.gnn_training.resume_checkpoint = None
@@ -501,6 +504,9 @@ def get_runtime_required_args(return_unknown_args=False, args=None):
                               "Valid substages: build_graphs, embed_nodes, embed_edges. "
                               "Default (None): runs all three in order. "
                               "Examples: 'build_graphs' or 'embed_nodes,embed_edges'.")
+     parser.add_argument('--force-preprocess', action='store_true',
+                         help="Explicitly rerun selected preprocessing substages even when "
+                              "validated completion markers exist.")
      parser.add_argument('--skip-tracing', action='store_true',
                          help="Skip attack reconstruction (tracing) stage. Overrides pipeline.run_tracing to False.")
      parser.add_argument('--artifact-root', type=str, default=None,
@@ -554,6 +560,14 @@ def set_task_paths(cfg):
           for subtask_name, subtask_args in subtask.items():
                subtask_cfg = getattr(task_cfg, subtask_name)
                restart_values = flatten_arg_values(subtask_cfg)
+               # Semantic corpus scope changes Word2Vec training, not graph
+               # construction. Add it only to embed_nodes; embed_edges picks
+               # it up through the declared upstream dependency.
+               if subtask_name == "embed_nodes":
+                    restart_values.append(
+                         "semantic_features.corpus_scope="
+                         f"{cfg.semantic_features.corpus_scope}"
+                    )
 
                clean_hash_args = ["".join([c for c in str(restart_value) if c not in set(" []\"\'")]) for restart_value in restart_values]
                final_hash_string = ",".join(clean_hash_args)

@@ -93,6 +93,19 @@ def mock_pipeline_runtime(tmp_path):
                 patch("orthrus.resolve_artifact_paths", side_effect=_patched_resolve)
             ),
         }
+        def _run_mocked_preprocess(cfg, substages, force=False):
+            modules = {
+                "build_graphs": mocks["build_graphs"],
+                "embed_nodes": mocks["embed_nodes"],
+                "embed_edges": mocks["embed_edges"],
+            }
+            for substage in substages:
+                modules[substage](cfg)
+            return {f"time_{substage}": 0.01 for substage in substages}
+
+        mocks["preprocess_runner"] = stack.enter_context(
+            patch("orthrus._run_preprocess_substages", side_effect=_run_mocked_preprocess)
+        )
         mocks["wandb"].run = None
         mocks["resolve_artifact_paths"].return_value = run_dir
         yield mocks

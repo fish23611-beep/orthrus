@@ -5,6 +5,7 @@ from config import *
 from gensim.models import Word2Vec
 import numpy as np
 from tqdm import tqdm
+from edge_featurization.build_feature_word2vec import load_semantic_messages
 from torch_geometric.data import *
 import gc
 
@@ -58,15 +59,29 @@ def get_indexid2vec(indexid2msg, model_path, use_node_types, decline_percentage)
             else:
                 tokens = tokenize_netflow(msg[1])
 
-        weight_list = cal_word_weight(len(tokens), decline_percentage)
+        # Validation/test semantics never update the fitted model. Unknown
+        # tokens are ignored; an all-OOV (or empty) message maps to a fixed
+        # zero vector. This is deterministic and cannot produce NaN values.
+        if tokens:
+            weight_list = cal_word_weight(len(tokens), decline_percentage)
+            weighted_vectors = [
+                weight * model.wv[word]
+                for weight, word in zip(weight_list, tokens)
+                if word in model.wv
+            ]
+        else:
+            weighted_vectors = []
 
-        word_vectors = [model.wv[word] for word in tokens]
-        weighted_vectors = [weight * word_vec for weight, word_vec in zip(weight_list, word_vectors)]
-        sentence_vector = np.mean(weighted_vectors, axis=0)
+        if weighted_vectors:
+            sentence_vector = np.mean(weighted_vectors, axis=0)
+            norm = np.linalg.norm(sentence_vector)
+            normalized_vector = (
+                sentence_vector / norm if norm > 0 else np.zeros(model.vector_size)
+            )
+        else:
+            normalized_vector = np.zeros(model.vector_size)
 
-        normalized_vector = sentence_vector / np.linalg.norm(sentence_vector)
-
-        indexid2vec[int(indexid)] = np.array(normalized_vector)
+        indexid2vec[int(indexid)] = np.asarray(normalized_vector, dtype=np.float32)
 
     log(f"Finish generating normalized node vectors.")
 
@@ -178,14 +193,9 @@ def main(cfg):
     use_port = cfg.edge_featurization.embed_nodes.feature_word2vec.use_port
     decline_percentage = cfg.edge_featurization.embed_nodes.feature_word2vec.decline_rate
 
-    log("Loading node msg from database...")
-    cur, connect = init_database_connection(cfg)
-    indexid2msg = get_indexid2msg(cur, use_cmd=use_cmd, use_port=use_port)
+    log("Loading node semantics (metadata cache first, PostgreSQL fallback)...")
+    indexid2msg = load_semantic_messages(cfg, use_cmd=use_cmd, use_port=use_port)
     indexid2msg = dict(sorted(indexid2msg.items(), key=lambda item: int(item[0])))
-    
-    # Close database connection as soon as possible
-    cur.close()
-    connect.close()
 
     log("Generating node vectors...")
     feature_word2vec_model_path = cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir + 'feature_word2vec.model'
@@ -232,12 +242,14 @@ def main(cfg):
                           cfg=cfg
                           )
     
-    # Write completion marker
+    # Publish the completion marker atomically after every split is saved.
     edge_embeds_dir = cfg.edge_featurization.embed_edges._edge_embeds_dir
     marker_path = os.path.join(edge_embeds_dir, ".preprocess_embed_edges_complete")
-    from datetime import datetime
-    with open(marker_path, 'w') as f:
-        f.write(datetime.now().isoformat())
+    marker_tmp_path = marker_path + ".tmp"
+    from datetime import datetime, timezone
+    with open(marker_tmp_path, 'w', encoding="utf-8") as f:
+        f.write(datetime.now(timezone.utc).isoformat())
+    os.replace(marker_tmp_path, marker_path)
     log(f"Embed edges complete. Marker written: {marker_path}")
     
     # Final cleanup

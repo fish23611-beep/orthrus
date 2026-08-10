@@ -91,6 +91,7 @@ class MetadataCache:
     RELATION_MAPPING_FILE = "relation_mapping.json"
     DATASET_MANIFEST_FILE = "dataset_manifest.json"
     NODEID2MSG_FILE = "nodeid2msg.pkl"
+    COMPLETION_MARKER_FILE = ".preprocess_metadata_complete"
 
     def __init__(self, cache_root: str | Path):
         self.cache_root = Path(cache_root)
@@ -288,6 +289,8 @@ class MetadataCache:
         test_files: list[str],
         word2vec_dim: int,
         preprocess_config_hash: str,
+        corpus_scope: str = "official_full_dataset",
+        word2vec_model_hash: Optional[str] = None,
     ) -> None:
         """Save dataset manifest with required fields."""
         manifest = {
@@ -298,7 +301,9 @@ class MetadataCache:
             "val_files": val_files,
             "test_files": test_files,
             "word2vec_dim": word2vec_dim,
+            "corpus_scope": corpus_scope,
             "preprocess_config_hash": preprocess_config_hash,
+            "word2vec_model_hash": word2vec_model_hash,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         path = self._get_cache_path(self.DATASET_MANIFEST_FILE)
@@ -410,154 +415,23 @@ class MetadataCache:
         
         return result
 
-
-# --------------------------------------------------------------------------- #
-# Database dump helper
-# --------------------------------------------------------------------------- #
-
+# Production implementations live separately to keep this cache container
+# importable without database/config side effects.
 def dump_from_postgres(cfg, cache: MetadataCache) -> None:
-    """
-    Dump metadata caches from PostgreSQL database.
-    
-    Parameters
-    ----------
-    cfg : CfgNode
-        Configuration object with database and dataset settings.
-    cache : MetadataCache
-        Cache instance to write dumps to.
-    
-    Raises
-    ------
-    MetadataCacheError
-        If database connection fails.
-    """
-    from provnet_utils import init_database_connection, get_uuid2nids
-    
-    try:
-        cur, connect = init_database_connection(cfg)
-    except Exception as e:
-        raise MetadataCacheError(
-            f"Failed to connect to database for metadata dump: {e}"
-        ) from e
-    
-    try:
-        # Dump UUID to node ID mapping
-        uuid2nids, nid2uuid = get_uuid2nids(cur)
-        cache.save_uuid_to_node_id(uuid2nids)
-        cache.save_node_id_to_uuid(nid2uuid)
-        
-        # Ground truth nodes
-        ground_truth_nids = _get_ground_truth_nids_from_db(cfg, cur, uuid2nids)
-        cache.save_ground_truth_nodes(set(ground_truth_nids))
-        
-        # Attack to nodes
-        attack_to_nids = _get_attack_to_nodes_from_db(cfg, cur, uuid2nids)
-        cache.save_attack_to_nodes(attack_to_nids)
-        
-        # Time to malicious nodes (simplified - would need full implementation)
-        cache.save_time_to_malicious_nodes({})
-        
-        # Node metadata from queries
-        node_metadata = _get_node_metadata_from_db(cur)
-        cache.save_node_metadata(node_metadata)
-        
-        # Relation mapping (would need schema knowledge)
-        cache.save_relation_mapping({})
-        
-    finally:
-        connect.close()
+    from mstc.metadata_export import dump_from_postgres as _dump
+    _dump(cfg, cache)
 
 
-def _get_ground_truth_nids_from_db(cfg, cur, uuid2nids):
-    """Get ground truth node IDs from CSV files + UUID mapping."""
-    import csv
-    
-    ground_truth_nids = []
-    for file in cfg.dataset.ground_truth_relative_path:
-        gt_path = os.path.join(cfg._ground_truth_dir, file)
-        if os.path.exists(gt_path):
-            with open(gt_path, 'r') as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    node_uuid = row[0]
-                    if node_uuid in uuid2nids:
-                        ground_truth_nids.append(int(uuid2nids[node_uuid]))
-    return ground_truth_nids
+def export_metadata(cfg, force: bool = False) -> MetadataCache:
+    from mstc.metadata_export import export_metadata as _export
+    return _export(cfg, force=force)
 
 
-def _get_attack_to_nodes_from_db(cfg, cur, uuid2nids):
-    """Get attack to node IDs mapping from CSV files + UUID mapping."""
-    import csv
-    
-    attack_to_nids = {}
-    for i, file in enumerate(cfg.dataset.ground_truth_relative_path):
-        attack_to_nids[i] = set()
-        gt_path = os.path.join(cfg._ground_truth_dir, file)
-        if os.path.exists(gt_path):
-            with open(gt_path, 'r') as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    node_uuid = row[0]
-                    if node_uuid in uuid2nids:
-                        attack_to_nids[i].add(int(uuid2nids[node_uuid]))
-    return attack_to_nids
+def update_dataset_manifest(cfg, cache: Optional[MetadataCache] = None) -> None:
+    from mstc.metadata_export import update_dataset_manifest as _update
+    _update(cfg, cache=cache)
 
 
-def _get_node_metadata_from_db(cur):
-    """Get node metadata from database queries."""
-    import re
-    
-    node_metadata = {}
-    
-    # Subject nodes
-    sql = "SELECT index_id, node_uuid, path, cmd FROM subject_node_table;"
-    cur.execute(sql)
-    for row in cur.fetchall():
-        index_id, uuid_val, path, cmd = row
-        node_metadata[index_id] = {
-            "uuid": str(uuid_val),
-            "type": "subject",
-            "path": str(path) if path else None,
-            "cmd": str(cmd) if cmd else None,
-            "local_ip": None,
-            "local_port": None,
-            "remote_ip": None,
-            "remote_port": None,
-            "display": f"subject:{path} {cmd}" if cmd else f"subject:{path}",
-        }
-    
-    # File nodes
-    sql = "SELECT index_id, node_uuid, path FROM file_node_table;"
-    cur.execute(sql)
-    for row in cur.fetchall():
-        index_id, uuid_val, path = row
-        node_metadata[index_id] = {
-            "uuid": str(uuid_val),
-            "type": "file",
-            "path": str(path) if path else None,
-            "cmd": None,
-            "local_ip": None,
-            "local_port": None,
-            "remote_ip": None,
-            "remote_port": None,
-            "display": f"file:{path}",
-        }
-    
-    # Netflow nodes
-    sql = "SELECT index_id, node_uuid, src_addr, src_port, dst_addr, dst_port FROM netflow_node_table;"
-    cur.execute(sql)
-    for row in cur.fetchall():
-        index_id, uuid_val, src_addr, src_port, dst_addr, dst_port = row
-        node_metadata[index_id] = {
-            "uuid": str(uuid_val),
-            "type": "netflow",
-            "path": None,
-            "cmd": None,
-            "local_ip": str(src_addr) if src_addr else None,
-            "local_port": str(src_port) if src_port else None,
-            "remote_ip": str(dst_addr) if dst_addr else None,
-            "remote_port": str(dst_port) if dst_port else None,
-            "display": f"netflow:{src_addr}:{src_port}->{dst_addr}:{dst_port}",
-        }
-    
-    return node_metadata
+def metadata_complete(cache: MetadataCache) -> bool:
+    from mstc.metadata_export import metadata_complete as _complete
+    return _complete(cache)

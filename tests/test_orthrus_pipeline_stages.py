@@ -214,6 +214,23 @@ class TestStageConflict:
 # -------------------------------------------------------------------------- #
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
 class TestTraceGating:
+    @pytest.fixture(autouse=True)
+    def _isolate_preprocessing_runner(self, monkeypatch):
+        """Trace-gating tests exercise routing, not metadata/database internals."""
+        import orthrus
+
+        def run_selected(cfg, substages, force=False):
+            for substage in substages:
+                if substage == "build_graphs":
+                    orthrus.build_orthrus_graphs.main(cfg)
+                elif substage == "embed_nodes":
+                    orthrus.build_feature_word2vec.main(cfg)
+                elif substage == "embed_edges":
+                    orthrus.embed_edges_feature_word2vec.main(cfg)
+            return {f"time_{stage}": 0.0 for stage in substages}
+
+        monkeypatch.setattr(orthrus, "_run_preprocess_substages", run_selected)
+
 
     @requires_torch
     @patch("orthrus.resolve_artifact_paths")

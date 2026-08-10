@@ -41,6 +41,7 @@ from pipeline_stages import (
     check_preprocess_stage_complete,
 )
 
+from mstc.metadata_cache import export_metadata
 from artifact_paths import resolve_artifact_paths
 from run_metadata import dump_environment, dump_config, dump_runtime
 from wandb_control import resolve_wandb_mode, init_wandb, wandb_log, wandb_finish
@@ -206,8 +207,12 @@ def _check_preprocess_substage_prerequisites(substage, cfg, completed_substages=
     """
     completed_substages = set(completed_substages)
     if substage == "embed_nodes":
-        # embed_nodes needs database access (checked at runtime)
-        pass
+        if ("build_graphs" not in completed_substages and
+                not check_preprocess_stage_complete(cfg, "build_graphs")):
+            raise FileNotFoundError(
+                "Substage 'embed_nodes' requires completed training graph artifacts. "
+                "Run 'build_graphs' first, or restore its completion marker."
+            )
     elif substage == "embed_edges":
         # embed_edges needs graphs and Word2Vec model
         if ("build_graphs" not in completed_substages and
@@ -224,77 +229,91 @@ def _check_preprocess_substage_prerequisites(substage, cfg, completed_substages=
             )
 
 
-def _run_preprocess_substages(cfg, substages):
-    """
-    Run specified preprocessing substages with memory tracking.
-    
-    Args:
-        cfg: configuration object
-        substages: list of substage names to run
-        
-    Returns:
-        dict with timing information
-    """
+def _run_preprocess_substages(cfg, substages, force=False):
+    """Run restartable preprocessing, skipping validated completed substages."""
     timings = {}
     peak_rss = 0.0
-    
     completed_substages = set()
+
+    def ensure_metadata(force_export=False):
+        if check_preprocess_stage_complete(cfg, "metadata") and not force_export:
+            return
+        started = time_module.time()
+        export_metadata(cfg, force=force_export)
+        timings["time_metadata"] = round(time_module.time() - started, 2)
+        if not check_preprocess_stage_complete(cfg, "metadata"):
+            raise RuntimeError("Metadata export returned without validated completion")
+
     log("=" * 40)
     log("Starting bounded-memory preprocessing")
     _log_memory("preprocess start")
     log("=" * 40)
-    
+
     for substage in substages:
+        if check_preprocess_stage_complete(cfg, substage) and not force:
+            log(f">>> Skipping completed substage: {substage}")
+            completed_substages.add(substage)
+            timings[f"time_{substage}"] = 0.0
+            timings[f"skipped_{substage}"] = True
+            if substage in ("build_graphs", "embed_nodes"):
+                ensure_metadata()
+            continue
+
         log(f"\n>>> Starting substage: {substage}")
         t_start = time_module.time()
         rss_start = _get_memory_usage_mb()
-        
+
         try:
             if substage == "build_graphs":
                 build_orthrus_graphs.main(cfg)
+                ensure_metadata(force_export=force)
             elif substage == "embed_nodes":
-                _check_preprocess_substage_prerequisites(substage, cfg, completed_substages)
+                _check_preprocess_substage_prerequisites(
+                    substage, cfg, completed_substages
+                )
+                ensure_metadata()
                 build_feature_word2vec.main(cfg)
             elif substage == "embed_edges":
-                _check_preprocess_substage_prerequisites(substage, cfg, completed_substages)
+                _check_preprocess_substage_prerequisites(
+                    substage, cfg, completed_substages
+                )
                 embed_edges_feature_word2vec.main(cfg)
             else:
                 raise ValueError(f"Unknown substage: {substage}")
-            
+
+            if not check_preprocess_stage_complete(cfg, substage):
+                raise RuntimeError(
+                    f"Substage {substage!r} returned without validated artifacts"
+                )
             t_end = time_module.time()
             completed_substages.add(substage)
             rss_end = _get_memory_usage_mb()
             rss_peak = max(rss_start, rss_end, _get_memory_usage_mb())
             peak_rss = max(peak_rss, rss_peak)
-            
-            log(f">>> Completed substage: {substage} "
-                f"(time: {t_end - t_start:.1f}s, "
-                f"RSS: {rss_end:.1f}MB)")
-            
+
+            log(
+                f">>> Completed substage: {substage} "
+                f"(time: {t_end - t_start:.1f}s, RSS: {rss_end:.1f}MB)"
+            )
             timings[f"time_{substage}"] = round(t_end - t_start, 2)
             timings[f"rss_{substage}_mb"] = round(rss_end, 1)
             timings[f"peak_rss_{substage}_mb"] = round(rss_peak, 1)
-            
-        except Exception as e:
-            log(f">>> FAILED substage: {substage}: {e}")
+        except Exception as exc:
+            log(f">>> FAILED substage: {substage}: {exc}")
             raise
-        
-        # Force garbage collection between stages
+
         import gc
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    
+
     log("\n" + "=" * 40)
-    log("Preprocessing complete")
+    log("Selected preprocessing substages finished")
     _log_memory("preprocess end")
     log(f"Peak RSS during preprocessing: {peak_rss:.1f} MB ({peak_rss/1024:.2f} GB)")
     log("=" * 40)
-    
     timings["preprocess_peak_rss_mb"] = round(peak_rss, 1)
-    
     return timings
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -378,7 +397,11 @@ def main(cfg, args, **kwargs):
         
         log(f"Preprocess substages to run: {preprocess_substages}")
         
-        preprocess_timings = _run_preprocess_substages(cfg, preprocess_substages)
+        preprocess_timings = _run_preprocess_substages(
+            cfg,
+            preprocess_substages,
+            force=getattr(args, "force_preprocess", False),
+        )
         
         # Record timing boundaries
         if "build_graphs" in preprocess_substages:
