@@ -36,12 +36,36 @@ from pipeline_stages import (
     VALID_STAGES,
     PREPROCESS_SUBSTAGES,
     parse_stages as _parse_stages,
+    parse_preprocess_substages as _parse_preprocess_substages,
     check_conflict as _check_conflict,
+    check_preprocess_stage_complete,
 )
 
 from artifact_paths import resolve_artifact_paths
 from run_metadata import dump_environment, dump_config, dump_runtime
 from wandb_control import resolve_wandb_mode, init_wandb, wandb_log, wandb_finish
+
+
+# ---------------------------------------------------------------------------
+# Memory tracking
+# ---------------------------------------------------------------------------
+
+def _get_memory_usage_mb():
+    """Get current process RSS memory in MB using psutil."""
+    try:
+        import psutil
+        process = psutil.Process()
+        return process.memory_info().rss / (1024 * 1024)
+    except ImportError:
+        return 0.0
+
+
+def _log_memory(label=""):
+    """Log current memory usage."""
+    rss_mb = _get_memory_usage_mb()
+    if rss_mb > 0:
+        log(f"[Memory{': ' + label if label else ''}] RSS = {rss_mb:.1f} MB ({rss_mb/1024:.2f} GB)")
+    return rss_mb
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +136,8 @@ def _check_artifact_prerequisites(stages, cfg):
     Check that required artifacts exist when an upstream stage is NOT being run.
 
     Rules:
-    - test selected  AND train NOT selected  鈫?check model checkpoint dir
-    - evaluate selected AND test NOT selected 鈫?check test edge-loss output dir
+    - test selected  AND train NOT selected  -> check model checkpoint dir
+    - evaluate selected AND test NOT selected -> check test edge-loss output dir
     """
     train_run = "train" in stages
     test_run = "test" in stages
@@ -162,6 +186,108 @@ def _check_artifact_prerequisites(stages, cfg):
                 f"Stage 'evaluate' requires test split edge scores, "
                 f"but no 'test' split found in {edge_losses_path}. Run 'test' stage first."
             )
+
+
+# ---------------------------------------------------------------------------
+# Preprocess substage execution
+# ---------------------------------------------------------------------------
+
+def _check_preprocess_substage_prerequisites(substage, cfg):
+    """
+    Check prerequisites for running a specific preprocess substage.
+    
+    Args:
+        substage: one of "build_graphs", "embed_nodes", "embed_edges"
+        cfg: configuration object
+        
+    Raises:
+        FileNotFoundError: if prerequisites are not met
+    """
+    if substage == "embed_nodes":
+        # embed_nodes needs database access (checked at runtime)
+        pass
+    elif substage == "embed_edges":
+        # embed_edges needs graphs and Word2Vec model
+        if not check_preprocess_stage_complete(cfg, "build_graphs"):
+            raise FileNotFoundError(
+                f"Substage 'embed_edges' requires completed 'build_graphs' stage. "
+                f"Run 'build_graphs' first, or full 'preprocess' pipeline."
+            )
+        if not check_preprocess_stage_complete(cfg, "embed_nodes"):
+            raise FileNotFoundError(
+                f"Substage 'embed_edges' requires completed 'embed_nodes' stage. "
+                f"Run 'embed_nodes' first, or full 'preprocess' pipeline."
+            )
+
+
+def _run_preprocess_substages(cfg, substages):
+    """
+    Run specified preprocessing substages with memory tracking.
+    
+    Args:
+        cfg: configuration object
+        substages: list of substage names to run
+        
+    Returns:
+        dict with timing information
+    """
+    timings = {}
+    peak_rss = 0.0
+    
+    log("=" * 40)
+    log("Starting bounded-memory preprocessing")
+    _log_memory("preprocess start")
+    log("=" * 40)
+    
+    for substage in substages:
+        log(f"\n>>> Starting substage: {substage}")
+        t_start = time_module.time()
+        rss_start = _get_memory_usage_mb()
+        
+        try:
+            if substage == "build_graphs":
+                build_orthrus_graphs.main(cfg)
+            elif substage == "embed_nodes":
+                _check_preprocess_substage_prerequisites(substage, cfg)
+                build_feature_word2vec.main(cfg)
+            elif substage == "embed_edges":
+                _check_preprocess_substage_prerequisites(substage, cfg)
+                embed_edges_feature_word2vec.main(cfg)
+            else:
+                raise ValueError(f"Unknown substage: {substage}")
+            
+            t_end = time_module.time()
+            rss_end = _get_memory_usage_mb()
+            rss_peak = max(rss_start, rss_end, _get_memory_usage_mb())
+            peak_rss = max(peak_rss, rss_peak)
+            
+            log(f">>> Completed substage: {substage} "
+                f"(time: {t_end - t_start:.1f}s, "
+                f"RSS: {rss_end:.1f}MB)")
+            
+            timings[f"time_{substage}"] = round(t_end - t_start, 2)
+            timings[f"rss_{substage}_mb"] = round(rss_end, 1)
+            timings[f"peak_rss_{substage}_mb"] = round(rss_peak, 1)
+            
+        except Exception as e:
+            log(f">>> FAILED substage: {substage}: {e}")
+            raise
+        
+        # Force garbage collection between stages
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    log("\n" + "=" * 40)
+    log("Preprocessing complete")
+    _log_memory("preprocess end")
+    log(f"Peak RSS during preprocessing: {peak_rss:.1f} MB ({peak_rss/1024:.2f} GB)")
+    log("=" * 40)
+    
+    timings["preprocess_peak_rss_mb"] = round(peak_rss, 1)
+    
+    return timings
 
 
 # ---------------------------------------------------------------------------
@@ -218,11 +344,17 @@ def main(cfg, args, **kwargs):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
     t0 = time_module.time()
+    
+    # Record start memory
+    rss_start = _get_memory_usage_mb()
+    if rss_start > 0:
+        log(f"[Memory] Process start RSS: {rss_start:.1f} MB ({rss_start/1024:.2f} GB)")
 
     # ------------------------------------------------------------------
     # 3. Preprocess (skip in detection_only mode)
@@ -230,16 +362,25 @@ def main(cfg, args, **kwargs):
     t_build_graphs = None
     t_embed_nodes = None
     t_embed_edges = None
+    preprocess_timings = {}
 
     if "preprocess" in stages:
-        build_orthrus_graphs.main(cfg)
-        t_build_graphs = time_module.time()
-
-        build_feature_word2vec.main(cfg)
-        t_embed_nodes = time_module.time()
-
-        embed_edges_feature_word2vec.main(cfg)
-        t_embed_edges = time_module.time()
+        # Parse preprocess substages from args
+        preprocess_substages = _parse_preprocess_substages(
+            getattr(args, 'preprocess_substages', None)
+        )
+        
+        log(f"Preprocess substages to run: {preprocess_substages}")
+        
+        preprocess_timings = _run_preprocess_substages(cfg, preprocess_substages)
+        
+        # Record timing boundaries
+        if "build_graphs" in preprocess_substages:
+            t_build_graphs = time_module.time()
+        if "embed_nodes" in preprocess_substages:
+            t_embed_nodes = time_module.time()
+        if "embed_edges" in preprocess_substages:
+            t_embed_edges = time_module.time()
 
     # ------------------------------------------------------------------
     # 4. Train
@@ -247,7 +388,8 @@ def main(cfg, args, **kwargs):
     t_gnn_training = None
     if "train" in stages:
         orthrus_gnn_training.main(cfg)
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         t_gnn_training = time_module.time()
 
     # ------------------------------------------------------------------
@@ -280,6 +422,7 @@ def main(cfg, args, **kwargs):
     # 8. Timing summary
     # ------------------------------------------------------------------
     t_final = time_module.time()
+    rss_final = _get_memory_usage_mb()
 
     def _delta(start_t, end_t):
         return round(end_t - start_t, 2) if (start_t is not None and end_t is not None) else 0.0
@@ -304,11 +447,19 @@ def main(cfg, args, **kwargs):
         "time_evaluation": _delta(eval_baseline, t_evaluation),
         "time_tracing": _delta(trace_baseline, t_tracing),
     }
+    
+    # Add memory info to timing
+    if rss_start > 0:
+        time_consumption["rss_start_mb"] = round(rss_start, 1)
+    if rss_final > 0:
+        time_consumption["rss_end_mb"] = round(rss_final, 1)
+    if preprocess_timings:
+        time_consumption.update(preprocess_timings)
 
     log("==" * 30)
     log("Run finished. Time consumed in each step:")
     for k, v in time_consumption.items():
-        log(f"{k}: {v} s")
+        log(f"{k}: {v} s" if not k.endswith("_mb") else f"{k}: {v} MB")
 
     log("==" * 30)
     if wandb.run is not None:

@@ -496,6 +496,11 @@ def get_runtime_required_args(return_unknown_args=False, args=None):
                          help="Comma-separated pipeline stages to run (e.g. 'preprocess,train,test,evaluate'). "
                               "Standard stages: preprocess, train, test, evaluate, trace. "
                               "'all' runs everything. If omitted, behavior depends on --run_from_training.")
+     parser.add_argument('--preprocess-substages', type=str, default=None,
+                         help="Comma-separated preprocess substages to run within --stages preprocess. "
+                              "Valid substages: build_graphs, embed_nodes, embed_edges. "
+                              "Default (None): runs all three in order. "
+                              "Examples: 'build_graphs' or 'embed_nodes,embed_edges'.")
      parser.add_argument('--skip-tracing', action='store_true',
                          help="Skip attack reconstruction (tracing) stage. Overrides pipeline.run_tracing to False.")
      parser.add_argument('--artifact-root', type=str, default=None,

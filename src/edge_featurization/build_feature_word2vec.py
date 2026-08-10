@@ -7,10 +7,31 @@ import numpy as np
 import random
 import torch
 
-def load_corpus_from_database(indexid2msg, use_node_types):
 
+# ---------------------------------------------------------------------------
+# Corpus building with restartable iterator
+# ---------------------------------------------------------------------------
+
+def _build_corpus_dict(indexid2msg, use_node_types):
+    """
+    Build the corpus dictionary from indexid2msg.
+    
+    The corpus dict has keys that are msg[1] (the semantic label) and values
+    that are tokenized sequences. If multiple nodes share the same msg[1],
+    the later one overwrites the earlier one (Python dict behavior).
+    
+    This behavior must be preserved in streaming mode.
+    
+    Args:
+        indexid2msg: dict mapping index_id -> [node_type, msg]
+        use_node_types: whether to prefix tokens with node type
+    
+    Returns:
+        dict: corpus mapping semantic label -> tokens
+    """
     corpus = {}
-    for indexid, msg in tqdm(indexid2msg.items(), desc='Tokenizing corpus from database:'):
+    
+    for indexid, msg in indexid2msg.items():
         if msg[0] == 'subject':
             if use_node_types:
                 tokens = tokenize_subject(msg[0] + ' ' + msg[1])
@@ -26,10 +47,78 @@ def load_corpus_from_database(indexid2msg, use_node_types):
                 tokens = tokenize_netflow(msg[0] + ' ' + msg[1])
             else:
                 tokens = tokenize_netflow(msg[1])
+        
+        # Key is msg[1] - later entries with same key overwrite earlier ones
         corpus[msg[1]] = tokens
-    return list(corpus.values())
+    
+    return corpus
+
+
+class RestartableCorpus:
+    """
+    A corpus wrapper that allows multiple iterations over the same data.
+    
+    Gensim Word2Vec needs to iterate over the corpus multiple times (once per epoch).
+    Simply returning a generator would fail on the second epoch because generators
+    can only be consumed once.
+    
+    This class maintains the underlying data and provides a restartable iterator.
+    """
+    
+    def __init__(self, indexid2msg, use_node_types):
+        """
+        Initialize the restartable corpus.
+        
+        Args:
+            indexid2msg: dict mapping index_id -> [node_type, msg]
+            use_node_types: whether to prefix tokens with node type
+        """
+        self._corpus_dict = _build_corpus_dict(indexid2msg, use_node_types)
+        # Convert to list of values to preserve order of first appearance
+        self._sentences = list(self._corpus_dict.values())
+    
+    def __iter__(self):
+        """Return an iterator over sentences. Can be called multiple times."""
+        return iter(self._sentences)
+    
+    def __len__(self):
+        """Return the number of sentences."""
+        return len(self._sentences)
+    
+    def to_list(self):
+        """Return as a list (for compatibility with existing code)."""
+        return list(self._sentences)
+
+
+def load_corpus_from_database(indexid2msg, use_node_types):
+    """
+    Build corpus from indexid2msg with restartable iterator support.
+    
+    Returns a RestartableCorpus that can be iterated multiple times for
+    multi-epoch Word2Vec training.
+    
+    Args:
+        indexid2msg: dict mapping index_id -> [node_type, msg]
+        use_node_types: whether to prefix tokens with node type
+    
+    Returns:
+        RestartableCorpus: restartable corpus for Word2Vec training
+    """
+    return RestartableCorpus(indexid2msg, use_node_types)
+
 
 def train_feature_word2vec(corpus, cfg, model_save_path, logger):
+    """
+    Train Word2Vec model with bounded memory.
+    
+    The corpus must support multiple iterations (restartable iterator).
+    
+    Args:
+        corpus: RestartableCorpus or list-like object
+        cfg: configuration object
+        model_save_path: path to save model
+        logger: logging handler
+    """
     emb_dim = cfg.edge_featurization.embed_nodes.emb_dim
     show_epoch_loss = cfg.edge_featurization.embed_nodes.feature_word2vec.show_epoch_loss
     window_size = cfg.edge_featurization.embed_nodes.feature_word2vec.window_size
@@ -42,6 +131,11 @@ def train_feature_word2vec(corpus, cfg, model_save_path, logger):
     use_seed = cfg.edge_featurization.embed_nodes.use_seed
     SEED = cfg._seed
 
+    # Ensure corpus can be iterated multiple times
+    if not hasattr(corpus, '__iter__'):
+        raise ValueError("Corpus must be iterable")
+    
+    # Train with epoch loss tracking
     if show_epoch_loss:
         if use_seed:
             model = Word2Vec(corpus,
@@ -97,8 +191,15 @@ def train_feature_word2vec(corpus, cfg, model_save_path, logger):
         log(f"Epoch: {epochs}; loss: {loss}")
 
     model.init_sims(replace=True)
-    model.save(os.path.join(model_save_path, 'feature_word2vec.model'))
-    log(f"Save word2vec to {os.path.join(model_save_path, 'feature_word2vec.model')}")
+    
+    # Atomic save: write to temp file, then rename
+    model_path = os.path.join(model_save_path, 'feature_word2vec.model')
+    temp_path = model_path + '.tmp'
+    model.save(temp_path)
+    os.replace(temp_path, model_path)
+    
+    log(f"Save word2vec to {model_path}")
+
 
 def main(cfg):
     model_save_path = cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir
@@ -121,9 +222,11 @@ def main(cfg):
         random.seed(SEED)
 
         torch.manual_seed(SEED)
-        torch.cuda.manual_seed_all(SEED)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        # Only call CUDA seed if CUDA is available
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(SEED)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
     log(f"Get indexid2msg from database...")
     cur, connect = init_database_connection(cfg)
@@ -133,11 +236,27 @@ def main(cfg):
 
     log("Loading and tokenizing corpus from database...")
     corpus = load_corpus_from_database(indexid2msg=indexid2msg, use_node_types=use_node_types)
+    
+    log(f"Corpus size: {len(corpus)} sentences")
 
     train_feature_word2vec(corpus=corpus,
                            cfg=cfg,
                            model_save_path=model_save_path,
                            logger=logger)
+    
+    # Write completion marker
+    marker_path = os.path.join(model_save_path, ".preprocess_embed_nodes_complete")
+    from datetime import datetime
+    with open(marker_path, 'w') as f:
+        f.write(datetime.now().isoformat())
+    log(f"Embed nodes complete. Marker written: {marker_path}")
+    
+    # Clean up
+    cur.close()
+    connect.close()
+    del indexid2msg
+    del corpus
+
 
 if __name__ == '__main__':
     args =get_runtime_required_args()

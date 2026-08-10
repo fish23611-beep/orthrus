@@ -367,59 +367,77 @@ def get_detected_attacks(cfg):
     cfg.dataset.attack_to_time_window
 
 def get_indexid2msg(cur, use_cmd=True, use_port=False):
+    """Legacy version - wraps streaming version with default batch size."""
+    return get_indexid2msg_streaming(cur, use_cmd=use_cmd, use_port=use_port)
+
+
+def get_indexid2msg_streaming(cur, use_cmd=True, use_port=False, batch_size=1024):
+    """
+    Memory-efficient version of get_indexid2msg using streaming cursor.
+    
+    Args:
+        cur: database cursor
+        use_cmd: whether to include command line in subject labels
+        use_port: whether to include port in netflow labels
+        batch_size: fetchmany batch size for node tables
+        
+    Returns:
+        dict: indexid2msg mapping index_id -> [node_type, msg]
+    """
+    def stream_table(sql, batch_size):
+        """Stream rows from a table using fetchmany()."""
+        cur.execute(sql)
+        while True:
+            rows = cur.fetchmany(batch_size)
+            if not rows:
+                break
+            for row in rows:
+                yield row
+    
     indexid2msg = {}
 
     # netflow
-    sql = """
-        select * from netflow_node_table;
-        """
-    cur.execute(sql)
-    records = cur.fetchall()
-
-    log(f"Number of netflow nodes: {len(records)}")
-
-    for i in records:
+    sql = "SELECT * FROM netflow_node_table;"
+    count = 0
+    for i in stream_table(sql, batch_size):
         remote_ip = str(i[4])
         remote_port = str(i[5])
-        index_id = i[-1] # int
+        index_id = i[-1]  # int
         if use_port:
-            indexid2msg[index_id] = ['netflow', remote_ip + ':' +remote_port]
+            indexid2msg[index_id] = ['netflow', remote_ip + ':' + remote_port]
         else:
             indexid2msg[index_id] = ['netflow', remote_ip]
+        count += 1
+
+    log(f"Number of netflow nodes: {count}")
 
     # subject
-    sql = """
-    select * from subject_node_table;
-    """
-    cur.execute(sql)
-    records = cur.fetchall()
-
-    log(f"Number of process nodes: {len(records)}")
-
-    for i in records:
+    sql = "SELECT * FROM subject_node_table;"
+    count = 0
+    for i in stream_table(sql, batch_size):
         path = str(i[2])
         cmd = str(i[3])
         index_id = i[-1]
         if use_cmd:
-            indexid2msg[index_id] = ['subject', path + ' ' +cmd]
+            indexid2msg[index_id] = ['subject', path + ' ' + cmd]
         else:
             indexid2msg[index_id] = ['subject', path]
+        count += 1
+
+    log(f"Number of process nodes: {count}")
 
     # file
-    sql = """
-    select * from file_node_table;
-    """
-    cur.execute(sql)
-    records = cur.fetchall()
-
-    log(f"Number of file nodes: {len(records)}")
-
-    for i in records:
+    sql = "SELECT * FROM file_node_table;"
+    count = 0
+    for i in stream_table(sql, batch_size):
         path = str(i[2])
         index_id = i[-1]
         indexid2msg[index_id] = ['file', path]
+        count += 1
 
-    return indexid2msg #{index_id: [node_type, msg]}
+    log(f"Number of file nodes: {count}")
+
+    return indexid2msg
 
 def tokenize_subject(sentence: str):
     new_sentence = re.sub(r'\\+', '/', sentence)
