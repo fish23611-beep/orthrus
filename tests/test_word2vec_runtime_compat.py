@@ -738,6 +738,110 @@ class TestWord2VecEpochCallback:
         assert loaded.vector_size == 8
 
 
+class TestEpochLossLoggerRealLogger:
+    """Regression tests for EpochLossLogger with real logging.Logger.
+
+    This test class verifies that EpochLossLogger correctly handles
+    standard Python logging.Logger instances (which are NOT callable,
+    but have callable .info() methods).
+
+    Previously, only MagicMock was used in tests, which is callable by
+    default and thus did not expose the bug that occurs in production
+    when get_logger() returns a real logging.Logger.
+    """
+
+    def test_real_logging_logger_compatibility(self, tmp_path):
+        """EpochLossLogger must work with real logging.Logger (not just MagicMock)."""
+        import logging
+        from edge_featurization.build_feature_word2vec import EpochLossLogger
+
+        # Create a real Python logging.Logger
+        log_file = tmp_path / "test_logger.log"
+        logger = logging.getLogger("test_word2vec_epoch_logger")
+        logger.setLevel(logging.INFO)
+        # Add a FileHandler to capture log output
+        handler = logging.FileHandler(str(log_file))
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+
+        # Create callback with real logger
+        callback = EpochLossLogger(logger, total_epochs=1)
+
+        # Create minimal mock model
+        model = MagicMock()
+        model.get_latest_training_loss.return_value = 12.5
+
+        # This should NOT raise TypeError: 'Logger' object is not callable
+        callback.on_epoch_end(model)
+
+        # Verify callback state
+        assert callback.epoch == 1, f"Expected epoch=1, got {callback.epoch}"
+
+        # Verify log file contains expected message
+        log_content = log_file.read_text()
+        assert "Epoch: 1/1" in log_content, f"Missing 'Epoch: 1/1' in: {log_content}"
+        assert "loss:" in log_content, f"Missing 'loss:' in: {log_content}"
+
+    def test_callable_magicmock_still_works(self):
+        """Backward compatibility: callable MagicMock should still work."""
+        from edge_featurization.build_feature_word2vec import EpochLossLogger
+
+        logger = MagicMock()
+
+        callback = EpochLossLogger(logger, total_epochs=2)
+
+        model = MagicMock()
+        model.get_latest_training_loss.return_value = 5.0
+
+        callback.on_epoch_end(model)
+
+        assert callback.epoch == 1
+        logger.assert_called_once()
+        call_args = logger.call_args[0][0]
+        assert "Epoch: 1/2" in call_args
+        assert "loss:" in call_args
+
+    def test_invalid_logger_raises_clear_error(self):
+        """Invalid logger (non-callable, no .info) should raise TypeError."""
+        from edge_featurization.build_feature_word2vec import EpochLossLogger
+
+        class InvalidLogger:
+            pass
+
+        invalid_logger = InvalidLogger()
+        callback = EpochLossLogger(invalid_logger, total_epochs=1)
+
+        model = MagicMock()
+        model.get_latest_training_loss.return_value = 1.0
+
+        with pytest.raises(TypeError, match="callable logger.*or.*callable .info"):
+            callback.on_epoch_end(model)
+
+    def test_logger_with_custom_info_method(self):
+        """Logger with custom callable .info() should work."""
+        from edge_featurization.build_feature_word2vec import EpochLossLogger
+
+        class CustomLogger:
+            def __init__(self):
+                self.info_calls = []
+
+            def info(self, msg):
+                self.info_calls.append(msg)
+
+        custom_logger = CustomLogger()
+        callback = EpochLossLogger(custom_logger, total_epochs=3)
+
+        model = MagicMock()
+        model.get_latest_training_loss.return_value = 10.0
+
+        callback.on_epoch_end(model)
+
+        assert callback.epoch == 1
+        assert len(custom_logger.info_calls) == 1
+        assert "Epoch: 1/3" in custom_logger.info_calls[0]
+        assert "loss:" in custom_logger.info_calls[0]
+
+
 class TestInitSimsRemoved:
     """Audit tests confirming init_sims has been removed."""
 

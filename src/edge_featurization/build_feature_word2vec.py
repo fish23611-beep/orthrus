@@ -117,6 +117,11 @@ class EpochLossLogger(CallbackAny2Vec):
     Gensim Word2Vec accumulates training loss across all epochs.
     This callback tracks the previous cumulative loss and reports
     the delta (actual loss for that epoch).
+
+    Supports three logger interface patterns:
+    A. callable logger (e.g., MagicMock in tests)
+    B. standard logging.Logger with .info() method
+    C. any object with a callable .info() method
     """
 
     def __init__(self, logger, total_epochs):
@@ -125,12 +130,28 @@ class EpochLossLogger(CallbackAny2Vec):
         self.epoch = 0
         self.previous_loss = 0.0
 
+    def _emit(self, message):
+        """Emit a log message through the configured logger interface."""
+        if callable(self.logger):
+            self.logger(message)
+            return
+
+        info = getattr(self.logger, "info", None)
+        if callable(info):
+            info(message)
+            return
+
+        raise TypeError(
+            "EpochLossLogger requires a callable logger "
+            "or an object exposing callable .info()"
+        )
+
     def on_epoch_end(self, model):
         cumulative = model.get_latest_training_loss()
         epoch_loss = cumulative - self.previous_loss
         self.previous_loss = cumulative
         self.epoch += 1
-        self.logger(f"Epoch: {self.epoch}/{self.total_epochs}; loss: {epoch_loss}")
+        self._emit(f"Epoch: {self.epoch}/{self.total_epochs}; loss: {epoch_loss}")
 
 
 def train_feature_word2vec(corpus, cfg, model_save_path, logger):
