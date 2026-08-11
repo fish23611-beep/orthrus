@@ -6,6 +6,7 @@ from provnet_utils import *
 from config import *
 from tqdm import tqdm
 from gensim.models import Word2Vec
+from gensim.models.callbacks import CallbackAny2Vec
 import numpy as np
 import random
 import torch
@@ -110,6 +111,28 @@ def load_corpus_from_database(indexid2msg, use_node_types):
     return RestartableCorpus(indexid2msg, use_node_types)
 
 
+class EpochLossLogger(CallbackAny2Vec):
+    """Gensim callback that logs per-epoch training loss delta.
+
+    Gensim Word2Vec accumulates training loss across all epochs.
+    This callback tracks the previous cumulative loss and reports
+    the delta (actual loss for that epoch).
+    """
+
+    def __init__(self, logger, total_epochs):
+        self.logger = logger
+        self.total_epochs = total_epochs
+        self.epoch = 0
+        self.previous_loss = 0.0
+
+    def on_epoch_end(self, model):
+        cumulative = model.get_latest_training_loss()
+        epoch_loss = cumulative - self.previous_loss
+        self.previous_loss = cumulative
+        self.epoch += 1
+        self.logger(f"Epoch: {self.epoch}/{self.total_epochs}; loss: {epoch_loss}")
+
+
 def train_feature_word2vec(corpus, cfg, model_save_path, logger):
     """
     Train Word2Vec model with bounded memory.
@@ -138,21 +161,12 @@ def train_feature_word2vec(corpus, cfg, model_save_path, logger):
     if not hasattr(corpus, '__iter__'):
         raise ValueError("Corpus must be iterable")
 
-    # Train with epoch loss tracking using a callback approach.
+    # Train with epoch loss tracking using EpochLossLogger callback.
     # This preserves a single training lifecycle so Gensim handles alpha decay
     # correctly across all epochs, avoiding the "alpha higher than previous
     # cycles" warning that occurs when train() is called multiple times.
-    if show_epoch_loss:
-        epoch_losses = []
-
-        def epoch_callback(w2v_model, epoch, total_epochs):
-            """Called at the end of each epoch to record loss."""
-            loss = w2v_model.get_latest_training_loss()
-            epoch_losses.append(loss)
-            log(f"Epoch: {epoch}/{total_epochs}; loss: {loss}")
-
-        callbacks = [epoch_callback] if compute_loss else []
-        extra_kwargs = {'callbacks': callbacks} if callbacks else {}
+    if show_epoch_loss and compute_loss:
+        callback = EpochLossLogger(logger, epochs)
 
         if use_seed:
             model = Word2Vec(corpus,
@@ -162,10 +176,10 @@ def train_feature_word2vec(corpus, cfg, model_save_path, logger):
                              sg=use_skip_gram,
                              workers=num_workers,
                              epochs=epochs,
-                             compute_loss=compute_loss,
+                             compute_loss=True,
+                             callbacks=[callback],
                              negative=negative,
-                             seed=SEED,
-                             **extra_kwargs)
+                             seed=SEED)
         else:
             model = Word2Vec(corpus,
                              vector_size=emb_dim,
@@ -174,9 +188,9 @@ def train_feature_word2vec(corpus, cfg, model_save_path, logger):
                              sg=use_skip_gram,
                              workers=num_workers,
                              epochs=epochs,
-                             compute_loss=compute_loss,
-                             negative=negative,
-                             **extra_kwargs)
+                             compute_loss=True,
+                             callbacks=[callback],
+                             negative=negative)
     else:
         if use_seed:
             model = Word2Vec(corpus,
@@ -202,38 +216,31 @@ def train_feature_word2vec(corpus, cfg, model_save_path, logger):
         loss = model.get_latest_training_loss()
         log(f"Epoch: {epochs}; loss: {loss}")
 
-    model.init_sims(replace=True)
-
-    # Atomic save: save to temp directory with final basename, then move contents.
-    # This ensures all sidecar files (syn1neg.npy, wv.vectors.npy, etc.) are
-    # created with the correct final names before being published.
+    # Atomic save: write to .tmp, flush+fsync, then atomically replace.
     model_path = os.path.join(model_save_path, 'feature_word2vec.model')
+    tmp_path = os.path.join(model_save_path, 'feature_word2vec.model.tmp')
+    tmp_existed = os.path.exists(model_path)
 
-    # Create a temp directory in the same parent as model_save_path for atomicity.
-    # Saving to a temp file with .tmp extension (e.g., model.tmp) causes Gensim
-    # to create sidecars named model.tmp.wv.vectors.npy, which then need renaming
-    # separately - fragile and not atomic. Instead, we save to a temp dir with
-    # the final basename, then move everything atomically.
-    temp_model_dir = tempfile.mkdtemp(dir=model_save_path)
-    temp_model_path = os.path.join(temp_model_dir, 'feature_word2vec.model')
     try:
-        model.save(temp_model_path)
-        # Move all contents to the final directory.
-        # All sidecar files now have the correct final basename before being
-        # published to model_save_path.
-        for item in os.listdir(temp_model_dir):
-            src = os.path.join(temp_model_dir, item)
-            dst = os.path.join(model_save_path, item)
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True)
-            else:
-                shutil.copy2(src, dst)
-        # Now atomically replace the main model file last.
-        # The sidecars are already in place with correct names.
-        os.replace(temp_model_path, model_path)
-    finally:
-        # Clean up temp directory even on failure.
-        shutil.rmtree(temp_model_dir, ignore_errors=True)
+        # Use file handle for atomic single-file save.
+        # Gensim's save(handle) serializes everything into one file,
+        # avoiding separate .npy sidecar files that would need manual handling.
+        with open(tmp_path, "wb") as handle:
+            model.save(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        # Only replace after the new model is fully written and synced.
+        # If model_path already exists, it remains unchanged until os.replace succeeds.
+        os.replace(tmp_path, model_path)
+    except Exception:
+        # Clean up tmp on any failure.
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
 
     log(f"Save word2vec to {model_path}")
 

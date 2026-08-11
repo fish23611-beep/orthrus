@@ -41,24 +41,35 @@ import glob
 
 # Lazy NLTK download: only download when actually needed, not at import time.
 # This avoids blocking pytest sessions and improves import performance.
-# NLTK 3.9.1 requires punkt_tab for word_tokenize() even when punkt exists.
+# For NLTK 3.9+ punkt_tab may also be needed, but punkt alone works for 3.8.x.
 def _ensure_nltk_punkt():
-    """Ensure NLTK punkt and punkt_tab tokenizer data is available.
+    """Ensure NLTK punkt tokenizer data is available.
 
-    NLTK 3.9.1 changed to require punkt_tab for word_tokenize() regardless
-    of punkt availability. This helper checks both and downloads missing
-    resources lazily on first tokenization.
+    punkt is the base sentence tokenizer used by word_tokenize().
+    NLTK 3.9+ may additionally require punkt_tab, but punkt alone is
+    sufficient for NLTK 3.8.x.
 
     Raises:
-        LookupError: if the required resources cannot be found after download.
+        LookupError: if the required resource cannot be found after download.
+        RuntimeError: if download fails or returns False.
     """
-    for resource in ("punkt", "punkt_tab"):
+    import nltk.data
+    try:
+        nltk.data.find("tokenizers/punkt")
+    except (ImportError, LookupError):
+        import nltk
+        result = nltk.download("punkt", quiet=True)
+        if result is False:
+            raise RuntimeError(
+                "NLTK download('punkt') returned False; network may be unavailable"
+            )
+        # Verify the resource is actually available after download
         try:
-            import nltk.data
-            nltk.data.find(f"tokenizers/{'punkt_tab' if resource == 'punkt_tab' else resource}")
+            nltk.data.find("tokenizers/punkt")
         except (ImportError, LookupError):
-            import nltk
-            nltk.download(resource, quiet=True)
+            raise RuntimeError(
+                "NLTK download('punkt') claimed success but tokenizers/punkt not found"
+            )
 
 
 from nltk.tokenize import word_tokenize

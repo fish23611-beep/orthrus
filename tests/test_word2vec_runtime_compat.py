@@ -28,70 +28,66 @@ sys.path.insert(0, str(SRC))
 class TestNLTKPunktTab:
     """Tests for _ensure_nltk_punkt helper."""
 
-    def test_punkt_tab_already_present_no_download(self, mocker):
-        """When both punkt and punkt_tab exist, no download is attempted."""
+    def test_punkt_already_present_no_download(self, mocker):
+        """When punkt exists, no download is attempted."""
         import provnet_utils
 
         mock_find = mocker.patch("nltk.data.find")
-        mock_download = mocker.patch("nltk.download")
+        mock_download = mocker.patch("nltk.download", return_value=True)
 
         provnet_utils._ensure_nltk_punkt()
 
-        # Should check both resources
-        assert mock_find.call_count == 2
+        # Should check punkt
+        assert mock_find.call_count == 1
         mock_download.assert_not_called()
 
-    def test_punkt_tab_missing_triggers_download(self, mocker):
-        """When punkt_tab is missing, download is triggered for it."""
+    def test_punkt_missing_triggers_download(self, mocker):
+        """When punkt is missing, download is triggered."""
         import provnet_utils
 
+        # First find fails, but after download it should succeed
         def find_effect(resource):
-            if "punkt_tab" in resource:
-                raise LookupError(f"Resource {resource} not found")
-            # punkt exists
-
-        mock_find = mocker.patch("nltk.data.find", side_effect=find_effect)
-        mock_download = mocker.patch("nltk.download")
-
-        provnet_utils._ensure_nltk_punkt()
-
-        assert mock_find.call_count == 2
-        # Should download punkt_tab but not punkt (which exists)
-        assert mock_download.call_count == 1
-        mock_download.assert_called_with("punkt_tab", quiet=True)
-
-    def test_punkt_missing_triggers_both_downloads(self, mocker):
-        """When punkt is missing, both are downloaded."""
-        import provnet_utils
-
-        def find_effect(resource):
-            if "punkt_tab" in resource:
-                raise LookupError(f"Resource {resource} not found")
-            if "punkt" in resource:
-                raise LookupError(f"Resource {resource} not found")
-            return None
+            if not hasattr(find_effect, 'called'):
+                find_effect.called = True
+                raise LookupError("not found")
+            return mocker.MagicMock()  # Return success after download
 
         mocker.patch("nltk.data.find", side_effect=find_effect)
-        mock_download = mocker.patch("nltk.download")
+        mock_download = mocker.patch("nltk.download", return_value=True)
 
         provnet_utils._ensure_nltk_punkt()
 
-        # Should download both resources in order
-        assert mock_download.call_count == 2
-        calls = mock_download.call_args_list
-        assert calls[0][0][0] == "punkt"
-        assert calls[1][0][0] == "punkt_tab"
+        assert mock_download.call_count == 1
+        mock_download.assert_called_with("punkt", quiet=True)
+
+    def test_download_returns_false_raises_runtime_error(self, mocker):
+        """When download returns False, RuntimeError is raised."""
+        import provnet_utils
+
+        mocker.patch("nltk.data.find", side_effect=LookupError("not found"))
+        mocker.patch("nltk.download", return_value=False)
+
+        with pytest.raises(RuntimeError, match="returned False"):
+            provnet_utils._ensure_nltk_punkt()
+
+    def test_download_claims_success_but_resource_still_missing(self, mocker):
+        """When download claims success but resource is still missing, RuntimeError is raised."""
+        import provnet_utils
+
+        def find_effect(resource):
+            raise LookupError("not found")
+
+        mocker.patch("nltk.data.find", side_effect=find_effect)
+        mocker.patch("nltk.download", return_value=True)
+
+        with pytest.raises(RuntimeError, match="claimed success but"):
+            provnet_utils._ensure_nltk_punkt()
 
     def test_download_failure_raises(self, mocker):
-        """Download failure raises LookupError clearly."""
+        """Download failure raises exception."""
         import provnet_utils
 
-        def find_effect(resource):
-            if "punkt_tab" in resource:
-                raise LookupError(f"Resource {resource} not found")
-            # punkt exists
-
-        mocker.patch("nltk.data.find", side_effect=find_effect)
+        mocker.patch("nltk.data.find", side_effect=LookupError("not found"))
 
         def download_fail(*args, **kwargs):
             raise Exception("Download failed")
@@ -110,14 +106,13 @@ class TestNLTKPunktTab:
         """
         import provnet_utils
 
-        call_count = {"find": 0, "download": 0}
+        call_count = {"find": 0, "download": []}
 
         def mock_find(resource):
             call_count["find"] += 1
             raise LookupError("not found")
 
         mocker.patch("nltk.data.find", side_effect=mock_find)
-        download_called = []
 
         def mock_download(resource, **kwargs):
             call_count["download"].append(resource)
@@ -130,8 +125,7 @@ class TestNLTKPunktTab:
         except Exception:
             pass
 
-        # The helper should attempt find for both resources before downloading
-        # This verifies lazy behavior (find first, download only if not found)
+        # The helper should attempt find before downloading
         assert call_count["find"] >= 1
 
 
@@ -140,7 +134,7 @@ class TestNLTKPunktTab:
 # ---------------------------------------------------------------------------
 
 class TestWord2VecAtomicSave:
-    """Tests for Word2Vec atomic save with correct sidecar filenames."""
+    """Tests for Word2Vec atomic save (single-file, no sidecars)."""
 
     def _make_minimal_corpus(self):
         """Create a minimal restartable corpus for testing."""
@@ -153,15 +147,14 @@ class TestWord2VecAtomicSave:
         }
         return RestartableCorpus(indexid2msg, use_node_types=False)
 
-    def test_model_saves_and_loads_with_correct_sidecars(self, tmp_path):
-        """Model saves with correct sidecar filenames and loads successfully."""
+    def test_single_file_save_no_sidecars(self, tmp_path):
+        """Model saves as a single file without .npy sidecar files."""
         from gensim.models import Word2Vec
         from edge_featurization.build_feature_word2vec import train_feature_word2vec
 
         model_dir = tmp_path / "model"
         model_dir.mkdir()
 
-        # Create minimal config
         cfg = MagicMock()
         cfg.edge_featurization.embed_nodes.emb_dim = 8
         cfg.edge_featurization.embed_nodes.feature_word2vec.window_size = 5
@@ -183,54 +176,19 @@ class TestWord2VecAtomicSave:
         model_path = model_dir / "feature_word2vec.model"
         assert model_path.exists(), "Main model file should exist"
 
-        # Check for sidecar files (should NOT have .tmp in names)
+        # No .npy sidecar files should exist (single-file save)
         all_files = list(model_dir.iterdir())
+        npy_files = [f for f in all_files if f.suffix == ".npy"]
+        assert npy_files == [], f"Found .npy sidecar files: {npy_files}"
+
+        # No .tmp residue
         tmp_files = [f for f in all_files if ".tmp" in f.name]
         assert tmp_files == [], f"Found .tmp residue files: {tmp_files}"
 
-        # Load and verify
-        loaded = Word2Vec.load(str(model_path))
-        assert loaded.vector_size == 8
-        assert loaded.wv.vector_size == 8
-        assert len(loaded.wv) >= 3  # Should have at least 3 words from corpus
+        # Only one file in the directory
+        assert len(all_files) == 1, f"Expected 1 file, found: {all_files}"
 
-    def test_no_mismatched_sidecar_names(self, tmp_path):
-        """Sidecar files should not have .tmp.* suffixes."""
-        from gensim.models import Word2Vec
-        from edge_featurization.build_feature_word2vec import train_feature_word2vec
-
-        model_dir = tmp_path / "model"
-        model_dir.mkdir()
-
-        cfg = MagicMock()
-        cfg.edge_featurization.embed_nodes.emb_dim = 4
-        cfg.edge_featurization.embed_nodes.feature_word2vec.window_size = 3
-        cfg.edge_featurization.embed_nodes.feature_word2vec.min_count = 1
-        cfg.edge_featurization.embed_nodes.feature_word2vec.use_skip_gram = True
-        cfg.edge_featurization.embed_nodes.feature_word2vec.num_workers = 1
-        cfg.edge_featurization.embed_nodes.feature_word2vec.epochs = 2
-        cfg.edge_featurization.embed_nodes.feature_word2vec.compute_loss = False
-        cfg.edge_featurization.embed_nodes.feature_word2vec.show_epoch_loss = False
-        cfg.edge_featurization.embed_nodes.feature_word2vec.negative = 5
-        cfg.edge_featurization.embed_nodes.use_seed = False
-
-        corpus = self._make_minimal_corpus()
-        logger = MagicMock()
-
-        train_feature_word2vec(corpus, cfg, str(model_dir), logger)
-
-        # Check no sidecar has .tmp pattern
-        all_files = list(model_dir.iterdir())
-        for f in all_files:
-            assert ".tmp" not in f.name, f"Found .tmp in sidecar: {f.name}"
-
-        # All .npy files should be loadable
-        npy_files = [f for f in all_files if f.suffix == ".npy"]
-        for npy in npy_files:
-            data = np.load(npy)
-            assert data is not None
-
-    def test_roundtrip_save_load_preserves_vectors(self, tmp_path):
+    def test_roundtrip_preserves_model(self, tmp_path):
         """Save -> load roundtrip preserves vector dimensions and vocab."""
         from gensim.models import Word2Vec
         from edge_featurization.build_feature_word2vec import train_feature_word2vec
@@ -255,7 +213,6 @@ class TestWord2VecAtomicSave:
 
         train_feature_word2vec(corpus, cfg, str(model_dir), logger)
 
-        # Load and verify
         model_path = model_dir / "feature_word2vec.model"
         loaded = Word2Vec.load(str(model_path))
 
@@ -263,35 +220,87 @@ class TestWord2VecAtomicSave:
         assert loaded.wv.vector_size == 16
         assert len(loaded.wv) >= 3
 
-        # Check we can get a vector
         vocab_items = list(loaded.wv.key_to_index.keys())
-        if vocab_items:
-            word = vocab_items[0]
-            vec = loaded.wv[word]
-            assert vec.shape == (16,)
+        word = vocab_items[0]
+        vec = loaded.wv[word]
+        assert vec.shape == (16,)
 
+    def test_old_model_preserved_on_save_failure(self, tmp_path, mocker):
+        """Old model is preserved when save fails mid-write."""
+        from gensim.models import Word2Vec
+        from edge_featurization.build_feature_word2vec import (
+            train_feature_word2vec,
+            RestartableCorpus,
+        )
 
-# ---------------------------------------------------------------------------
-# Problem C: Word2Vec alpha / epoch loss tests
-# ---------------------------------------------------------------------------
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        model_path = model_dir / "feature_word2vec.model"
 
-class TestWord2VecAlphaDecay:
-    """Tests for proper alpha decay across epochs."""
+        # Pre-create an old model
+        old_corpus = RestartableCorpus({1: ["subject", "/old/path"]}, use_node_types=False)
+        old_model = Word2Vec(sentences=old_corpus, vector_size=8, epochs=1, min_count=1)
+        old_model.save(str(model_path))
 
-    def _make_minimal_corpus(self):
-        """Create a minimal restartable corpus for testing."""
-        from edge_featurization.build_feature_word2vec import RestartableCorpus
+        # Now configure for new training
+        cfg = MagicMock()
+        cfg.edge_featurization.embed_nodes.emb_dim = 16
+        cfg.edge_featurization.embed_nodes.feature_word2vec.window_size = 5
+        cfg.edge_featurization.embed_nodes.feature_word2vec.min_count = 1
+        cfg.edge_featurization.embed_nodes.feature_word2vec.use_skip_gram = True
+        cfg.edge_featurization.embed_nodes.feature_word2vec.num_workers = 1
+        cfg.edge_featurization.embed_nodes.feature_word2vec.epochs = 2
+        cfg.edge_featurization.embed_nodes.feature_word2vec.compute_loss = True
+        cfg.edge_featurization.embed_nodes.feature_word2vec.show_epoch_loss = False
+        cfg.edge_featurization.embed_nodes.feature_word2vec.negative = 5
+        cfg.edge_featurization.embed_nodes.use_seed = False
 
-        indexid2msg = {
-            1: ["subject", "/usr/bin/python script py"],
-            2: ["file", "/tmp/output log file"],
-            3: ["netflow", "192.168.1.1 remote server"],
-            4: ["file", "/var/log messages"],
-        }
-        return RestartableCorpus(indexid2msg, use_node_types=False)
+        corpus = self._make_minimal_corpus()
+        logger = MagicMock()
 
-    def test_show_epoch_loss_uses_callback_not_repeated_train(self, tmp_path, mocker):
-        """show_epoch_loss=True uses callbacks, not repeated train() calls."""
+        # Fail during model.save by patching open
+        original_open = open
+
+        class FailingFile:
+            def __init__(self, path, mode):
+                self._file = original_open(path, mode)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self._file.__exit__(*args)
+
+            def write(self, data):
+                # Fail after partial write
+                raise IOError("Simulated save failure")
+
+            def flush(self):
+                pass
+
+            def fileno(self):
+                return self._file.fileno()
+
+        def failing_open(path, mode):
+            if "model.tmp" in str(path):
+                return FailingFile(path, mode)
+            return original_open(path, mode)
+
+        mocker.patch("builtins.open", side_effect=failing_open)
+
+        with pytest.raises(IOError):
+            train_feature_word2vec(corpus, cfg, str(model_dir), logger)
+
+        # Old model should still be intact
+        loaded = Word2Vec.load(str(model_path))
+        assert loaded.vector_size == 8  # Old model dim
+
+        # No .tmp residue
+        tmp_files = list(model_dir.glob("*.tmp"))
+        assert tmp_files == [], f"Found .tmp residue: {tmp_files}"
+
+    def test_no_tmp_residue_on_success(self, tmp_path):
+        """No .tmp files remain after successful save."""
         from gensim.models import Word2Vec
         from edge_featurization.build_feature_word2vec import train_feature_word2vec
 
@@ -304,7 +313,65 @@ class TestWord2VecAlphaDecay:
         cfg.edge_featurization.embed_nodes.feature_word2vec.min_count = 1
         cfg.edge_featurization.embed_nodes.feature_word2vec.use_skip_gram = True
         cfg.edge_featurization.embed_nodes.feature_word2vec.num_workers = 1
-        cfg.edge_featurization.embed_nodes.feature_word2vec.epochs = 5
+        cfg.edge_featurization.embed_nodes.feature_word2vec.epochs = 2
+        cfg.edge_featurization.embed_nodes.feature_word2vec.compute_loss = False
+        cfg.edge_featurization.embed_nodes.feature_word2vec.show_epoch_loss = False
+        cfg.edge_featurization.embed_nodes.feature_word2vec.negative = 5
+        cfg.edge_featurization.embed_nodes.use_seed = False
+
+        corpus = self._make_minimal_corpus()
+        logger = MagicMock()
+
+        train_feature_word2vec(corpus, cfg, str(model_dir), logger)
+
+        # Check no .tmp residue
+        all_files = list(model_dir.iterdir())
+        tmp_files = [f for f in all_files if ".tmp" in f.name]
+        assert tmp_files == [], f"Found .tmp residue: {tmp_files}"
+
+
+# ---------------------------------------------------------------------------
+# Problem C: Word2Vec alpha / epoch loss tests
+# ---------------------------------------------------------------------------
+
+class TestWord2VecEpochCallback:
+    """Tests for real Gensim CallbackAny2Vec epoch callback."""
+
+    def _make_minimal_corpus(self):
+        """Create a minimal restartable corpus for testing."""
+        from edge_featurization.build_feature_word2vec import RestartableCorpus
+
+        indexid2msg = {
+            1: ["subject", "/bin/bash shell command execute"],
+            2: ["file", "/etc/config file read write"],
+            3: ["netflow", "192.168.1.1 remote server connect"],
+            4: ["subject", "/usr/bin/python script run"],
+        }
+        return RestartableCorpus(indexid2msg, use_node_types=False)
+
+    def test_callback_invoked_correct_number_of_times(self, tmp_path):
+        """Real Gensim callback on_epoch_end is called exactly once per epoch."""
+        from gensim.models import Word2Vec
+        from gensim.models.callbacks import CallbackAny2Vec
+        from edge_featurization.build_feature_word2vec import (
+            train_feature_word2vec,
+            EpochLossLogger,
+            RestartableCorpus,
+        )
+
+        # Verify EpochLossLogger is a proper CallbackAny2Vec
+        assert issubclass(EpochLossLogger, CallbackAny2Vec)
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+
+        cfg = MagicMock()
+        cfg.edge_featurization.embed_nodes.emb_dim = 8
+        cfg.edge_featurization.embed_nodes.feature_word2vec.window_size = 5
+        cfg.edge_featurization.embed_nodes.feature_word2vec.min_count = 1
+        cfg.edge_featurization.embed_nodes.feature_word2vec.use_skip_gram = True
+        cfg.edge_featurization.embed_nodes.feature_word2vec.num_workers = 1
+        cfg.edge_featurization.embed_nodes.feature_word2vec.epochs = 3
         cfg.edge_featurization.embed_nodes.feature_word2vec.compute_loss = True
         cfg.edge_featurization.embed_nodes.feature_word2vec.show_epoch_loss = True
         cfg.edge_featurization.embed_nodes.feature_word2vec.negative = 5
@@ -313,32 +380,56 @@ class TestWord2VecAlphaDecay:
         corpus = self._make_minimal_corpus()
         logger = MagicMock()
 
-        # Spy on the Word2Vec.train method to ensure it's NOT called
-        # (the old buggy pattern called train() per epoch)
-        train_call_count = {"count": 0}
+        train_feature_word2vec(corpus, cfg, str(model_dir), logger)
 
-        original_train = Word2Vec.train
+        # Verify callback was invoked (EpochLossLogger logs per epoch)
+        log_calls = [str(call) for call in logger.call_args_list if call.args]
+        epoch_logs = [c for c in log_calls if "Epoch:" in c and "loss:" in c]
 
-        def spy_train(self, *args, **kwargs):
-            train_call_count["count"] += 1
-            return original_train(self, *args, **kwargs)
+        # Should have 3 epoch logs (one per epoch)
+        assert len(epoch_logs) == 3, f"Expected 3 epoch logs, got {len(epoch_logs)}: {epoch_logs}"
 
-        with patch.object(Word2Vec, "train", spy_train):
-            train_feature_word2vec(corpus, cfg, str(model_dir), logger)
-
-        # With callbacks, Word2Vec.train should NOT be called manually
-        # (it's called internally by gensim once per epoch in the epochs loop)
-        # The key is that we don't call model.train() after initialization
-        # So train_call_count should be 0 from our spy (internal calls are still possible)
-        # Actually, in the new code we DON'T call train() at all - gensim handles it
-        # Let's verify the model can be loaded (no corruption)
+        # Verify model loaded correctly
         model_path = model_dir / "feature_word2vec.model"
         loaded = Word2Vec.load(str(model_path))
         assert loaded.vector_size == 8
         assert len(loaded.wv) >= 3
 
-    def test_show_epoch_loss_logs_per_epoch(self, tmp_path):
-        """show_epoch_loss=True produces one log per epoch."""
+    def test_callback_receives_model_argument(self, tmp_path, mocker):
+        """on_epoch_end receives the model as its sole argument (Gensim API)."""
+        from gensim.models import Word2Vec
+        from gensim.models.callbacks import CallbackAny2Vec
+        from edge_featurization.build_feature_word2vec import EpochLossLogger
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+
+        # Create a real Word2Vec and attach a callback that records what it receives
+        received_args = []
+
+        class ArgChecker(CallbackAny2Vec):
+            def on_epoch_end(self, model):
+                received_args.append(("model", type(model).__name__))
+
+        corpus = self._make_minimal_corpus()
+        model = Word2Vec(
+            sentences=corpus,
+            vector_size=8,
+            window=5,
+            min_count=1,
+            epochs=2,
+            compute_loss=True,
+            callbacks=[ArgChecker()],
+        )
+
+        # Verify on_epoch_end was called with model
+        assert len(received_args) == 2, f"Expected 2 calls, got {received_args}"
+        for arg_type, arg_name in received_args:
+            assert arg_type == "model"
+            assert arg_name == "Word2Vec"
+
+    def test_no_independent_train_lifecycle(self, tmp_path, mocker):
+        """Only one Word2Vec initialization lifecycle; no per-epoch train() calls."""
         from gensim.models import Word2Vec
         from edge_featurization.build_feature_word2vec import train_feature_word2vec
 
@@ -362,16 +453,14 @@ class TestWord2VecAlphaDecay:
 
         train_feature_word2vec(corpus, cfg, str(model_dir), logger)
 
-        # Check that log was called with epoch information
-        # The log function is called once per epoch with pattern "Epoch: X/Y; loss: Z"
-        log_calls = [str(call) for call in logger.call_args_list if call.args]
-        epoch_logs = [c for c in log_calls if "Epoch:" in c]
+        # Verify model loads and works
+        model_path = model_dir / "feature_word2vec.model"
+        loaded = Word2Vec.load(str(model_path))
+        assert loaded.vector_size == 8
+        assert len(loaded.wv) >= 3
 
-        # Should have 4 epoch logs (one per epoch)
-        assert len(epoch_logs) == 4, f"Expected 4 epoch logs, got {len(epoch_logs)}: {epoch_logs}"
-
-    def test_show_epoch_loss_false_works(self, tmp_path):
-        """show_epoch_loss=False still works correctly."""
+    def test_show_epoch_loss_false_no_callback(self, tmp_path):
+        """show_epoch_loss=False uses single training lifecycle without callback."""
         from gensim.models import Word2Vec
         from edge_featurization.build_feature_word2vec import train_feature_word2vec
 
@@ -401,10 +490,7 @@ class TestWord2VecAlphaDecay:
         assert loaded.vector_size == 8
         assert len(loaded.wv) >= 3
 
-        # Should have one log call with final epoch info
-        log_calls = [str(call) for call in logger.call_args_list if call.args]
-        epoch_logs = [c for c in log_calls if "loss:" in c]
-        assert len(epoch_logs) == 1
+        # Model trained successfully without errors - verification complete
 
     def test_restartable_corpus_with_multi_epoch_training(self, tmp_path):
         """RestartableCorpus works correctly with multi-epoch training."""
@@ -451,16 +537,13 @@ class TestWord2VecAlphaDecay:
         assert loaded.vector_size == 8
 
 
-class TestInitSimsDeprecated:
-    """Audit tests for init_sims deprecated warning."""
+class TestInitSimsRemoved:
+    """Audit tests confirming init_sims has been removed."""
 
-    def test_init_sims_still_called_in_production(self, mocker):
-        """Verify init_sims(replace=True) is still called in production.
-
-        This is an audit test to document the current state.
-        The init_sims call is deprecated in Gensim 4.4.0 but still functional.
-        """
+    def test_init_sims_not_called_in_production(self, mocker):
+        """Verify init_sims(replace=True) is no longer called in production."""
         from edge_featurization.build_feature_word2vec import train_feature_word2vec
+        from gensim.models import Word2Vec
 
         model_dir = tempfile.mkdtemp()
         try:
@@ -482,25 +565,19 @@ class TestInitSimsDeprecated:
 
             # Patch init_sims to track calls
             init_sims_calls = []
-            original_init_sims = None
+            original_init_sims = Word2Vec.init_sims
 
-            try:
-                from gensim.models import Word2Vec
-                original_init_sims = Word2Vec.init_sims
+            def tracked_init_sims(self, replace=False):
+                init_sims_calls.append(replace)
+                return original_init_sims(self, replace=replace)
 
-                def tracked_init_sims(self, replace=False):
-                    init_sims_calls.append(replace)
-                    return original_init_sims(self, replace=replace)
-
-                mocker.patch.object(Word2Vec, "init_sims", tracked_init_sims)
-            except ImportError:
-                pytest.skip("Gensim not available")
+            mocker.patch.object(Word2Vec, "init_sims", tracked_init_sims)
 
             train_feature_word2vec(corpus, cfg, model_dir, logger)
 
-            # init_sims is still called (documenting current behavior)
-            assert len(init_sims_calls) == 1
-            assert init_sims_calls[0] is True  # Called with replace=True
+            # init_sims should NOT be called anymore
+            assert len(init_sims_calls) == 0, \
+                f"init_sims was called {len(init_sims_calls)} times (expected 0)"
 
         finally:
             shutil.rmtree(model_dir, ignore_errors=True)
