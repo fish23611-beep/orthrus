@@ -320,15 +320,17 @@ def run_diagnostic(args):
     print(f"  val_files: {dataset_config.get('val_files', [])}")
     print(f"  test_files: {dataset_config.get('test_files', [])}")
 
-    # Build configuration
+    # Build configuration. The dataset is a required positional for
+    # ``get_runtime_required_args``; we forward it explicitly and drop the
+    # earlier ``sys.argv`` monkey-patch + post-hoc ``runtime_args.dataset``
+    # override that masked the real CLI bug.
     print("\n[Initializing configuration...]")
-    sys.argv = ["diagnose", args.dataset]
-    if args.config:
-        sys.argv.extend(["--config", args.config])
 
     try:
-        runtime_args = get_runtime_required_args(args=["--config", args.config] if args.config else [])
-        runtime_args.dataset = args.dataset
+        cli_args = [args.dataset]
+        if args.config:
+            cli_args += ["--config", args.config]
+        runtime_args = get_runtime_required_args(args=cli_args)
         cfg = get_yml_cfg(runtime_args)
     except Exception as e:
         print(f"ERROR: Failed to initialize configuration: {e}")

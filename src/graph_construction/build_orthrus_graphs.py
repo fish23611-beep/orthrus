@@ -6,6 +6,12 @@ import networkx as nx
 import torch
 from config import *
 from provnet_utils import *
+from graph_construction.empty_day import (
+    EMPTY_DAY_REASON_NO_RAW_EVENTS,
+    build_marker_payload,
+    clear_marker,
+    write_marker,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +186,74 @@ def generate_timestamps(start_time, end_time, interval_minutes):
 # Graph construction with streaming event table
 # ---------------------------------------------------------------------------
 
+def _count_raw_events_streaming(cur, sql, fetch_size=8192):
+    """Count raw events for a day using only streaming fetches.
+
+    Returns the number of rows the DB driver would surface for the day's
+    SQL range. The count is used solely to decide whether the day is
+    raw-empty (and therefore a legal empty-day outcome) or contains data
+    that the streaming graph builder may or may not be able to materialize.
+    The implementation never calls ``fetchall`` and materializes at most
+    ``fetch_size`` rows in memory at a time.
+    """
+    cur.execute(sql)
+    total = 0
+    while True:
+        rows = cur.fetchmany(fetch_size)
+        if not rows:
+            break
+        total += len(rows)
+        try:
+            short_batch = len(rows) < fetch_size
+        except TypeError:
+            break
+        if short_batch:
+            break
+    return total
+
+
+def _record_verified_empty_day(
+    graph_day_dir,
+    *,
+    dataset,
+    graph_name,
+    day,
+    date_start,
+    date_stop,
+    start_ns,
+    end_ns,
+    raw_event_count,
+    logger,
+):
+    """Persist a verified empty-day marker atomically.
+
+    Only raw-empty days (``raw_event_count == 0``) are eligible. A raw > 0
+    day is never recorded as empty; if no graphs were produced the
+    caller is expected to surface a data/relation-mapping warning.
+    """
+    if raw_event_count != 0:
+        raise ValueError(
+            "_record_verified_empty_day must only be called for raw-empty days; "
+            f"got raw_event_count={raw_event_count!r}"
+        )
+    payload = build_marker_payload(
+        dataset=dataset,
+        graph_name=graph_name,
+        day=day,
+        date_start=date_start,
+        date_stop=date_stop,
+        start_ns=start_ns,
+        end_ns=end_ns,
+        raw_event_count=raw_event_count,
+        reason=EMPTY_DAY_REASON_NO_RAW_EVENTS,
+    )
+    path = write_marker(graph_day_dir, payload)
+    logger.info(
+        f"Day {day} is raw-empty; wrote verified empty-day marker at {path}"
+    )
+    return path
+
+
 def gen_edge_fused_tw_streaming(cur, nodeid2msg, logger, cfg, event_fetch_size=8192):
     """
     Memory-efficient graph construction using streaming event table.
@@ -203,22 +277,62 @@ def gen_edge_fused_tw_streaming(cur, nodeid2msg, logger, cfg, event_fetch_size=8
     
     graphs_dir = cfg.graph_construction.build_graphs._graphs_dir
     start, end = cfg.dataset.start_end_day_range
-    
+    dataset_name = getattr(getattr(cfg, "dataset", None), "name", "")
+
     for day in range(start, end):
         date_start = cfg.dataset.year_month + '-' + str(day) + ' 00:00:00'
         date_stop = cfg.dataset.year_month + '-' + str(day + 1) + ' 00:00:00'
 
         start_ns_timestamp = datetime_to_ns_time_US(date_start)
         end_ns_timestamp = datetime_to_ns_time_US(date_stop)
-        
+
         sql = """
             SELECT * FROM event_table
             WHERE timestamp_rec > '%s' AND timestamp_rec < '%s'
             ORDER BY timestamp_rec, event_uuid;
         """ % (start_ns_timestamp, end_ns_timestamp)
-        
+
         logger.info(f"Streaming events for day {day}: {date_start} to {date_stop}")
-        
+
+        # Bounded-memory raw event count: needed to legally classify the day
+        # as raw-empty. This runs *before* the semantic filter, so it reflects
+        # the upstream database, not the relation-mapping result.
+        raw_event_count = _count_raw_events_streaming(cur, sql, event_fetch_size)
+
+        graph_name = f"graph_{day}"
+        date_dir = f"{graphs_dir}/{graph_name}/"
+        os.makedirs(graphs_dir, exist_ok=True)
+
+        if raw_event_count == 0:
+            # Legal empty day: the upstream DB has zero events for this date.
+            # Persist the verified empty-day marker atomically; never create
+            # a fake/empty NetworkX graph. The marker is required to be
+            # structurally valid and identity-matching; see ``empty_day.py``.
+            os.makedirs(date_dir, exist_ok=True)
+            _record_verified_empty_day(
+                date_dir,
+                dataset=dataset_name,
+                graph_name=graph_name,
+                day=day,
+                date_start=date_start,
+                date_stop=date_stop,
+                start_ns=start_ns_timestamp,
+                end_ns=end_ns_timestamp,
+                raw_event_count=raw_event_count,
+                logger=logger,
+            )
+            logger.info(
+                f"Day {day} completed: 0 graphs (verified empty day, "
+                f"raw_event_count=0)"
+            )
+            continue
+
+        # Any prior stale empty-day marker would prevent the validator from
+        # accepting the rebuilt graphs; remove it before producing real data
+        # so a previous bad run cannot mask a good one.
+        clear_marker(date_dir)
+        os.makedirs(date_dir, exist_ok=True)
+
         # Keep the frozen implementation's semantic batches while allowing the
         # database fetch size to vary independently. At most one incomplete
         # semantic batch plus the current time-window's events are retained;
@@ -363,15 +477,25 @@ def gen_edge_fused_tw_streaming(cur, nodeid2msg, logger, cfg, event_fetch_size=8
                 if cfg._test_mode:
                     return
 
-        if start_time is None:
-            logger.info(f"No events for day {day}")
+        if start_time is None and graph_count == 0 and raw_event_count > 0:
+            # Raw events exist for this day, but the semantic filter rejected
+            # all of them. This is a data/relation-mapping anomaly and must
+            # not be silently reclassified as a "raw-empty" day. Surface it
+            # in the build log and the persisted build state so the C8.3B
+            # invariants (raw > 0, supported == 0) are never papered over.
+            logger.warning(
+                f"Day {day} had {raw_event_count} raw events but produced "
+                "0 graphs (no events passed the supported-relation filter). "
+                "This is a data/relation-mapping issue, not an empty day; "
+                "no empty-day marker will be written."
+            )
 
         # End of day cleanup
         temp_list.clear()
         gc.collect()
-        
+
         logger.info(f"Day {day} completed: {graph_count} graphs created")
-    
+
     return
 
 

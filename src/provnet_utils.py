@@ -276,10 +276,29 @@ def get_logger(name: str, filename: str):
     return logger
 
 def get_all_files_from_folders(base_dir: str, folders: list[str]):
-    paths = [os.path.abspath(os.path.join(base_dir, sub, f))
-        for sub in os.listdir(base_dir)
-        if os.path.isdir(os.path.join(base_dir, sub)) and sub in folders
-        for f in os.listdir(os.path.join(base_dir, sub))]
+    """Return real graph artifacts for the requested split folders.
+
+    Hidden preprocess markers (``.preprocess_*``) and in-flight
+    ``.tmp`` files are explicitly excluded so a verified empty-day
+    marker (or any other bookkeeping file) is never fed to
+    ``torch.load`` as if it were a graph.
+    """
+    if not os.path.isdir(base_dir):
+        return []
+    paths = []
+    for sub in sorted(os.listdir(base_dir)):
+        if not (sub in folders):
+            continue
+        sub_path = os.path.join(base_dir, sub)
+        if not os.path.isdir(sub_path):
+            continue
+        for name in sorted(os.listdir(sub_path)):
+            if name.startswith(".preprocess_") or name.endswith(".tmp"):
+                continue
+            file_path = os.path.join(sub_path, name)
+            if not os.path.isfile(file_path):
+                continue
+            paths.append(os.path.abspath(file_path))
     paths.sort(key=lambda f: int(''.join(filter(str.isdigit, f))))
     return paths
 

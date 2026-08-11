@@ -202,8 +202,38 @@ def train_feature_word2vec(corpus, cfg, model_save_path, logger):
     log(f"Save word2vec to {model_path}")
 
 
-def collect_split_node_ids(graphs_dir, split_files):
-    """Collect node IDs that actually occur in the requested graph split."""
+def _is_verified_empty_split(split_dir, cfg, split_name):
+    """Validate a verified-empty marker against the active config."""
+    from graph_construction.empty_day import is_verified_empty_day
+
+    dataset_name = getattr(getattr(cfg, "dataset", None), "name", None)
+    day = _day_index_from_split_name(split_name)
+    return is_verified_empty_day(
+        split_dir,
+        dataset=dataset_name,
+        graph_name=split_name,
+        day=day,
+    )
+
+
+def _day_index_from_split_name(name):
+    if not isinstance(name, str) or not name.startswith("graph_"):
+        return None
+    suffix = name[len("graph_"):]
+    return int(suffix) if suffix.isdigit() else None
+
+
+def _collect_split_node_ids_for_cfg(cfg, split_files):
+    """Local variant that threads ``cfg`` into the empty-day identity check
+    without using module-level globals."""
+    return _collect_split_node_ids_impl(
+        cfg.graph_construction.build_graphs._graphs_dir,
+        split_files,
+        cfg=cfg,
+    )
+
+
+def _collect_split_node_ids_impl(graphs_dir, split_files, *, cfg=None):
     node_ids = set()
     base_dir = Path(graphs_dir)
     for split_name in split_files:
@@ -219,16 +249,28 @@ def collect_split_node_ids(graphs_dir, split_files):
             and not path.name.startswith(".preprocess_")
             and not path.name.endswith(".tmp")
         )
-        if not graph_paths:
-            raise FileNotFoundError(f"Training graph split has no graph files: {split_dir}")
-        for graph_path in graph_paths:
-            try:
-                graph = torch.load(graph_path, weights_only=False)
-            except TypeError:  # PyTorch versions before weights_only
-                graph = torch.load(graph_path)
-            node_ids.update(int(node_id) for node_id in graph.nodes)
-            del graph
+        if graph_paths:
+            for graph_path in graph_paths:
+                try:
+                    graph = torch.load(graph_path, weights_only=False)
+                except TypeError:
+                    graph = torch.load(graph_path)
+                node_ids.update(int(node_id) for node_id in graph.nodes)
+                del graph
+            continue
+
+        if cfg is not None and _is_verified_empty_split(split_dir, cfg, split_name):
+            continue
+        raise FileNotFoundError(
+            f"Training graph split has no graph files: {split_dir}"
+        )
     return node_ids
+
+
+# Keep the public name with the original signature for backward compatibility
+# with existing callers and tests; the cfg-aware variant is below.
+def collect_split_node_ids(graphs_dir, split_files):
+    return _collect_split_node_ids_impl(graphs_dir, split_files)
 
 
 def _indexid2msg_from_metadata(node_metadata, use_cmd=True, use_port=False):
@@ -280,9 +322,10 @@ def select_corpus_messages(indexid2msg, cfg):
     if scope != "train_only":
         raise ValueError(f"Unsupported semantic corpus scope: {scope!r}")
 
-    train_node_ids = collect_split_node_ids(
+    train_node_ids = _collect_split_node_ids_impl(
         cfg.graph_construction.build_graphs._graphs_dir,
         cfg.dataset.train_files,
+        cfg=cfg,
     )
     available_ids = {int(node_id) for node_id in indexid2msg}
     missing = train_node_ids.difference(available_ids)

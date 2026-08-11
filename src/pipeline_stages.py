@@ -136,6 +136,71 @@ def _has_visible_file(folder):
     )
 
 
+def _is_verified_empty_day(folder, *, dataset=None, graph_name=None, day=None):
+    """A legal empty day is a marker, not a graph file.
+
+    The marker must be structurally valid and identity-matching for the
+    (dataset, graph_name, day) tuple that the validator is checking. This
+    makes a raw-empty day equivalent to a real graph artifact for the
+    purpose of artifact validation, but never equivalent to a missing,
+    malformed, or stale marker.
+    """
+    try:
+        from graph_construction.empty_day import is_verified_empty_day
+    except ImportError:
+        return False
+    kwargs = {}
+    if dataset is not None:
+        kwargs["dataset"] = dataset
+    if graph_name is not None:
+        kwargs["graph_name"] = graph_name
+    if day is not None:
+        kwargs["day"] = day
+    return is_verified_empty_day(folder, **kwargs)
+
+
+def _has_real_graph_artifact(folder):
+    """True iff ``folder`` contains at least one real graph artifact.
+
+    Hidden preprocess markers (``.preprocess_*``) and in-flight
+    ``.tmp`` files are explicitly excluded so they can never be
+    miscounted as graph artifacts.
+    """
+    if not os.path.isdir(folder):
+        return False
+    for name in os.listdir(folder):
+        if name.startswith(".preprocess_") or name.endswith(".tmp"):
+            continue
+        if os.path.isfile(os.path.join(folder, name)):
+            return True
+    return False
+
+
+def _split_is_valid(folder, *, dataset=None, graph_name=None, day=None):
+    """An expected split is valid iff it has real graph files OR a
+    valid verified-empty-day marker. Anything else (missing, empty,
+    malformed, raw_event_count != 0) is invalid."""
+    if not os.path.isdir(folder):
+        return False
+    if _has_real_graph_artifact(folder):
+        return True
+    return _is_verified_empty_day(
+        folder, dataset=dataset, graph_name=graph_name, day=day
+    )
+
+
+def _day_index_from_graph_name(graph_name):
+    """Parse the integer day index from a ``graph_<n>`` folder name."""
+    if not isinstance(graph_name, str):
+        return None
+    if not graph_name.startswith("graph_"):
+        return None
+    suffix = graph_name[len("graph_"):]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
 def _stage_artifacts_valid(cfg, stage):
     graphs_dir = cfg.graph_construction.build_graphs._graphs_dir
     if stage == "build_graphs":
@@ -143,20 +208,30 @@ def _stage_artifacts_valid(cfg, stage):
             return False
         expected_folders = []
         dataset = getattr(cfg, "dataset", None)
+        train_files = val_files = test_files = ()
         if dataset is not None:
-            for attr in ("train_files", "val_files", "test_files"):
-                values = getattr(dataset, attr, None)
-                if isinstance(values, (list, tuple)):
-                    expected_folders.extend(values)
+            train_files = getattr(dataset, "train_files", None) or ()
+            val_files = getattr(dataset, "val_files", None) or ()
+            test_files = getattr(dataset, "test_files", None) or ()
+            expected_folders.extend(train_files)
+            expected_folders.extend(val_files)
+            expected_folders.extend(test_files)
         expected_folders = list(dict.fromkeys(expected_folders))
         if expected_folders:
-            return all(
-                _has_visible_file(os.path.join(graphs_dir, folder))
-                for folder in expected_folders
-            )
+            dataset_name = getattr(dataset, "name", None)
+            for folder in expected_folders:
+                day_index = _day_index_from_graph_name(folder)
+                if not _split_is_valid(
+                    os.path.join(graphs_dir, folder),
+                    dataset=dataset_name,
+                    graph_name=folder,
+                    day=day_index,
+                ):
+                    return False
+            return True
         return any(
             name.startswith("graph_")
-            and _has_visible_file(os.path.join(graphs_dir, name))
+            and _has_real_graph_artifact(os.path.join(graphs_dir, name))
             for name in os.listdir(graphs_dir)
         )
 

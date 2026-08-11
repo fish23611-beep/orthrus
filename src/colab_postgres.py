@@ -48,14 +48,46 @@ def _capture(command, *, env=None, check=True):
 
 
 def pg_restore_candidates():
+    """Return pg_restore candidates ordered from newest major to oldest.
+
+    The symlink at ``/usr/bin/pg_restore`` is intentionally resolved so
+    downstream code can derive the actual PostgreSQL major from the
+    binary path, rather than guessing it from the symlink directory
+    (``bin``/``usr``).
+    """
     candidates = []
+    seen = set()
+    for path in sorted(
+        glob.glob("/usr/lib/postgresql/*/bin/pg_restore"),
+        reverse=True,
+    ):
+        resolved = str(Path(path).resolve())
+        if resolved not in seen:
+            seen.add(resolved)
+            candidates.append(resolved)
     current = shutil.which("pg_restore")
     if current:
-        candidates.append(current)
-    candidates.extend(
-        sorted(glob.glob("/usr/lib/postgresql/*/bin/pg_restore"), reverse=True)
-    )
-    return list(dict.fromkeys(candidates))
+        resolved = str(Path(current).resolve())
+        if resolved not in seen:
+            seen.add(resolved)
+            candidates.append(resolved)
+    return candidates
+
+
+_PG_VERSION_RE = re.compile(r"\(PostgreSQL\)\s+(\d+)")
+
+
+def parse_pg_restore_major(version_text):
+    """Extract the PostgreSQL major from a ``pg_restore --version`` line.
+
+    Returns the major as a string (e.g. ``"18"``), or ``None`` if the
+    text does not look like a stock PostgreSQL version banner. The
+    parser deliberately does *not* try to guess from the path layout.
+    """
+    if not version_text:
+        return None
+    match = _PG_VERSION_RE.search(version_text)
+    return match.group(1) if match else None
 
 
 def archive_is_readable(pg_restore, dump_path):
@@ -68,7 +100,11 @@ def choose_compatible_pg_restore(dump_path, candidates=None):
     for candidate in candidates or pg_restore_candidates():
         ok, reason = archive_is_readable(candidate, dump_path)
         version = _capture([candidate, "--version"], check=False).stdout.strip()
-        print(f"Archive check: {candidate} ({version}) -> {'ok' if ok else 'unsupported'}")
+        major = parse_pg_restore_major(version) or "?"
+        print(
+            f"Archive check: {candidate} ({version}) -> "
+            f"{'ok' if ok else 'unsupported'} (major={major})"
+        )
         if ok:
             return candidate
         if reason:
@@ -125,11 +161,25 @@ def ensure_compatible_postgres(dump_path):
     if pg_restore is None:
         raise RuntimeError("No pg_restore client can read the archive after PGDG fallback")
 
-    pg_bin = Path(pg_restore).parent
+    # Resolve any symlink (notably /usr/bin/pg_restore on Debian/Ubuntu)
+    # so the major is derived from the real binary location, not from the
+    # ``bin``/``usr`` directory of the symlink.
+    resolved_pg_restore = Path(pg_restore).resolve()
+    pg_bin = resolved_pg_restore.parent
     psql = pg_bin / "psql"
     if not psql.is_file():
         raise RuntimeError(f"Matching psql is missing: {psql}")
-    return str(pg_restore), str(psql), pg_bin.parent.name
+
+    version_text = _capture(
+        [str(resolved_pg_restore), "--version"], check=False
+    ).stdout.strip()
+    major = parse_pg_restore_major(version_text)
+    if not major or not major.isdigit():
+        raise RuntimeError(
+            "Could not determine PostgreSQL major from "
+            f"{resolved_pg_restore}: version output was {version_text!r}"
+        )
+    return str(resolved_pg_restore), str(psql), major
 
 
 def _clusters():
