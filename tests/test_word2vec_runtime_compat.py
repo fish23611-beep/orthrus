@@ -26,11 +26,197 @@ sys.path.insert(0, str(SRC))
 # ---------------------------------------------------------------------------
 
 class TestNLTKPunktTab:
-    """Tests for _ensure_nltk_punkt helper."""
+    """Tests for _ensure_nltk_punkt helper with NLTK 3.8.x and 3.9+ compatibility."""
 
+    def _clear_version_cache(self):
+        """Clear the _nltk_major_minor cache before each test."""
+        import provnet_utils
+        if hasattr(provnet_utils._nltk_major_minor, "_cached"):
+            delattr(provnet_utils._nltk_major_minor, "_cached")
+
+    # -------------------------------------------------------------------------
+    # Scenario 1: NLTK 3.8.1 - punkt exists, no download needed
+    # -------------------------------------------------------------------------
+    def test_nltk_381_punkt_exists_no_download(self, mocker):
+        """Scenario 1: NLTK 3.8.1, punkt exists, 0 downloads."""
+        import provnet_utils
+        self._clear_version_cache()
+
+        # Mock version to 3.8.1
+        mocker.patch.object(provnet_utils, "_nltk_major_minor", return_value=(3, 8))
+
+        # Mock punkt exists, punkt_tab doesn't matter for 3.8.x
+        punkt_tab_find = mocker.patch("nltk.data.find")
+        punkt_download = mocker.patch("nltk.download", return_value=True)
+
+        provnet_utils._ensure_nltk_punkt()
+
+        # Should find punkt, no download
+        assert punkt_tab_find.call_count == 1
+        punkt_download.assert_not_called()
+
+    # -------------------------------------------------------------------------
+    # Scenario 2: NLTK 3.8.1 - punkt missing, only downloads punkt
+    # -------------------------------------------------------------------------
+    def test_nltk_381_punkt_missing_downloads_punkt(self, mocker):
+        """Scenario 2: NLTK 3.8.1, punkt missing, only downloads punkt."""
+        import provnet_utils
+        self._clear_version_cache()
+
+        mocker.patch.object(provnet_utils, "_nltk_major_minor", return_value=(3, 8))
+
+        call_count = {"punkt_find": 0}
+
+        def find_effect(resource):
+            if resource == "tokenizers/punkt":
+                call_count["punkt_find"] += 1
+                if call_count["punkt_find"] == 1:
+                    raise LookupError("punkt not found")
+            return mocker.MagicMock()
+
+        mocker.patch("nltk.data.find", side_effect=find_effect)
+        punkt_download = mocker.patch("nltk.download", return_value=True)
+
+        provnet_utils._ensure_nltk_punkt()
+
+        # punkt should be downloaded
+        punkt_download.assert_called_with("punkt", quiet=True)
+        # punkt_tab should NOT be downloaded for NLTK 3.8.x
+        assert not any(
+            call.args[0] == "punkt_tab"
+            for call in punkt_download.call_args_list
+        )
+
+    # -------------------------------------------------------------------------
+    # Scenario 3: NLTK 3.9.1 - punkt and punkt_tab both exist, 0 downloads
+    # -------------------------------------------------------------------------
+    def test_nltk_391_both_exist_no_download(self, mocker):
+        """Scenario 3: NLTK 3.9.1, punkt and punkt_tab both exist, 0 downloads."""
+        import provnet_utils
+        self._clear_version_cache()
+
+        mocker.patch.object(provnet_utils, "_nltk_major_minor", return_value=(3, 9))
+
+        # Mock both find and download - both resources already exist
+        mocker.patch("nltk.data.find", return_value=mocker.MagicMock())
+        punkt_download = mocker.patch("nltk.download", return_value=True)
+
+        provnet_utils._ensure_nltk_punkt()
+
+        # Both resources exist, no downloads
+        punkt_download.assert_not_called()
+
+    # -------------------------------------------------------------------------
+    # Scenario 4: NLTK 3.9.1 - punkt exists, punkt_tab missing, must download punkt_tab
+    # -------------------------------------------------------------------------
+    def test_nltk_391_punkt_tab_missing_downloads_punkt_tab(self, mocker):
+        """Scenario 4: NLTK 3.9.1, punkt exists, punkt_tab missing, downloads punkt_tab."""
+        import provnet_utils
+        self._clear_version_cache()
+
+        mocker.patch.object(provnet_utils, "_nltk_major_minor", return_value=(3, 9))
+
+        call_count = {"punkt_tab_find": 0}
+
+        def find_effect(resource):
+            if resource == "tokenizers/punkt_tab/english":
+                call_count["punkt_tab_find"] += 1
+                if call_count["punkt_tab_find"] == 1:
+                    raise LookupError("punkt_tab not found")
+            return mocker.MagicMock()
+
+        mocker.patch("nltk.data.find", side_effect=find_effect)
+        punkt_download = mocker.patch("nltk.download", return_value=True)
+
+        provnet_utils._ensure_nltk_punkt()
+
+        # punkt_tab should be downloaded
+        punkt_download.assert_any_call("punkt_tab", quiet=True)
+        # Should NOT try punkt (it exists)
+        assert not any(
+            call.args[0] == "punkt"
+            for call in punkt_download.call_args_list
+        )
+
+    # -------------------------------------------------------------------------
+    # Scenario 5: NLTK 3.9.1 - punkt_tab download returns False, RuntimeError
+    # -------------------------------------------------------------------------
+    def test_nltk_391_punkt_tab_download_false_raises(self, mocker):
+        """Scenario 5: NLTK 3.9.1, punkt_tab download returns False, RuntimeError."""
+        import provnet_utils
+        self._clear_version_cache()
+
+        mocker.patch.object(provnet_utils, "_nltk_major_minor", return_value=(3, 9))
+
+        def find_effect(resource):
+            if resource == "tokenizers/punkt_tab/english":
+                raise LookupError("punkt_tab not found")
+            return mocker.MagicMock()
+
+        mocker.patch("nltk.data.find", side_effect=find_effect)
+        punkt_download = mocker.patch("nltk.download", return_value=False)
+
+        with pytest.raises(RuntimeError, match="returned False"):
+            provnet_utils._ensure_nltk_punkt()
+
+        punkt_download.assert_any_call("punkt_tab", quiet=True)
+
+    # -------------------------------------------------------------------------
+    # Scenario 6: NLTK 3.9.1 - download returns True but punkt_tab still not found, RuntimeError
+    # -------------------------------------------------------------------------
+    def test_nltk_391_punkt_tab_download_success_but_missing_still_raises(self, mocker):
+        """Scenario 6: NLTK 3.9.1, download True but punkt_tab still missing, RuntimeError."""
+        import provnet_utils
+        self._clear_version_cache()
+
+        mocker.patch.object(provnet_utils, "_nltk_major_minor", return_value=(3, 9))
+
+        def find_effect(resource):
+            if resource == "tokenizers/punkt_tab/english":
+                raise LookupError("punkt_tab not found")
+            return mocker.MagicMock()
+
+        mocker.patch("nltk.data.find", side_effect=find_effect)
+        punkt_download = mocker.patch("nltk.download", return_value=True)
+
+        with pytest.raises(RuntimeError, match="claimed success but"):
+            provnet_utils._ensure_nltk_punkt()
+
+    # -------------------------------------------------------------------------
+    # Scenario 7: Verify punkt_tab find path is tokenizers/punkt_tab/english
+    # -------------------------------------------------------------------------
+    def test_punkt_tab_resource_path_is_tokenizers_punkt_tab_english(self, mocker):
+        """Scenario 7: punkt_tab find path is tokenizers/punkt_tab/english, not just punkt_tab."""
+        import provnet_utils
+        self._clear_version_cache()
+
+        mocker.patch.object(provnet_utils, "_nltk_major_minor", return_value=(3, 9))
+
+        find_calls = []
+
+        def find_effect(resource):
+            find_calls.append(resource)
+            return mocker.MagicMock()
+
+        mocker.patch("nltk.data.find", side_effect=find_effect)
+        mocker.patch("nltk.download", return_value=True)
+
+        provnet_utils._ensure_nltk_punkt()
+
+        # Verify the correct punkt_tab path was used
+        punkt_tab_calls = [c for c in find_calls if "punkt_tab" in c]
+        assert any("tokenizers/punkt_tab/english" in c for c in punkt_tab_calls), \
+            f"Expected tokenizers/punkt_tab/english, got: {punkt_tab_calls}"
+
+    # -------------------------------------------------------------------------
+    # Legacy tests (compatible with original test structure)
+    # -------------------------------------------------------------------------
     def test_punkt_already_present_no_download(self, mocker):
         """When punkt exists, no download is attempted."""
         import provnet_utils
+        self._clear_version_cache()
+
+        mocker.patch.object(provnet_utils, "_nltk_major_minor", return_value=(3, 8))
 
         mock_find = mocker.patch("nltk.data.find")
         mock_download = mocker.patch("nltk.download", return_value=True)
@@ -44,6 +230,9 @@ class TestNLTKPunktTab:
     def test_punkt_missing_triggers_download(self, mocker):
         """When punkt is missing, download is triggered."""
         import provnet_utils
+        self._clear_version_cache()
+
+        mocker.patch.object(provnet_utils, "_nltk_major_minor", return_value=(3, 8))
 
         # First find fails, but after download it should succeed
         def find_effect(resource):
@@ -63,9 +252,12 @@ class TestNLTKPunktTab:
     def test_download_returns_false_raises_runtime_error(self, mocker):
         """When download returns False, RuntimeError is raised."""
         import provnet_utils
+        self._clear_version_cache()
+
+        mocker.patch.object(provnet_utils, "_nltk_major_minor", return_value=(3, 8))
 
         mocker.patch("nltk.data.find", side_effect=LookupError("not found"))
-        mocker.patch("nltk.download", return_value=False)
+        mock_download = mocker.patch("nltk.download", return_value=False)
 
         with pytest.raises(RuntimeError, match="returned False"):
             provnet_utils._ensure_nltk_punkt()
@@ -73,6 +265,9 @@ class TestNLTKPunktTab:
     def test_download_claims_success_but_resource_still_missing(self, mocker):
         """When download claims success but resource is still missing, RuntimeError is raised."""
         import provnet_utils
+        self._clear_version_cache()
+
+        mocker.patch.object(provnet_utils, "_nltk_major_minor", return_value=(3, 8))
 
         def find_effect(resource):
             raise LookupError("not found")
@@ -86,6 +281,9 @@ class TestNLTKPunktTab:
     def test_download_failure_raises(self, mocker):
         """Download failure raises exception."""
         import provnet_utils
+        self._clear_version_cache()
+
+        mocker.patch.object(provnet_utils, "_nltk_major_minor", return_value=(3, 8))
 
         mocker.patch("nltk.data.find", side_effect=LookupError("not found"))
 
@@ -105,6 +303,9 @@ class TestNLTKPunktTab:
         only trigger downloads when actually needed (when find fails).
         """
         import provnet_utils
+        self._clear_version_cache()
+
+        mocker.patch.object(provnet_utils, "_nltk_major_minor", return_value=(3, 8))
 
         call_count = {"find": 0, "download": []}
 

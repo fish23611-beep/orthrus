@@ -39,6 +39,75 @@ from config import *
 import hashlib
 import glob
 
+
+# ---------------------------------------------------------------------------
+# NLTK version detection and resource helpers
+# ---------------------------------------------------------------------------
+
+def _parse_nltk_version():
+    """Parse NLTK version as (major, minor) tuple.
+
+    Returns (3, 8) for NLTK 3.8.1, (3, 9) for NLTK 3.9.1, etc.
+    Falls back to (0, 0) if version cannot be determined.
+    """
+    try:
+        import nltk
+        version_str = nltk.__version__
+        parts = version_str.split(".")[:2]
+        major = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+        minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        return (major, minor)
+    except Exception:
+        return (0, 0)
+
+
+def _nltk_major_minor():
+    """Return (major, minor) NLTK version tuple, cached per process."""
+    if not hasattr(_nltk_major_minor, "_cached"):
+        _nltk_major_minor._cached = _parse_nltk_version()
+    return _nltk_major_minor._cached
+
+
+def _ensure_nltk_resource(package_name, resource_path):
+    """Ensure an NLTK resource is available.
+
+    Downloads lazily (only when find fails), skips download if already present,
+    and verifies the resource exists after download.
+
+    Args:
+        package_name: NLTK package identifier for download (e.g. "punkt", "punkt_tab")
+        resource_path: NLTK data.find path (e.g. "tokenizers/punkt",
+                   "tokenizers/punkt_tab/english")
+
+    Raises:
+        LookupError: if the required resource cannot be found after download.
+        RuntimeError: if download fails or returns False.
+    """
+    import nltk
+    import nltk.data
+
+    try:
+        nltk.data.find(resource_path)
+        return  # Already present
+    except LookupError:
+        pass  # Not found, proceed to download
+
+    result = nltk.download(package_name, quiet=True)
+    if result is False:
+        raise RuntimeError(
+            f"NLTK download('{package_name}') returned False; "
+            f"network may be unavailable"
+        )
+
+    try:
+        nltk.data.find(resource_path)
+    except LookupError:
+        raise RuntimeError(
+            f"NLTK download('{package_name}') claimed success but "
+            f"{resource_path} not found"
+        )
+
+
 # Lazy NLTK download: only download when actually needed, not at import time.
 # This avoids blocking pytest sessions and improves import performance.
 # For NLTK 3.9+ punkt_tab may also be needed, but punkt alone works for 3.8.x.
@@ -46,30 +115,24 @@ def _ensure_nltk_punkt():
     """Ensure NLTK punkt tokenizer data is available.
 
     punkt is the base sentence tokenizer used by word_tokenize().
-    NLTK 3.9+ may additionally require punkt_tab, but punkt alone is
-    sufficient for NLTK 3.8.x.
+    NLTK 3.9+ additionally requires punkt_tab (resource:
+    tokenizers/punkt_tab/english) to avoid LookupError when word_tokenize
+    is called. punkt alone is sufficient for NLTK 3.8.x.
+
+    This function:
+    - Lazily downloads only when needed (not at import time)
+    - Skips download if resources are already present
+    - Verifies resources exist after download
+    - Raises RuntimeError if download fails or is incomplete
 
     Raises:
         LookupError: if the required resource cannot be found after download.
         RuntimeError: if download fails or returns False.
     """
-    import nltk.data
-    try:
-        nltk.data.find("tokenizers/punkt")
-    except (ImportError, LookupError):
-        import nltk
-        result = nltk.download("punkt", quiet=True)
-        if result is False:
-            raise RuntimeError(
-                "NLTK download('punkt') returned False; network may be unavailable"
-            )
-        # Verify the resource is actually available after download
-        try:
-            nltk.data.find("tokenizers/punkt")
-        except (ImportError, LookupError):
-            raise RuntimeError(
-                "NLTK download('punkt') claimed success but tokenizers/punkt not found"
-            )
+    _ensure_nltk_resource("punkt", "tokenizers/punkt")
+
+    if _nltk_major_minor() >= (3, 9):
+        _ensure_nltk_resource("punkt_tab", "tokenizers/punkt_tab/english")
 
 
 from nltk.tokenize import word_tokenize
