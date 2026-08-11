@@ -7,7 +7,10 @@ import numpy as np
 from tqdm import tqdm
 from edge_featurization.build_feature_word2vec import load_semantic_messages
 from torch_geometric.data import *
+import networkx as nx
 import gc
+
+from serialization_compat import load_trusted_torch_artifact
 
 
 # ---------------------------------------------------------------------------
@@ -127,9 +130,12 @@ def gen_vectorized_graphs(indexid2vec, etype2oh, ntype2oh, split_files, out_dir,
 
     for path in tqdm(sorted_paths, "Embedding edges"):
         file = path.split("/")[-1]
-        
+
         # Load single graph at a time
-        graph = torch.load(path)
+        # ORTHRUS-generated NetworkX MultiDiGraph artifacts require full pickle
+        # deserialization (weights_only=False). Using trusted loader ensures
+        # PyTorch 2.6 compatibility while maintaining trust boundary.
+        graph = load_trusted_torch_artifact(path, expected_type=nx.MultiDiGraph)
 
         sorted_edges = list(graph.edges(data=True, keys=True))
         num_edges = len(sorted_edges)

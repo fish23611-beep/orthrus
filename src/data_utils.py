@@ -7,6 +7,7 @@ from torch_geometric.data import Data, TemporalData
 from torch_geometric.loader import TemporalDataLoader
 
 from encoders import OrthrusEncoder
+from serialization_compat import load_trusted_torch_artifact
 
 
 # --------------------------------------------------------------------------- #
@@ -275,7 +276,10 @@ def load_data_set(cfg, path: str, split: str) -> list[TemporalData]:
     data_list = []
     for f in sorted(os.listdir(os.path.join(path, split))):
         filepath = os.path.join(path, split, f)
-        data = torch.load(filepath).to("cpu")
+        # ORTHRUS-generated TemporalData artifacts require full pickle deserialization
+        # (weights_only=False). Using trusted loader ensures PyTorch 2.6 compatibility
+        # while maintaining trust boundary and type verification.
+        data = load_trusted_torch_artifact(filepath, expected_type=TemporalData).to("cpu")
         data_list.append(data)
 
     if cfg.edge_featurization.embed_nodes.used_method.strip() == "only_type":

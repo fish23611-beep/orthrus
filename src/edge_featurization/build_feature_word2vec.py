@@ -10,6 +10,9 @@ from gensim.models.callbacks import CallbackAny2Vec
 import numpy as np
 import random
 import torch
+import networkx as nx
+
+from serialization_compat import load_trusted_torch_artifact
 
 
 # ---------------------------------------------------------------------------
@@ -316,9 +319,13 @@ def _collect_split_node_ids_impl(graphs_dir, split_files, *, cfg=None):
         if graph_paths:
             for graph_path in graph_paths:
                 try:
+                    # ORTHRUS-generated NetworkX MultiDiGraph artifacts require full pickle
+                    # deserialization (weights_only=False). Using trusted loader ensures
+                    # PyTorch 2.6 compatibility while maintaining trust boundary.
+                    graph = load_trusted_torch_artifact(graph_path, expected_type=nx.MultiDiGraph)
+                except (TypeError, AttributeError):
+                    # Fallback for unexpected artifact structure.
                     graph = torch.load(graph_path, weights_only=False)
-                except TypeError:
-                    graph = torch.load(graph_path)
                 node_ids.update(int(node_id) for node_id in graph.nodes)
                 del graph
             continue
