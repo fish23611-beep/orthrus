@@ -1,4 +1,6 @@
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from provnet_utils import *
 from config import *
@@ -111,9 +113,9 @@ def load_corpus_from_database(indexid2msg, use_node_types):
 def train_feature_word2vec(corpus, cfg, model_save_path, logger):
     """
     Train Word2Vec model with bounded memory.
-    
+
     The corpus must support multiple iterations (restartable iterator).
-    
+
     Args:
         corpus: RestartableCorpus or list-like object
         cfg: configuration object
@@ -135,9 +137,23 @@ def train_feature_word2vec(corpus, cfg, model_save_path, logger):
     # Ensure corpus can be iterated multiple times
     if not hasattr(corpus, '__iter__'):
         raise ValueError("Corpus must be iterable")
-    
-    # Train with epoch loss tracking
+
+    # Train with epoch loss tracking using a callback approach.
+    # This preserves a single training lifecycle so Gensim handles alpha decay
+    # correctly across all epochs, avoiding the "alpha higher than previous
+    # cycles" warning that occurs when train() is called multiple times.
     if show_epoch_loss:
+        epoch_losses = []
+
+        def epoch_callback(w2v_model, epoch, total_epochs):
+            """Called at the end of each epoch to record loss."""
+            loss = w2v_model.get_latest_training_loss()
+            epoch_losses.append(loss)
+            log(f"Epoch: {epoch}/{total_epochs}; loss: {loss}")
+
+        callbacks = [epoch_callback] if compute_loss else []
+        extra_kwargs = {'callbacks': callbacks} if callbacks else {}
+
         if use_seed:
             model = Word2Vec(corpus,
                              vector_size=emb_dim,
@@ -145,10 +161,11 @@ def train_feature_word2vec(corpus, cfg, model_save_path, logger):
                              min_count=min_count,
                              sg=use_skip_gram,
                              workers=num_workers,
-                             epochs=1,
+                             epochs=epochs,
                              compute_loss=compute_loss,
                              negative=negative,
-                             seed=SEED)
+                             seed=SEED,
+                             **extra_kwargs)
         else:
             model = Word2Vec(corpus,
                              vector_size=emb_dim,
@@ -156,16 +173,10 @@ def train_feature_word2vec(corpus, cfg, model_save_path, logger):
                              min_count=min_count,
                              sg=use_skip_gram,
                              workers=num_workers,
-                             epochs=1,
+                             epochs=epochs,
                              compute_loss=compute_loss,
-                             negative=negative)
-        epoch_loss = model.get_latest_training_loss()
-        log(f"Epoch: 0/{epochs}; loss: {epoch_loss}")
-
-        for epoch in range(epochs - 1):
-            model.train(corpus, epochs=1, total_examples=len(corpus), compute_loss=compute_loss)
-            epoch_loss = model.get_latest_training_loss()
-            log(f"Epoch: {epoch+1}/{epochs}; loss: {epoch_loss}")
+                             negative=negative,
+                             **extra_kwargs)
     else:
         if use_seed:
             model = Word2Vec(corpus,
@@ -192,13 +203,38 @@ def train_feature_word2vec(corpus, cfg, model_save_path, logger):
         log(f"Epoch: {epochs}; loss: {loss}")
 
     model.init_sims(replace=True)
-    
-    # Atomic save: write to temp file, then rename
+
+    # Atomic save: save to temp directory with final basename, then move contents.
+    # This ensures all sidecar files (syn1neg.npy, wv.vectors.npy, etc.) are
+    # created with the correct final names before being published.
     model_path = os.path.join(model_save_path, 'feature_word2vec.model')
-    temp_path = model_path + '.tmp'
-    model.save(temp_path)
-    os.replace(temp_path, model_path)
-    
+
+    # Create a temp directory in the same parent as model_save_path for atomicity.
+    # Saving to a temp file with .tmp extension (e.g., model.tmp) causes Gensim
+    # to create sidecars named model.tmp.wv.vectors.npy, which then need renaming
+    # separately - fragile and not atomic. Instead, we save to a temp dir with
+    # the final basename, then move everything atomically.
+    temp_model_dir = tempfile.mkdtemp(dir=model_save_path)
+    temp_model_path = os.path.join(temp_model_dir, 'feature_word2vec.model')
+    try:
+        model.save(temp_model_path)
+        # Move all contents to the final directory.
+        # All sidecar files now have the correct final basename before being
+        # published to model_save_path.
+        for item in os.listdir(temp_model_dir):
+            src = os.path.join(temp_model_dir, item)
+            dst = os.path.join(model_save_path, item)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+        # Now atomically replace the main model file last.
+        # The sidecars are already in place with correct names.
+        os.replace(temp_model_path, model_path)
+    finally:
+        # Clean up temp directory even on failure.
+        shutil.rmtree(temp_model_dir, ignore_errors=True)
+
     log(f"Save word2vec to {model_path}")
 
 
