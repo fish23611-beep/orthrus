@@ -377,6 +377,11 @@ def get_default_cfg(args):
      cfg._from_weights_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "weights/")
      cfg._seed = args.seed
 
+     # C8-B: Bounded smoke limit — runtime-only, does NOT participate in artifact hash
+     # None = load all windows (default, unchanged behavior)
+     # int > 0 = load at most that many windows per split
+     cfg._max_windows_per_split = getattr(args, "max_windows_per_split", None)
+
      # Pipeline stage control
      cfg.pipeline = CN()
      cfg.pipeline.mode = "full_pipeline"  # C2: "full_pipeline" or "detection_only"
@@ -793,6 +798,12 @@ def get_yml_cfg(args):
      if resume_checkpoint is not None:
           cfg.detection.gnn_training.resume_checkpoint = resume_checkpoint
      cfg._inference_checkpoint = getattr(args, "inference_checkpoint", None)
+
+     # C8-B: Smoke detection flag — set when bounded smoke is active.
+     # This is a runtime-only marker that helps collect_results.py filter out
+     # smoke runs from formal paper results.
+     max_windows = getattr(cfg, "_max_windows_per_split", None)
+     cfg._is_smoke = max_windows is not None and max_windows > 0
 
      # Handle --artifact-root explicitly (non-dotted CLI arg, not processed by overwrite_cfg_with_args)
      artifact_root_raw = getattr(args, "artifact_root", None)

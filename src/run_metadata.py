@@ -295,6 +295,9 @@ def dump_runtime(
         "time_gnn_testing": timing.get("time_gnn_testing", 0.0),
         "time_evaluation": timing.get("time_evaluation", 0.0),
         "time_tracing": timing.get("time_tracing", 0.0),
+        # C8-B: Bounded smoke metadata
+        "is_smoke": bool(getattr(cfg, "_is_smoke", False)),
+        "max_windows_per_split": getattr(cfg, "_max_windows_per_split", None),
     }
 
     if error_message:

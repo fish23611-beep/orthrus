@@ -47,6 +47,15 @@ def build_parser() -> argparse.ArgumentParser:
               "checkpoint file or directory used for inference."),
     )
     parser.add_argument("--cpu", action="store_true", help="Force CPU execution.")
+    parser.add_argument(
+        "--max-windows-per-split",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Maximum number of TemporalData windows to load per split (train/val/test). "
+             "Default: None (load all windows). "
+             "Use 2 for bounded baseline smoke test.",
+    )
     return parser
 
 
@@ -89,6 +98,7 @@ def build_pipeline_args(namespace: argparse.Namespace) -> SimpleNamespace:
         show_attack=0,
         gt_type="orthrus",
         plot_gt=False,
+        max_windows_per_split=namespace.max_windows_per_split,
     )
     if checkpoint is not None:
         if "train" in stages:

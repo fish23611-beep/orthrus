@@ -269,13 +269,37 @@ def load_all_datasets(cfg):
 def load_data_set(cfg, path: str, split: str) -> list[TemporalData]:
     """
     Returns a list of time window graphs for a given `split` (train/val/test set).
+
+    When ``cfg._max_windows_per_split`` is set to a positive integer, only the
+    first N files (sorted alphabetically) are loaded. This enables bounded
+    smoke tests that avoid loading the full dataset into RAM. When the limit
+    is ``None`` (default), all windows are loaded — preserving existing
+    behaviour for formal experiments.
     """
     if cfg._test_mode:
         split = "train"
 
+    split_dir = os.path.join(path, split)
+    all_files = sorted(os.listdir(split_dir))
+    available = len(all_files)
+
+    # C8-B: Bounded smoke limit — applied BEFORE torch.load to save RAM
+    limit = getattr(cfg, "_max_windows_per_split", None)
+
+    if limit is not None:
+        # limit=0 or negative is an error (loading 0 windows makes no sense for smoke)
+        if limit <= 0:
+            raise ValueError(
+                f"max_windows_per_split must be a positive integer; got {limit}"
+            )
+        selected = all_files[:limit]
+        print(f"[Bounded smoke] split={split}: selected {len(selected)} / {available} windows")
+    else:
+        selected = all_files
+
     data_list = []
-    for f in sorted(os.listdir(os.path.join(path, split))):
-        filepath = os.path.join(path, split, f)
+    for f in selected:
+        filepath = os.path.join(split_dir, f)
         # ORTHRUS-generated TemporalData artifacts require full pickle deserialization
         # (weights_only=False). Using trusted loader ensures PyTorch 2.6 compatibility
         # while maintaining trust boundary and type verification.
