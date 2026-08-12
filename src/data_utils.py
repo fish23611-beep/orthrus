@@ -433,15 +433,128 @@ def build_edge_feats(fields, msg, cfg):
     edge_feats = torch.cat(edge_feats, dim=-1) if len(edge_feats) > 0 else None
     return edge_feats
 
+def _is_event_level_attribute(value, num_events):
+    """
+    Returns True if ``value`` is a Tensor whose first dimension equals ``num_events``,
+    indicating it should be sliced per-batch by PyG's TemporalDataLoader.
+
+    Returns False for window-level scalars (int, str) or other non-sliceable types
+    that would cause ``AttributeError: 'int' object has no attribute 'size'`` in
+    PyG's TemporalData.index_select.
+
+    This is the complement of the PyG condition::
+
+        if value.size(0) == self.num_events:
+            data[key] = value[idx]
+
+    The ``dim() >= 1`` guard is critical: it prevents 0-d scalars (Python int/str)
+    from reaching ``size(0)`` and causing AttributeError.
+    """
+    return (
+        isinstance(value, torch.Tensor)
+        and value.dim() >= 1
+        and value.size(0) == num_events
+    )
+
+
 def custom_temporal_data_loader(data: TemporalData, batch_size: int, *args, **kwargs):
     """
-    A simple `TemporalDataLoader` which also update the edge_index with the
-    sampled edges of size `batch_size`. By default, only attributes of shape (E, d)
-    are updated, `edge_index` is thus not updated automatically.
+    A `TemporalDataLoader` wrapper that safely handles TemporalData windows
+    containing mixed event-level Tensor fields and window-level non-Tensor
+    metadata (e.g. ``split=int``, ``split_name=str``, ``window_id=int``).
+
+    Background
+    ----------
+    PyG's ``TemporalDataLoader`` calls ``TemporalData.index_select`` internally.
+    ``index_select`` unconditionally calls ``value.size(0)`` for every store
+    attribute.  Window-level metadata (Python ``int`` / ``str``) has no
+    ``.size()`` method, causing::
+
+        AttributeError: 'int' object has no attribute 'size'
+
+    This wrapper separates the two classes of attributes before batching and
+    re-attaches window-level metadata to each emitted batch.
+
+    Event-level Tensor attributes (``src``, ``dst``, ``t``, ``msg``, etc.) are
+    sliced normally by PyG.  The existing contract is preserved:
+
+        - ``g.split`` remains a Python ``int`` on the window
+        - ``g.split_name`` remains a Python ``str`` on the window
+        - ``g.window_id`` remains a Python ``int`` on the window
+        - ``full_data.split`` (``torch.long[E]``) is unaffected (it is the
+          event-level tensor, not a window scalar)
+
+    Parameters
+    ----------
+    data:
+        A TemporalData window. May contain both event-level Tensor fields
+        and window-level scalar metadata.
+    batch_size:
+        Number of events per emitted batch.
+
+    Yields
+    ------
+    TemporalData
+        A batch with all event-level fields correctly sliced and
+        window-level metadata re-attached.
     """
-    loader = TemporalDataLoader(data, batch_size=batch_size, *args, **kwargs)
+    num_events = data.num_events
+
+    # ------------------------------------------------------------------
+    # 1. Separate event-level tensors from window-level metadata.
+    # ------------------------------------------------------------------
+    loader_safe_data_dict = {}
+    window_metadata = {}
+
+    for key, value in data._store.items():
+        if _is_event_level_attribute(value, num_events):
+            loader_safe_data_dict[key] = value
+        else:
+            window_metadata[key] = value
+
+    # ------------------------------------------------------------------
+    # 2. Build a loader-safe TemporalData containing only event-level
+    #    tensors.  Copy to avoid mutating the caller's original object.
+    # ------------------------------------------------------------------
+    if loader_safe_data_dict:
+        loader_safe_data = TemporalData(**loader_safe_data_dict)
+    else:
+        # Degenerate: zero-event window — still construct a valid TemporalData
+        loader_safe_data = TemporalData()
+
+    # ------------------------------------------------------------------
+    # 3. Delegate batching to PyG's TemporalDataLoader.
+    # ------------------------------------------------------------------
+    loader = TemporalDataLoader(loader_safe_data, batch_size=batch_size, *args, **kwargs)
+
     for batch in loader:
+        # PyG's index_select stores the node index used to slice each attribute
+        # as ``_idx`` on the resulting TemporalData.
+        batch_idx = batch._idx if hasattr(batch, "_idx") else None
+
+        # ------------------------------------------------------------------
+        # 4. Restore window-level metadata onto the batch.
+        # ------------------------------------------------------------------
+        for key, value in window_metadata.items():
+            if batch_idx is not None:
+                # Preserve list/array metadata by slicing to batch size.
+                if isinstance(value, (list, tuple)):
+                    batch[key] = list(value[: len(batch_idx)])
+                elif hasattr(value, "__getitem__"):
+                    # numpy array or similar array-like object
+                    batch[key] = value[: len(batch_idx)]
+                else:
+                    # Scalar: int, str, Path, or 0-d Tensor — re-attach unchanged.
+                    batch[key] = value
+            else:
+                # Fallback for degenerate (zero-event) windows.
+                batch[key] = value
+
+        # ------------------------------------------------------------------
+        # 5. Reconstruct edge_index from batched src/dst (PyG convention).
+        # ------------------------------------------------------------------
         batch.edge_index = torch.stack([batch.src, batch.dst])
+
         yield batch
 
 def temporal_data_to_data(data: TemporalData) -> Data:

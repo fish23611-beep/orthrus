@@ -7,7 +7,11 @@ and split/window_id metadata.
 """
 import sys
 import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+sys.path.insert(0, str(SRC))
 
 import pytest
 import torch
@@ -696,3 +700,269 @@ def test_full_data_edge_type_src_dst_types_align():
     assert torch.equal(full.src_type, all_src_type)
     assert torch.equal(full.dst_type, all_dst_type)
     assert torch.equal(full.edge_type_index, all_edge_type_index)
+
+
+# --------------------------------------------------------------------------- #
+# C8 regression: window-level int/str metadata + TemporalDataLoader batching
+# --------------------------------------------------------------------------- #
+
+def _make_temporal_window_with_metadata(src, dst, t, split_val, split_name_str, window_id_val):
+    """
+    Construct a TemporalData that mimics a real train window after
+    _inject_full_data_event_fields — event-level Tensors plus
+    window-level scalar metadata (split=int, split_name=str, window_id=int).
+    """
+    E = len(src)
+    cfg = FakeCfg()
+    node_dim = cfg.dataset.num_node_types
+    edge_dim = cfg.dataset.num_edge_types
+    emb_dim = 128
+
+    src_type_oh = torch.zeros(E, node_dim, dtype=torch.long)
+    dst_type_oh = torch.zeros(E, node_dim, dtype=torch.long)
+    edge_type_oh = torch.zeros(E, edge_dim, dtype=torch.long)
+    edge_type_oh[:, 1] = 1
+
+    src_emb = torch.randn(E, emb_dim)
+    dst_emb = torch.randn(E, emb_dim)
+
+    src_type_oh[torch.arange(E), src % node_dim] = 1
+    dst_type_oh[torch.arange(E), dst % node_dim] = 1
+
+    msg = torch.cat([src_type_oh, src_emb, edge_type_oh, dst_type_oh, dst_emb], dim=-1)
+    x_src = torch.cat([src_emb, src_type_oh], dim=-1)
+    x_dst = torch.cat([dst_emb, dst_type_oh], dim=-1)
+
+    g = TemporalData()
+    g.src = src
+    g.dst = dst
+    g.t = t
+    g.msg = msg
+    g.edge_type = edge_type_oh
+    g.x_src = x_src
+    g.x_dst = x_dst
+    g.src_type_onehot = src_type_oh.clone()
+    g.dst_type_onehot = dst_type_oh.clone()
+    _inject_event_indices(g, cfg)
+
+    # Window-level metadata (the C8 blocker)
+    g.split = split_val          # Python int
+    g.split_name = split_name_str  # Python str
+    g.window_id = window_id_val  # Python int
+
+    # Per-window event indices (as set by _inject_full_data_event_fields)
+    g.global_event_index = torch.arange(
+        window_id_val * 2, window_id_val * 2 + E, dtype=torch.long
+    )
+    g.event_index = g.global_event_index
+
+    return g
+
+
+def test_c8_loader_no_attribute_error_on_window_metadata():
+    """
+    Test A: Real-style window with split=int, split_name=str, window_id=int
+    must not raise AttributeError when passed through custom_temporal_data_loader.
+    """
+    g = _make_temporal_window_with_metadata(
+        src=torch.tensor([0, 1, 2, 3, 4]),
+        dst=torch.tensor([1, 2, 3, 4, 0]),
+        t=torch.tensor([0, 10, 20, 30, 40], dtype=torch.long),
+        split_val=0,
+        split_name_str="train",
+        window_id_val=7,
+    )
+
+    # Must not raise AttributeError: 'int' object has no attribute 'size'
+    loader = custom_temporal_data_loader(g, batch_size=2)
+    batch = next(iter(loader))  # Should not crash
+    assert batch is not None
+
+
+def test_c8_window_metadata_preserved_in_batch():
+    """
+    Test B: After batching, each batch must retain the original window metadata
+    values: split=int, split_name=str, window_id=int.
+    """
+    g = _make_temporal_window_with_metadata(
+        src=torch.tensor([0, 1, 2, 3]),
+        dst=torch.tensor([1, 2, 3, 0]),
+        t=torch.tensor([0, 10, 20, 30], dtype=torch.long),
+        split_val=0,
+        split_name_str="train",
+        window_id_val=7,
+    )
+
+    loader = custom_temporal_data_loader(g, batch_size=2)
+    for batch in loader:
+        assert batch.split == 0
+        assert batch.split_name == "train"
+        assert batch.window_id == 7
+
+
+def test_c8_event_tensor_slicing_correct():
+    """
+    Test C: global_event_index (and event_index) must be sliced correctly,
+    preserving original absolute positions — NOT re-numbered from 0.
+    """
+    # Construct a window where global_event_index starts at offset 100
+    base_offset = 100
+    E = 5
+    g = _make_temporal_window_with_metadata(
+        src=torch.tensor([0, 1, 2, 3, 4]),
+        dst=torch.tensor([1, 2, 3, 4, 0]),
+        t=torch.tensor([0, 10, 20, 30, 40], dtype=torch.long),
+        split_val=1,
+        split_name_str="val",
+        window_id_val=50,
+    )
+    # Override global_event_index to a known offset (not contiguous with window_id)
+    g.global_event_index = torch.arange(base_offset, base_offset + E, dtype=torch.long)
+    g.event_index = g.global_event_index
+
+    loader = custom_temporal_data_loader(g, batch_size=2)
+    batches = list(loader)
+
+    # First batch: events 0-1
+    assert torch.equal(batches[0].global_event_index, torch.tensor([100, 101], dtype=torch.long))
+    assert torch.equal(batches[0].event_index, torch.tensor([100, 101], dtype=torch.long))
+    assert torch.equal(batches[0].local_event_index, torch.tensor([0, 1], dtype=torch.long))
+
+    # Second batch: events 2-3
+    assert torch.equal(batches[1].global_event_index, torch.tensor([102, 103], dtype=torch.long))
+    assert torch.equal(batches[1].event_index, torch.tensor([102, 103], dtype=torch.long))
+
+    # Third batch: event 4
+    assert torch.equal(batches[2].global_event_index, torch.tensor([104], dtype=torch.long))
+    assert torch.equal(batches[2].event_index, torch.tensor([104], dtype=torch.long))
+
+
+def test_c8_metadata_consistent_across_batches():
+    """
+    Test D: A window split into multiple batches must have identical
+    window metadata on every batch (split, split_name, window_id).
+    """
+    g = _make_temporal_window_with_metadata(
+        src=torch.tensor([0, 1, 2, 3]),
+        dst=torch.tensor([1, 2, 3, 0]),
+        t=torch.tensor([0, 10, 20, 30], dtype=torch.long),
+        split_val=2,
+        split_name_str="test",
+        window_id_val=99,
+    )
+
+    loader = custom_temporal_data_loader(g, batch_size=2)
+    batches = list(loader)
+
+    assert len(batches) == 2
+    for batch in batches:
+        assert batch.split == 2
+        assert batch.split_name == "test"
+        assert batch.window_id == 99
+
+
+def test_c8_event_level_split_tensor_still_works():
+    """
+    Test E: The existing semantic — full_data.split as a torch.long [E]
+    per-event Tensor — must still be sliced correctly by the loader.
+    This is the scenario covered by the original test_full_data_split_in_temporal_data_loader.
+    """
+    # Build a minimal full_data-style TemporalData (all tensors)
+    E = 5
+    full_temporal = TemporalData(
+        src=torch.tensor([0, 1, 2, 3, 4]),
+        dst=torch.tensor([1, 2, 3, 4, 0]),
+        t=torch.tensor([0, 10, 20, 30, 40], dtype=torch.long),
+        msg=torch.randn(E, 10),
+        edge_type=torch.zeros(E, 4),
+        src_type=torch.zeros(E, 3, dtype=torch.long),
+        dst_type=torch.zeros(E, 3, dtype=torch.long),
+        edge_type_index=torch.zeros(E, dtype=torch.long),
+        local_event_index=torch.arange(E, dtype=torch.long),
+        global_event_index=torch.tensor([100, 101, 102, 103, 104], dtype=torch.long),
+        # Event-level split Tensor — NOT a window scalar
+        split=torch.tensor([0, 0, 1, 2, 2], dtype=torch.long),
+    )
+    full_temporal.edge_type[:, 1] = 1
+
+    loader = custom_temporal_data_loader(full_temporal, batch_size=3)
+    batch1 = next(iter(loader))
+
+    # split must be sliced, not overwritten by window metadata
+    assert isinstance(batch1.split, torch.Tensor)
+    assert batch1.split.dtype == torch.long
+    assert torch.equal(batch1.split, torch.tensor([0, 0, 1], dtype=torch.long))
+    # global_event_index must also be sliced correctly
+    assert torch.equal(batch1.global_event_index, torch.tensor([100, 101, 102], dtype=torch.long))
+
+
+def test_c8_mixed_window_metadata_and_event_split():
+    """
+    Test F (boundary): A single TemporalData where the same key 'split'
+    is BOTH a window int and an event-level Tensor.  This cannot happen
+    in the real codebase (split is only ever one type per TemporalData),
+    but we verify the loader does not crash on mixed content.
+    """
+    E = 3
+    g = TemporalData()
+    g.src = torch.tensor([0, 1, 2])
+    g.dst = torch.tensor([1, 2, 0])
+    g.t = torch.tensor([0, 10, 20], dtype=torch.long)
+    g.msg = torch.randn(E, 10)
+    g.edge_type = torch.zeros(E, 4); g.edge_type[:, 1] = 1
+    g.src_type = torch.zeros(E, 3, dtype=torch.long)
+    g.dst_type = torch.zeros(E, 3, dtype=torch.long)
+    g.edge_type_index = torch.zeros(E, dtype=torch.long)
+    g.local_event_index = torch.arange(E, dtype=torch.long)
+    g.global_event_index = torch.tensor([200, 201, 202], dtype=torch.long)
+    # Window-level scalar
+    g.split_name = "train"
+    g.window_id = 5
+    # No g.split — intentionally omitted to avoid ambiguity
+
+    loader = custom_temporal_data_loader(g, batch_size=2)
+    batch = next(iter(loader))
+
+    assert batch.split_name == "train"
+    assert batch.window_id == 5
+    assert torch.equal(batch.global_event_index, torch.tensor([200, 201], dtype=torch.long))
+
+
+def test_c8_original_loader_behavior_preserved():
+    """
+    Test G (regression): Plain TemporalData with only Tensor attributes
+    (no window-level int/str metadata) must behave exactly as before
+    the fix — batch.edge_index correctly set, all fields sliced.
+    """
+    E = 5
+    g = TemporalData()
+    g.src = torch.tensor([0, 1, 2, 3, 4])
+    g.dst = torch.tensor([1, 2, 3, 4, 0])
+    g.t = torch.tensor([0, 10, 20, 30, 40], dtype=torch.long)
+    g.msg = torch.randn(E, 10)
+    g.edge_type = torch.zeros(E, 4); g.edge_type[:, 1] = 1
+    g.src_type = torch.zeros(E, 3, dtype=torch.long)
+    g.dst_type = torch.zeros(E, 3, dtype=torch.long)
+    g.edge_type_index = torch.zeros(E, dtype=torch.long)
+    g.local_event_index = torch.arange(E, dtype=torch.long)
+    g.global_event_index = torch.tensor([10, 11, 12, 13, 14], dtype=torch.long)
+    g.split = torch.tensor([0, 0, 0, 0, 0], dtype=torch.long)
+
+    loader = custom_temporal_data_loader(g, batch_size=2)
+    batches = list(loader)
+
+    assert len(batches) == 3  # [2, 2, 1]
+
+    # Batch 1: events 0-1
+    assert torch.equal(batches[0].src, torch.tensor([0, 1]))
+    assert torch.equal(batches[0].global_event_index, torch.tensor([10, 11], dtype=torch.long))
+    assert torch.equal(batches[0].split, torch.tensor([0, 0], dtype=torch.long))
+    assert torch.equal(batches[0].edge_index, torch.stack([batches[0].src, batches[0].dst]))
+
+    # Batch 2: events 2-3
+    assert torch.equal(batches[1].src, torch.tensor([2, 3]))
+    assert torch.equal(batches[1].global_event_index, torch.tensor([12, 13], dtype=torch.long))
+
+    # Batch 3: event 4
+    assert torch.equal(batches[2].src, torch.tensor([4]))
+    assert torch.equal(batches[2].global_event_index, torch.tensor([14], dtype=torch.long))
