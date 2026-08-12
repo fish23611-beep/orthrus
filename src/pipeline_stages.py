@@ -6,6 +6,7 @@ detection / attack_reconstruction imports so it can be unit-tested in isolation.
 """
 from __future__ import annotations
 
+import json
 import os
 
 
@@ -201,6 +202,43 @@ def _day_index_from_graph_name(graph_name):
     return int(suffix)
 
 
+def _is_valid_embed_edges_marker(artifact_dir):
+    """
+    Validate embed_edges completion marker is v2 format.
+
+    Old ISO timestamp markers are rejected (schema_version 1 implicit).
+    v2 markers must have correct schema_version and temporal_order.
+
+    Returns:
+        bool: True if marker is valid v2, False otherwise
+    """
+    marker_path = os.path.join(artifact_dir, ".preprocess_embed_edges_complete")
+    if not os.path.isfile(marker_path):
+        return False
+
+    try:
+        with open(marker_path, 'r', encoding="utf-8") as f:
+            content = f.read().strip()
+
+        # Try parsing as JSON v2 marker
+        if content.startswith('{'):
+            marker_data = json.loads(content)
+            if not isinstance(marker_data, dict):
+                return False
+            schema_version = marker_data.get("schema_version")
+            temporal_order = marker_data.get("temporal_order")
+            # Valid v2 marker
+            if schema_version == 2 and temporal_order == "nondecreasing":
+                return True
+            return False
+
+        # Old ISO timestamp marker format (schema_version implicit = 1)
+        # These are no longer valid
+        return False
+    except (json.JSONDecodeError, IOError, UnicodeDecodeError):
+        return False
+
+
 def _stage_artifacts_valid(cfg, stage):
     graphs_dir = cfg.graph_construction.build_graphs._graphs_dir
     if stage == "build_graphs":
@@ -261,6 +299,9 @@ def check_preprocess_stage_complete(cfg, stage):
 
     Marker-free graph/model/edge artifacts retain legacy compatibility, while a
     marker can never make a partial or corrupt stage look complete.
+
+    For embed_edges, v2 JSON marker with temporal_order="nondecreasing" is required.
+    Old ISO timestamp markers are automatically rejected.
     """
     if stage == "build_graphs":
         artifact_dir = cfg.graph_construction.build_graphs._graphs_dir
@@ -276,6 +317,9 @@ def check_preprocess_stage_complete(cfg, stage):
     valid = _stage_artifacts_valid(cfg, stage)
     marker = _get_completion_marker_path(artifact_dir, stage)
     if os.path.isfile(marker):
+        # embed_edges uses v2 marker validation
+        if stage == "embed_edges":
+            return valid and _is_valid_embed_edges_marker(artifact_dir)
         return valid
     if stage == "metadata":
         return False

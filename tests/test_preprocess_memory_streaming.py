@@ -197,7 +197,7 @@ class TestCompletionMarkers:
         assert check_preprocess_stage_complete(mock_cfg, "embed_nodes") is True
     
     def test_embed_edges_marker(self, mock_cfg, tmp_path):
-        """Edge completion requires non-empty train, val, and test outputs."""
+        """Edge completion requires non-empty train, val, and test outputs + v2 marker."""
         edge_embeds_dir = tmp_path / "edge_emb"
         assert check_preprocess_stage_complete(mock_cfg, "embed_edges") is False
 
@@ -205,7 +205,16 @@ class TestCompletionMarkers:
             split_dir = edge_embeds_dir / split
             split_dir.mkdir(exist_ok=True)
             (split_dir / "graph.TemporalData.simple").write_text("dummy")
-        (edge_embeds_dir / ".preprocess_embed_edges_complete").write_text("done")
+
+        # v2 JSON marker (old ISO timestamp format is now rejected)
+        import json
+        from datetime import datetime, timezone
+        marker_data = {
+            "schema_version": 2,
+            "temporal_order": "nondecreasing",
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        (edge_embeds_dir / ".preprocess_embed_edges_complete").write_text(json.dumps(marker_data))
         assert check_preprocess_stage_complete(mock_cfg, "embed_edges") is True
     
     def test_all_stages_complete_false(self, mock_cfg):
@@ -228,7 +237,16 @@ class TestCompletionMarkers:
             split_dir = edge_dir / split
             split_dir.mkdir()
             (split_dir / "graph").write_text("edges")
-        (edge_dir / ".preprocess_embed_edges_complete").write_text("done")
+
+        # v2 JSON marker for embed_edges (old ISO timestamp format is now rejected)
+        import json
+        from datetime import datetime, timezone
+        marker_data = {
+            "schema_version": 2,
+            "temporal_order": "nondecreasing",
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        (edge_dir / ".preprocess_embed_edges_complete").write_text(json.dumps(marker_data))
 
         cache = MetadataCache(mock_cfg._metadata_dir)
         cache.save_node_metadata({1: {"type": "file"}})
@@ -831,7 +849,7 @@ class TestFrozenReferenceEquivalence:
 
 def _temporal_data_case(tmp_path):
     import numpy as np
-    from edge_featurization.embed_edges_feature_word2vec import gen_vectorized_graphs
+    from edge_featurization.embed_edges_feature_word2vec import gen_vectorized_graphs, _order_edges_chronologically
 
     graphs_dir = tmp_path / "graphs"
     graph_dir = graphs_dir / "graph_8"
@@ -866,10 +884,15 @@ def _temporal_data_case(tmp_path):
         MagicMock(), cfg,
     )
     actual = torch.load(out_dir / "window.TemporalData.simple")
-    edges = list(graph.edges(data=True, keys=True))
-    expected_src = torch.tensor([int(u) for u, _v, _k, _a in edges], dtype=torch.long)
-    expected_dst = torch.tensor([int(v) for _u, v, _k, _a in edges], dtype=torch.long)
-    expected_t = torch.tensor([int(a["time"]) for _u, _v, _k, a in edges], dtype=torch.long)
+
+    # Build expected tensors from CHRONOLOGICALLY sorted edges
+    # (matching the fix: edges are now sorted before building TemporalData)
+    raw_edges = list(graph.edges(data=True, keys=True))
+    chronological_edges = _order_edges_chronologically(raw_edges, str(graphs_dir), "test")
+
+    expected_src = torch.tensor([int(u) for u, _v, _k, _a in chronological_edges], dtype=torch.long)
+    expected_dst = torch.tensor([int(v) for _u, v, _k, _a in chronological_edges], dtype=torch.long)
+    expected_t = torch.tensor([int(a["time"]) for _u, _v, _k, a in chronological_edges], dtype=torch.long)
     expected_msg = torch.stack([
         torch.cat([
             ntype2oh[graph.nodes[u]["node_type"]],
@@ -878,21 +901,26 @@ def _temporal_data_case(tmp_path):
             ntype2oh[graph.nodes[v]["node_type"]],
             torch.from_numpy(indexid2vec[int(v)]),
         ])
-        for u, v, _key, attr in edges
+        for u, v, _key, attr in chronological_edges
     ]).float()
     return actual, expected_src, expected_dst, expected_t, expected_msg
 
 
 class TestTemporalDataFrozenEquivalence:
-    def test_temporal_data_src_dst_t_msg_match_frozen_reference(self, tmp_path):
+    def test_temporal_data_src_dst_t_msg_match_chronological_reference(self, tmp_path):
+        """TemporalData now outputs chronologically sorted events."""
         actual, src, dst, timestamps, msg = _temporal_data_case(tmp_path)
         assert torch.equal(actual.src, src)
         assert torch.equal(actual.dst, dst)
         assert torch.equal(actual.t, timestamps)
         assert torch.equal(actual.msg, msg)
 
-    def test_temporal_data_preserves_frozen_edge_order(self, tmp_path):
+    def test_temporal_data_preserves_chronological_order(self, tmp_path):
+        """TemporalData outputs events in chronological order."""
         actual, src, dst, timestamps, _msg = _temporal_data_case(tmp_path)
+        # Verify that the output is chronologically sorted (10, 20, 30)
+        assert actual.t.tolist() == [10, 20, 30]
+        # Verify alignment
         assert list(zip(actual.src.tolist(), actual.dst.tolist(), actual.t.tolist())) == list(
             zip(src.tolist(), dst.tolist(), timestamps.tolist())
         )

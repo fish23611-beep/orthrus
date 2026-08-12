@@ -17,6 +17,57 @@ from serialization_compat import load_trusted_torch_artifact
 # Helper functions
 # ---------------------------------------------------------------------------
 
+def _parse_edge_timestamp(edge_tuple, graph_path, file_name):
+    """
+    Parse timestamp from an edge tuple, with strict error handling.
+
+    Args:
+        edge_tuple: (u, v, k, attr) from MultiDiGraph.edges(data=True, keys=True)
+        graph_path: path to source graph (for error messages)
+        file_name: graph file name (for error messages)
+
+    Returns:
+        int: the timestamp as an integer
+
+    Raises:
+        ValueError: if time attribute is missing or cannot be converted
+    """
+    u, v, k, attr = edge_tuple
+    if "time" not in attr:
+        raise ValueError(
+            f"Edge (src={u}, dst={v}, key={k}) in graph {graph_path}/{file_name} "
+            f"is missing required 'time' attribute. All edges must have a valid "
+            f"integer timestamp."
+        )
+    try:
+        return int(attr["time"])
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"Edge (src={u}, dst={v}, key={k}) in graph {graph_path}/{file_name} "
+            f"has non-integer 'time' attribute: {attr['time']!r} (type={type(attr['time']).__name__}). "
+            f"Original error: {e}"
+        ) from e
+
+
+def _order_edges_chronologically(edges, graph_path, file_name):
+    """
+    Sort edges chronologically by their timestamp attribute.
+
+    Uses Python's stable sort to preserve relative order for equal timestamps.
+
+    Args:
+        edges: list of (u, v, k, attr) edge tuples from MultiDiGraph
+        graph_path: path to source graph (for error messages)
+        file_name: graph file name (for error messages)
+
+    Returns:
+        list: edges sorted by timestamp in non-decreasing order
+    """
+    def get_time(edge_tuple):
+        return _parse_edge_timestamp(edge_tuple, graph_path, file_name)
+
+    return sorted(edges, key=get_time)
+
 def cal_word_weight(n, percentage):
     """Calculate word weights with linear decline."""
     d = -1 / n * percentage / 100
@@ -105,15 +156,50 @@ def gen_relation_onehot(rel2id):
     return rel2vec
 
 
+def _validate_temporal_order(timestamps, graph_path, file_name):
+    """
+    Validate that timestamps are in non-decreasing order.
+
+    This is a production-level invariant check that must pass before any
+    TemporalData artifact is saved to disk.
+
+    Args:
+        timestamps: torch.Tensor of timestamps
+        graph_path: path to source graph (for error messages)
+        file_name: graph file name (for error messages)
+
+    Raises:
+        ValueError: if timestamps are not non-decreasing
+    """
+    if timestamps.numel() <= 1:
+        return
+
+    if not bool((timestamps[1:] >= timestamps[:-1]).all()):
+        # Find first inversion for detailed error message
+        diffs = (timestamps[1:] >= timestamps[:-1])
+        first_bad_idx = 0
+        while first_bad_idx < len(diffs) and bool(diffs[first_bad_idx]):
+            first_bad_idx += 1
+
+        t_before = timestamps[first_bad_idx].item()
+        t_after = timestamps[first_bad_idx + 1].item()
+
+        raise ValueError(
+            f"Timestamp monotonicity violation in {graph_path}/{file_name}: "
+            f"timestamps must be non-decreasing; found inversion at index {first_bad_idx}: "
+            f"t[{first_bad_idx}]={t_before} > t[{first_bad_idx + 1}]={t_after}"
+        )
+
+
 def gen_vectorized_graphs(indexid2vec, etype2oh, ntype2oh, split_files, out_dir, logger, cfg):
     """
     Generate vectorized graphs with pre-allocated tensors.
-    
+
     Memory optimization:
     - Pre-allocate tensors based on edge count
     - Avoid appending individual tensors to a list
     - Use atomic writes for safety
-    
+
     Args:
         indexid2vec: dict mapping index_id -> normalized vector
         etype2oh: edge type to one-hot encoding
@@ -125,7 +211,7 @@ def gen_vectorized_graphs(indexid2vec, etype2oh, ntype2oh, split_files, out_dir,
     """
     base_dir = cfg.graph_construction.build_graphs._graphs_dir
     sorted_paths = get_all_files_from_folders(base_dir, split_files)
-    
+
     os.makedirs(out_dir, exist_ok=True)
 
     for path in tqdm(sorted_paths, "Embedding edges"):
@@ -137,25 +223,30 @@ def gen_vectorized_graphs(indexid2vec, etype2oh, ntype2oh, split_files, out_dir,
         # PyTorch 2.6 compatibility while maintaining trust boundary.
         graph = load_trusted_torch_artifact(path, expected_type=nx.MultiDiGraph)
 
-        sorted_edges = list(graph.edges(data=True, keys=True))
-        num_edges = len(sorted_edges)
-        
+        raw_edges = list(graph.edges(data=True, keys=True))
+        num_edges = len(raw_edges)
+
         if num_edges == 0:
             continue
-        
+
+        # Sort edges chronologically by timestamp
+        # Variable named 'chronological_edges' to accurately reflect the sorting
+        chronological_edges = _order_edges_chronologically(raw_edges, base_dir, file)
+
         # Pre-allocate tensors based on edge count
         # This avoids creating num_edges individual Tensor objects
         dataset = TemporalData()
-        
-        # Create index tensors directly
-        src_indices = [int(u) for u, v, k, attr in sorted_edges]
-        dst_indices = [int(v) for u, v, k, attr in sorted_edges]
-        timestamps = [int(attr["time"]) for u, v, k, attr in sorted_edges]
-        
-        # Build message features by iterating edges
+
+        # Build all event fields from the same sorted edge list
+        # Using chronological_edges ensures src/dst/t/msg stay aligned
+        src_indices = [int(u) for u, v, k, attr in chronological_edges]
+        dst_indices = [int(v) for u, v, k, attr in chronological_edges]
+        timestamps = [int(attr["time"]) for u, v, k, attr in chronological_edges]
+
+        # Build message features by iterating edges (same chronological order)
         # Use list then tensor construction (can't fully pre-allocate due to varying token lengths)
         msg_features = []
-        for u, v, k, attr in sorted_edges:
+        for u, v, k, attr in chronological_edges:
             msg_features.append(torch.cat([
                 ntype2oh[graph.nodes[u]['node_type']],
                 torch.from_numpy(indexid2vec[int(u)]),
@@ -163,25 +254,31 @@ def gen_vectorized_graphs(indexid2vec, etype2oh, ntype2oh, split_files, out_dir,
                 ntype2oh[graph.nodes[v]['node_type']],
                 torch.from_numpy(indexid2vec[int(v)])
             ]))
-        
+
         # Final tensor stack - only happens once per graph
         dataset.src = torch.tensor(src_indices, dtype=torch.long)
         dataset.dst = torch.tensor(dst_indices, dtype=torch.long)
         dataset.t = torch.tensor(timestamps, dtype=torch.long)
         dataset.msg = torch.stack(msg_features).to(torch.float)
-        
+
+        # Validate temporal monotonicity BEFORE saving
+        # This catches any sorting errors immediately rather than failing later during training
+        _validate_temporal_order(dataset.t, base_dir, file)
+
         # Clean up intermediate data
         del msg_features
         del src_indices
         del dst_indices
         del timestamps
-        
+        del raw_edges
+        del chronological_edges
+
         # Atomic save
         out_path = os.path.join(out_dir, f"{file}.TemporalData.simple")
         temp_path = out_path + ".tmp"
         torch.save(dataset, temp_path)
         os.replace(temp_path, out_path)
-        
+
         # Release graph memory
         del graph
         del dataset
@@ -249,15 +346,29 @@ def main(cfg):
                           )
     
     # Publish the completion marker atomically after every split is saved.
+    # Invalidate any existing marker BEFORE starting (crash-safe behavior).
     edge_embeds_dir = cfg.edge_featurization.embed_edges._edge_embeds_dir
     marker_path = os.path.join(edge_embeds_dir, ".preprocess_embed_edges_complete")
     marker_tmp_path = marker_path + ".tmp"
+
+    # Delete existing marker if present (crash-safe: start fresh)
+    if os.path.exists(marker_path):
+        os.remove(marker_path)
+
+    # Write v2 marker only after all splits complete successfully
+    # v2 marker format: JSON with schema_version and temporal_order guarantees
+    import json
     from datetime import datetime, timezone
+    marker_data = {
+        "schema_version": 2,
+        "temporal_order": "nondecreasing",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
     with open(marker_tmp_path, 'w', encoding="utf-8") as f:
-        f.write(datetime.now(timezone.utc).isoformat())
+        json.dump(marker_data, f, indent=2)
     os.replace(marker_tmp_path, marker_path)
     log(f"Embed edges complete. Marker written: {marker_path}")
-    
+
     # Final cleanup
     del indexid2vec
     gc.collect()
