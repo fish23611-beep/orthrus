@@ -1,13 +1,13 @@
 from config import *
 from provnet_utils import *
 from collections import defaultdict
-import wandb
 import os
 import torch
 
 from .tracing_methods import (
     depimpact,
 )
+from wandb_control import wandb_log
 
 def get_new_stats(tw_to_info,
                   evaluation_results,
@@ -126,7 +126,7 @@ def main(cfg):
         log("==" * 20)
 
         # wandb.log(best_stats)
-        wandb.log(stats_traced)
+        wandb_log(stats_traced)
 
 
 if __name__ == "__main__":

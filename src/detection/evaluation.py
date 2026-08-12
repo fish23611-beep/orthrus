@@ -1,5 +1,4 @@
 import os
-import wandb
 import numpy as np
 from collections import defaultdict
 from pprint import pprint
@@ -8,6 +7,7 @@ from . import node_evaluation
 from data_utils import *
 from provnet_utils import log
 from .evaluation_utils import *
+from wandb_control import wandb_log, wandb_is_active
 
 
 def standard_evaluation(cfg, evaluation_fn):
@@ -48,25 +48,30 @@ def standard_evaluation(cfg, evaluation_fn):
         # Annotate epoch number for convenience
         stats["epoch"] = int(model_epoch_dir.split("_")[-1])
 
-        out_dir = cfg.detection.evaluation.node_evaluation._precision_recall_dir
-        stats["simple_scores_img"] = wandb.Image(
-            os.path.join(out_dir, f"simple_scores_{model_epoch_dir}.png")
-        )
+        # Only create W&B media objects when there is an active run.
+        # In disabled mode wandb.run is None and raw wandb.log would raise
+        # "You must call wandb.init() before wandb.log()".
+        if wandb_is_active():
+            import wandb as _wandb
+            out_dir = cfg.detection.evaluation.node_evaluation._precision_recall_dir
+            stats["simple_scores_img"] = _wandb.Image(
+                os.path.join(out_dir, f"simple_scores_{model_epoch_dir}.png")
+            )
 
-        scores_img = os.path.join(out_dir, f"scores_{model_epoch_dir}.png")
-        if os.path.exists(scores_img):
-            stats["scores_img"] = wandb.Image(scores_img)
+            scores_img = os.path.join(out_dir, f"scores_{model_epoch_dir}.png")
+            if os.path.exists(scores_img):
+                stats["scores_img"] = _wandb.Image(scores_img)
 
-        dor_img = os.path.join(out_dir, f"dor_{model_epoch_dir}.png")
-        if os.path.exists(dor_img):
-            stats["dor_img"] = wandb.Image(dor_img)
+            dor_img = os.path.join(out_dir, f"dor_{model_epoch_dir}.png")
+            if os.path.exists(dor_img):
+                stats["dor_img"] = _wandb.Image(dor_img)
 
-        pr_img = os.path.join(out_dir, f"pr_curve_{model_epoch_dir}.png")
-        if os.path.exists(pr_img):
-            stats["precision_recall_img"] = wandb.Image(pr_img)
+            pr_img = os.path.join(out_dir, f"pr_curve_{model_epoch_dir}.png")
+            if os.path.exists(pr_img):
+                stats["precision_recall_img"] = _wandb.Image(pr_img)
 
         # Log every epoch so the full history is visible in W&B
-        wandb.log(stats)
+        wandb_log(stats)
 
         epoch_results.append((model_epoch_dir, stats))
 
@@ -116,7 +121,7 @@ def standard_evaluation(cfg, evaluation_fn):
     log(f"Best epoch selected ({method}): {best_epoch_dir}  "
         f"val_mean_edge_loss={best_stats.get('val_mean_edge_loss', float('nan')):.6f}")
 
-    wandb.log(best_stats)
+    wandb_log(best_stats)
 
 
 def mstc_evaluation_main(val_tw_path, test_tw_path, model_epoch_dir, cfg, **kwargs):

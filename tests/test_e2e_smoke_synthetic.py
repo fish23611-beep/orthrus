@@ -136,7 +136,7 @@ def test_training_main_runs_batches_and_saves_each_epoch_checkpoint(
                 return_value=torch.device("cpu"),
             )
         )
-        stack.enter_context(patch.object(orthrus_gnn_training.wandb, "log"))
+        stack.enter_context(patch("wandb_control.wandb_log"))
         stack.enter_context(patch.object(orthrus_gnn_training, "log"))
         cuda_memory = stack.enter_context(
             patch.object(

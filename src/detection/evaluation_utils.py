@@ -7,7 +7,7 @@ from sklearn.metrics import (
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import re
-import wandb
+import wandb as _wandb
 
 from provnet_utils import *
 from data_utils import *
@@ -18,6 +18,7 @@ from sklearn.cluster import KMeans
 
 import labelling
 import torch
+from wandb_control import wandb_is_active as _wandb_is_active
 
 
 def get_threshold(val_tw_path, threshold_method: str):
@@ -648,7 +649,10 @@ def viz_graph(
     plt.close(fig)
 
     print(f"Graph {svg} saved, with attack nodes:\t {','.join([str(n) for n in source_nodes])}.")
-    return {out_file: wandb.Image(svg)}
+    # Only wrap in wandb.Image when there is an active W&B run.
+    if _wandb_is_active():
+        return {out_file: _wandb.Image(svg)}
+    return {}
 
 def compute_kmeans_labels(results, topk_K):
     nodes_to_score = sorted([(node_id, d["score"]) for node_id, d in results.items()], key=lambda x: x[1])

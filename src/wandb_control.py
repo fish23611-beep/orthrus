@@ -162,6 +162,30 @@ def init_wandb(
 # Safe log / finish wrappers
 # --------------------------------------------------------------------------- #
 
+def wandb_is_active() -> bool:
+    """
+    Check if there is an active W&B run.
+
+    Returns
+    -------
+    bool
+        True if wandb module is available AND there is an active run
+        (i.e., ``wandb.run is not None``).  Returns False in all other
+        cases including:
+        - wandb module not installed
+        - wandb.run is None (disabled or offline mode with no init)
+
+    This is the companion predicate for ``wandb_log`` / ``wandb_finish``.
+    Use it to gate expensive operations (e.g. creating W&B media objects)
+    that should only happen when telemetry will actually be uploaded.
+    """
+    try:
+        import wandb as _wandb
+        return _wandb.run is not None
+    except Exception:
+        return False
+
+
 def wandb_log(metrics: dict, **kwargs) -> None:
     """
     Log metrics to W&B if an active run exists.

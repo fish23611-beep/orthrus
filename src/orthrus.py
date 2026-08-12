@@ -44,7 +44,7 @@ from pipeline_stages import (
 from mstc.metadata_cache import export_metadata
 from artifact_paths import resolve_artifact_paths
 from run_metadata import dump_environment, dump_config, dump_runtime
-from wandb_control import resolve_wandb_mode, init_wandb, wandb_log, wandb_finish
+from wandb_control import resolve_wandb_mode, init_wandb, wandb_log, wandb_finish, wandb_is_active
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +491,7 @@ def main(cfg, args, **kwargs):
         log(f"{k}: {v} s" if not k.endswith("_mb") else f"{k}: {v} MB")
 
     log("==" * 30)
-    if wandb.run is not None:
+    if wandb_is_active():
         wandb_log(time_consumption)
 
     return time_consumption

@@ -2,7 +2,6 @@ import logging
 from time import perf_counter as timer
 
 import torch.nn as nn
-import wandb
 
 from encoders import OrthrusEncoder
 from model import MSTCOrthrus
@@ -10,6 +9,7 @@ from config import *
 from data_utils import *
 from factory import *
 from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime
+from wandb_control import wandb_log
 
 
 def train(data,
@@ -137,7 +137,7 @@ def main(cfg):
             peak_memory_mb = torch.cuda.max_memory_allocated(device=device) / (1024 ** 2)
             log(f'Peak CUDA memory usage Epoch {epoch}: {peak_memory_mb:.2f} MB')
 
-        wandb.log({
+        wandb_log({
             "train_epoch": epoch,
             "train_loss": round(tot_loss, 4),
             "peak_cuda_memory_GB": round(peak_memory_mb / 1024, 2) if peak_memory_mb is not None else None,
@@ -163,7 +163,7 @@ def main(cfg):
         "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
         "trainable_parameter_count": sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
     })
-    wandb.log({"train_epoch_time": round(np.mean(epoch_times), 2) if epoch_times else float("nan")})
+    wandb_log({"train_epoch_time": round(np.mean(epoch_times), 2) if epoch_times else float("nan")})
 
 
 if __name__ == "__main__":
