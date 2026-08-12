@@ -185,6 +185,7 @@ class TestDeterministicSelection:
     def test_same_limit_produces_same_selection(self, tmp_path):
         """Two calls with same limit must select the same files."""
         from data_utils import load_data_set
+        from serialization_compat import load_trusted_torch_artifact
 
         split_dir = tmp_path / "train"
         split_dir.mkdir()
@@ -195,7 +196,7 @@ class TestDeterministicSelection:
         cfg1 = MockCfg(max_windows_per_split=2)
         cfg2 = MockCfg(max_windows_per_split=2)
 
-        with patch("data_utils.load_trusted_torch_artifact"):
+        with patch("data_utils.load_trusted_torch_artifact", wraps=load_trusted_torch_artifact):
             result1 = load_data_set(cfg1, path=str(tmp_path), split="train")
             result2 = load_data_set(cfg2, path=str(tmp_path), split="train")
 
@@ -212,6 +213,7 @@ class TestIndependentSplitLimits:
     def test_each_split_respects_limit(self, tmp_path):
         """Each split (train/val/test) must respect the limit independently."""
         from data_utils import load_data_set
+        from serialization_compat import load_trusted_torch_artifact
 
         # Create 5 files in each split
         for split in ("train", "val", "test"):
@@ -223,7 +225,7 @@ class TestIndependentSplitLimits:
 
         cfg = MockCfg(max_windows_per_split=2)
 
-        with patch("data_utils.load_trusted_torch_artifact"):
+        with patch("data_utils.load_trusted_torch_artifact", wraps=load_trusted_torch_artifact):
             train = load_data_set(cfg, path=str(tmp_path), split="train")
             val = load_data_set(cfg, path=str(tmp_path), split="val")
             test = load_data_set(cfg, path=str(tmp_path), split="test")
@@ -428,6 +430,7 @@ class TestLogOutput:
     def test_log_prints_selected_count(self, capsys):
         """Log must show selected / available window count."""
         from data_utils import load_data_set
+        from serialization_compat import load_trusted_torch_artifact
 
         split_dir = Path(tempfile.mkdtemp()) / "train"
         split_dir.mkdir(parents=True)
@@ -436,7 +439,7 @@ class TestLogOutput:
             torch.save(td, split_dir / f"window_{i:02d}.TemporalData.simple")
 
         cfg = MockCfg(max_windows_per_split=2)
-        with patch("data_utils.load_trusted_torch_artifact"):
+        with patch("data_utils.load_trusted_torch_artifact", wraps=load_trusted_torch_artifact):
             load_data_set(cfg, path=str(split_dir.parent), split="train")
 
         captured = capsys.readouterr()
@@ -450,6 +453,7 @@ class TestLogOutput:
     def test_no_smoke_log_when_limit_is_none(self, capsys):
         """No bounded smoke log should appear when limit is None."""
         from data_utils import load_data_set
+        from serialization_compat import load_trusted_torch_artifact
 
         split_dir = Path(tempfile.mkdtemp()) / "train"
         split_dir.mkdir(parents=True)
@@ -458,13 +462,136 @@ class TestLogOutput:
             torch.save(td, split_dir / f"window_{i:02d}.TemporalData.simple")
 
         cfg = MockCfg(max_windows_per_split=None)
-        with patch("data_utils.load_trusted_torch_artifact"):
+        with patch("data_utils.load_trusted_torch_artifact", wraps=load_trusted_torch_artifact):
             load_data_set(cfg, path=str(split_dir.parent), split="train")
 
         captured = capsys.readouterr()
         assert "[Bounded smoke]" not in captured.out, (
             "No bounded smoke log should appear when limit is None"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Production collector filters smoke runs
+# ---------------------------------------------------------------------------
+
+class TestCollectorFiltersSmoke:
+    """Verify production collect_results.py filters smoke runs by default."""
+
+    def test_collect_excludes_smoke_runs_by_default(self, tmp_path):
+        """Default collect() must skip runs where runtime['is_smoke'] is True."""
+        import json
+        from experiments.collect_results import collect
+
+        # Create a smoke run structure
+        run_dir = tmp_path / "THEIA_E3" / "runs" / "smoke" / "seed_0"
+        run_dir.mkdir(parents=True)
+        (run_dir / "environment.json").write_text(json.dumps({"git_commit": "abc123", "model": "orthrus"}))
+        (run_dir / "runtime.json").write_text(json.dumps({"is_smoke": True, "training": {}, "testing": {}, "model": {}}))
+        (run_dir / "config_resolved.yml").write_text("model: {variant: test}\ndetection: {gnn_training: {encoder: {backbone: test}}}\ndataset_view: {mode: full}")
+        (run_dir / "node_scores").mkdir()
+        (run_dir / "node_scores" / "metrics.json").write_text(json.dumps({"Precision": 0.9, "Recall": 0.8, "F1": 0.85}))
+
+        # Create run_status marker pointing to smoke path
+        status_marker = tmp_path / "results" / "run_status" / "THEIA_E3" / "test" / "seed_0"
+        status_marker.parent.mkdir(parents=True)
+        status_marker.write_text(json.dumps({
+            "dataset": "THEIA_E3",
+            "config": str(tmp_path / "test.yml"),
+            "seed": 0,
+            "status": "completed",
+            "artifact_root": str(tmp_path),
+        }))
+
+        # Default: should skip smoke runs
+        rows = collect(tmp_path, include_smoke=False)
+        assert len(rows) == 0, f"Expected 0 rows (smoke filtered), got {len(rows)}"
+
+    def test_collect_includes_smoke_runs_when_requested(self, tmp_path):
+        """collect(include_smoke=True) must include smoke runs."""
+        import json
+        from experiments.collect_results import collect
+
+        # Create a smoke run structure with proper run_dir path
+        run_dir = tmp_path / "THEIA_E3" / "runs" / "smoke" / "seed_0"
+        run_dir.mkdir(parents=True)
+        (run_dir / "environment.json").write_text(json.dumps({"git_commit": "abc123", "model": "orthrus"}))
+        (run_dir / "runtime.json").write_text(json.dumps({"is_smoke": True, "training": {}, "testing": {}, "model": {}}))
+        (run_dir / "config_resolved.yml").write_text("model: {variant: test}\ndetection: {gnn_training: {encoder: {backbone: test}}}\ndataset_view: {mode: full}")
+        (run_dir / "node_scores").mkdir()
+        (run_dir / "node_scores" / "metrics.json").write_text(json.dumps({"Precision": 0.9, "Recall": 0.8, "F1": 0.85}))
+
+        # Create run_status marker pointing to the smoke run
+        # find_run_dir looks for scoped/dataset/runs/*/seed_<seed>
+        status_marker = tmp_path / "results" / "run_status" / "THEIA_E3" / "baseline_test" / "seed_0" / "run_status.json"
+        status_marker.parent.mkdir(parents=True)
+        status_marker.write_text(json.dumps({
+            "dataset": "THEIA_E3",
+            "config": str(tmp_path / "baseline.yml"),
+            "seed": 0,
+            "status": "completed",
+            "artifact_root": str(tmp_path),
+        }))
+
+        # With include_smoke=True: should include smoke runs
+        rows = collect(tmp_path, include_smoke=True)
+        assert len(rows) == 1, f"Expected 1 row (smoke included), got {len(rows)}: {rows}"
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Artifact path isolation between smoke and formal runs
+# ---------------------------------------------------------------------------
+
+class TestArtifactPathIsolation:
+    """Verify smoke and formal runs use isolated artifact paths."""
+
+    def test_smoke_runs_use_smoke_subdirectory(self, tmp_path):
+        """Smoke runs must be placed under a 'smoke/' subdirectory."""
+        from artifact_paths import resolve_run_dir
+
+        # Formal run path structure: <root>/<dataset>/runs/<model>/seed_<seed>
+        formal_path = resolve_run_dir(
+            tmp_path, dataset="THEIA_E3",
+            model_variant="orthrus_baseline", seed=0, is_smoke=False
+        )
+        formal_parts = formal_path.relative_to(tmp_path).parts
+        assert "smoke" not in formal_parts, f"Formal path should not contain 'smoke' dir: {formal_path}"
+
+        # Smoke run path structure: <root>/<dataset>/runs/<model>/smoke/seed_<seed>
+        smoke_path = resolve_run_dir(
+            tmp_path, dataset="THEIA_E3",
+            model_variant="orthrus_baseline", seed=0, is_smoke=True
+        )
+        smoke_parts = smoke_path.relative_to(tmp_path).parts
+        assert "smoke" in smoke_parts, f"Smoke path should contain 'smoke' dir: {smoke_path}"
+
+        # Paths must be different
+        assert formal_path != smoke_path, "Smoke and formal paths must differ"
+
+    def test_smoke_and_formal_paths_do_not_collide(self, tmp_path):
+        """Smoke and formal paths must not overlap."""
+        from artifact_paths import resolve_run_dir
+
+        formal_path = resolve_run_dir(
+            tmp_path, dataset="THEIA_E3",
+            model_variant="orthrus_baseline", seed=0, is_smoke=False
+        )
+        smoke_path = resolve_run_dir(
+            tmp_path, dataset="THEIA_E3",
+            model_variant="orthrus_baseline", seed=0, is_smoke=True
+        )
+
+        # Smoke path should be under a subdirectory that formal path doesn't use
+        smoke_parent = smoke_path.parent
+        formal_name = formal_path.name
+        smoke_name = smoke_path.name
+
+        # Same seed name (seed_0)
+        assert formal_name == smoke_name == "seed_0"
+        # But parents differ: formal has no smoke/ intermediate dir
+        assert smoke_parent != formal_path
+        assert formal_path not in smoke_path.parents
+        assert smoke_path not in formal_path.parents
 
 
 if __name__ == "__main__":
