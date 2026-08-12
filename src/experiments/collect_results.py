@@ -41,10 +41,23 @@ def num(value: Any) -> float:
  try: return float(value)
  except (TypeError,ValueError): return nan()
 def find_run_dir(scoped: Path, dataset: str, seed: int) -> Path|None:
- candidates=sorted((scoped/dataset/"runs").glob(f"*/seed_{seed}"))
+ # Look for seed_<seed> directories at any depth under scoped/dataset/runs/
+ # This handles both formal runs (<root>/runs/<model>/seed_<N>)
+ # and smoke runs (<root>/runs/<model>/smoke/seed_<N>)
+ candidates=sorted((scoped/dataset/"runs").glob(f"**/seed_{seed}"))
  return candidates[0] if len(candidates)==1 else None
 def marker_paths(root: Path): return sorted((root/"results"/"run_status").glob("**/run_status.json"))
-def collect(artifact_root: Path) -> list[dict]:
+def collect(artifact_root: Path, *, include_smoke: bool = False) -> list[dict]:
+ """Collect run metadata into rows.
+
+ Parameters
+ ----------
+ artifact_root:
+  Root directory containing run artifacts.
+ include_smoke:
+  If False (default), skip runs where runtime["is_smoke"] is True.
+  Set to True when explicitly collecting smoke results.
+ """
  rows=[]; seen={}
  for marker in marker_paths(artifact_root):
   status, error=read_json(marker)
@@ -71,6 +84,9 @@ def collect(artifact_root: Path) -> list[dict]:
     row["status"]="incomplete"; row["collection_error"]="completed marker has no unique run directory"
    else:
     env,eerr=read_json(run_dir/"environment.json"); runtime,rerr=read_json(run_dir/"runtime.json"); cfg,cerr=read_yaml(run_dir/"config_resolved.yml"); metrics,merr=read_json(run_dir/"node_scores"/"metrics.json")
+    # Skip smoke runs when include_smoke is False (default)
+    if not include_smoke and runtime and runtime.get("is_smoke", False):
+     continue
     errors=[e for e in (eerr if eerr not in (None,"missing") else None,cerr if cerr not in (None,"missing") else None) if e]
     if env: row["git_commit"]=env.get("git_commit","") or ""; row["model_variant"]=env.get("model","") or ""; row["experiment"]=env.get("experiment_name") or row["experiment"]
     if cfg:
@@ -98,6 +114,13 @@ def write_csv(path: Path, rows: list[dict]) -> None:
   writer=csv.DictWriter(f,fieldnames=FIELDS,extrasaction="ignore"); writer.writeheader(); writer.writerows(rows); temp=Path(f.name)
  os.replace(temp,path)
 def main(argv: Sequence[str]|None=None) -> Path:
- parser=argparse.ArgumentParser(description="Collect C8 matrix results into all_runs.csv."); parser.add_argument("--artifact-root",required=True); parser.add_argument("--output",default=None); args=parser.parse_args(argv)
- root=Path(args.artifact_root).expanduser().resolve(); output=Path(args.output).expanduser().resolve() if args.output else root/"results"/"all_runs.csv"; write_csv(output,collect(root)); return output
+ parser=argparse.ArgumentParser(description="Collect C8 matrix results into all_runs.csv.")
+ parser.add_argument("--artifact-root",required=True)
+ parser.add_argument("--output",default=None)
+ parser.add_argument("--include-smoke",action="store_true",help="Include smoke runs in the output (default: skip them)")
+ args=parser.parse_args(argv)
+ root=Path(args.artifact_root).expanduser().resolve()
+ output=Path(args.output).expanduser().resolve() if args.output else root/"results"/"all_runs.csv"
+ write_csv(output,collect(root,include_smoke=args.include_smoke))
+ return output
 if __name__=="__main__": print(main())

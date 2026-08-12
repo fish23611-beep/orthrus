@@ -172,11 +172,20 @@ def resolve_run_dir(
     dataset: str,
     model_variant: str,
     seed: int,
+    *,
+    is_smoke: bool = False,
 ) -> Path:
     """
     Build the run directory path::
 
         <artifact_root>/<dataset>/runs/<model_variant>/seed_<seed>/
+
+    When ``is_smoke=True``, smoke runs are isolated in a "smoke" subdirectory::
+
+        <artifact_root>/<dataset>/runs/<model_variant>/smoke/seed_<seed>/
+
+    This prevents bounded-smoke test artifacts from overwriting formal experiment
+    artifacts when both use the same dataset/model_variant/seed identity.
 
     Parameters
     ----------
@@ -188,6 +197,9 @@ def resolve_run_dir(
         Non-empty str model variant name.  MagicMock / None / empty → ``ValueError``.
     seed:
         Integer seed.  MagicMock / None / non-int / bool → ``ValueError``.
+    is_smoke:
+        If True, place smoke runs under a "smoke/" subdirectory for isolation.
+        Defaults to False (formal run path).
 
     Returns
     -------
@@ -202,8 +214,10 @@ def resolve_run_dir(
         dataset_s,
         "runs",
         model_s,
-        f"seed_{seed_i}",
     ]
+    if is_smoke:
+        parts.append("smoke")
+    parts.append(f"seed_{seed_i}")
     return artifact_root.joinpath(*parts)
 
 
@@ -365,11 +379,13 @@ def resolve_artifact_paths(
     # 2. Resolve run dir (strict inputs; raises ValueError for MagicMock etc.)
     if run_dir is None:
         fields = extract_cfg_fields(cfg)
+        is_smoke = getattr(cfg, "_is_smoke", False)
         run_dir = resolve_run_dir(
             artifact_root,
             dataset=fields.dataset,
             model_variant=fields.model_variant,
             seed=fields.seed,
+            is_smoke=is_smoke,
         )
     else:
         run_dir = run_dir.expanduser().resolve()
