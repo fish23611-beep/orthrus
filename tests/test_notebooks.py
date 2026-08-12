@@ -31,8 +31,8 @@ ENTRYPOINTS = (
     "src/experiments/export_tables.py",
 )
 MASTER_NOTEBOOK_NAME = "ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb"
-REQUIRED_REPOSITORY_REF = "fix/c8-temporal-loader-metadata"
-REQUIRED_EXPECTED_COMMIT = "206c28fbd52bc55b5f8132da97a42c77bc2a809f"
+REQUIRED_REPOSITORY_REF = "fix/c8-wandb-safe-logging"
+REQUIRED_EXPECTED_COMMIT = "485f8dd6c002c34924c97d9fbbff4e97e5c4476e"
 
 
 def _read_notebook(path: Path):
