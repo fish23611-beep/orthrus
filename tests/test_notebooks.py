@@ -31,7 +31,8 @@ ENTRYPOINTS = (
     "src/experiments/export_tables.py",
 )
 MASTER_NOTEBOOK_NAME = "ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb"
-REQUIRED_REPOSITORY_REF = "fix/c8-preprocess-correctness"
+REQUIRED_REPOSITORY_REF = "fix/c8-temporal-loader-metadata"
+REQUIRED_EXPECTED_COMMIT = "206c28fbd52bc55b5f8132da97a42c77bc2a809f"
 
 
 def _read_notebook(path: Path):
@@ -142,19 +143,19 @@ def test_master_notebook_has_required_cells():
 
     # Check for key section markers in markdown cells
     required_sections = [
-        "Unified parameters",
+        "Unified Parameters",
         "Mount Drive",
-        "repository ref",
-        "Resource preflight",
-        "Install Python dependencies",
-        "environment record",
-        "persistent artifacts",
+        "Repository Ref",
+        "Resource Preflight",
+        "Install Python Dependencies",
+        "Environment Record",
+        "Persistent Artifacts",
         "PostgreSQL",
-        "Restartable preprocessing",
+        "Restartable Preprocessing",
         "Baseline Smoke",
-        "主模型矩阵",
-        "消融",
-        "结果收集",
+        "Main Model Matrix",
+        "Ablations",
+        "Result Collection",
     ]
 
     for section in required_sections:
@@ -172,6 +173,7 @@ def test_master_notebook_uses_one_coherent_frozen_ref_mechanism():
     assert "actual_commit" in source
     assert "Commit mismatch" in source
     assert "git describe --tags --exact-match" not in source
+    assert REQUIRED_EXPECTED_COMMIT in source
 
 
 def test_master_notebook_references_all_entrypoints():
@@ -268,6 +270,16 @@ def test_master_notebook_no_todo_placeholder():
         if cell.get("cell_type") == "code":
             assert cell.get("outputs", []) == [], MASTER_NOTEBOOK_NAME
             assert cell.get("execution_count") is None, MASTER_NOTEBOOK_NAME
+
+
+def test_master_notebook_is_english_only():
+    """AllInOne cell source must contain no CJK characters."""
+    master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
+    notebook = _read_notebook(master_path)
+    source = _source(notebook)
+    cjk_chars = [c for c in source if "\u4e00" <= c <= "\u9fff"]
+    assert len(cjk_chars) == 0, \
+        f"Master Notebook contains {len(cjk_chars)} CJK characters"
 
 
 def test_master_notebook_no_secrets_or_paths():
