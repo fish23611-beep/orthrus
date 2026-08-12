@@ -966,3 +966,39 @@ def test_c8_original_loader_behavior_preserved():
     # Batch 3: event 4
     assert torch.equal(batches[2].src, torch.tensor([4]))
     assert torch.equal(batches[2].global_event_index, torch.tensor([14], dtype=torch.long))
+
+
+def test_c8_0d_tensor_window_metadata_passed_through():
+    """
+    Test H (0-d Tensor boundary): A 0-d torch.Tensor attached as window metadata
+    (e.g. ``g.some_scalar = torch.tensor(7)``) must be treated as window-level
+    static metadata and re-attached unchanged to every batch — it must NOT
+    enter PyG's index_select path (which would call size(0) and raise TypeError).
+    """
+    E = 4
+    g = _make_temporal_window_with_metadata(
+        src=torch.tensor([0, 1, 2, 3]),
+        dst=torch.tensor([1, 2, 3, 0]),
+        t=torch.tensor([0, 10, 20, 30], dtype=torch.long),
+        split_val=0,
+        split_name_str="train",
+        window_id_val=3,
+    )
+    # Attach 0-d Tensor as window metadata
+    g.some_scalar = torch.tensor(7)
+    g.another_flag = torch.tensor(True)
+
+    loader = custom_temporal_data_loader(g, batch_size=2)
+    batches = list(loader)
+
+    assert len(batches) == 2
+    for batch in batches:
+        # Value is preserved (as Tensor or Python scalar — PyG stores tensors as-is)
+        scalar = batch.some_scalar
+        assert (scalar if isinstance(scalar, torch.Tensor) else torch.tensor(scalar)).item() == 7
+        flag = batch.another_flag
+        assert (flag if isinstance(flag, torch.Tensor) else torch.tensor(flag)).item() == True
+        # Original window metadata also preserved
+        assert batch.split == 0
+        assert batch.split_name == "train"
+        assert batch.window_id == 3

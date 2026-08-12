@@ -528,27 +528,11 @@ def custom_temporal_data_loader(data: TemporalData, batch_size: int, *args, **kw
     loader = TemporalDataLoader(loader_safe_data, batch_size=batch_size, *args, **kwargs)
 
     for batch in loader:
-        # PyG's index_select stores the node index used to slice each attribute
-        # as ``_idx`` on the resulting TemporalData.
-        batch_idx = batch._idx if hasattr(batch, "_idx") else None
-
         # ------------------------------------------------------------------
-        # 4. Restore window-level metadata onto the batch.
+        # 4. Restore window-level metadata onto the batch unchanged.
         # ------------------------------------------------------------------
         for key, value in window_metadata.items():
-            if batch_idx is not None:
-                # Preserve list/array metadata by slicing to batch size.
-                if isinstance(value, (list, tuple)):
-                    batch[key] = list(value[: len(batch_idx)])
-                elif hasattr(value, "__getitem__"):
-                    # numpy array or similar array-like object
-                    batch[key] = value[: len(batch_idx)]
-                else:
-                    # Scalar: int, str, Path, or 0-d Tensor — re-attach unchanged.
-                    batch[key] = value
-            else:
-                # Fallback for degenerate (zero-event) windows.
-                batch[key] = value
+            batch[key] = value
 
         # ------------------------------------------------------------------
         # 5. Reconstruct edge_index from batched src/dst (PyG convention).
