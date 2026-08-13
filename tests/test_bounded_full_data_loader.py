@@ -193,6 +193,9 @@ def test_loader_does_not_touch_database_and_reports_phase_rss(tmp_path):
     # Verify history_access telemetry is populated
     assert "history_access" in telemetry
     history = telemetry["history_access"]
-    assert history["architecture"] == "compact_history_random_access"
+    # architecture name may carry an implementation version suffix
+    assert history["architecture"].startswith("compact_history_random_access")
     assert "index_build_seconds" in history
     assert "compact_bytes" in history
+    assert "source_artifact_scan_count" in history
+    assert "fallback_full_window_load_count" in history
