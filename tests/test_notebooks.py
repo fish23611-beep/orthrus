@@ -31,8 +31,8 @@ ENTRYPOINTS = (
     "src/experiments/export_tables.py",
 )
 MASTER_NOTEBOOK_NAME = "ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb"
-REQUIRED_REPOSITORY_REF = "fix/c8-ground-truth-metadata"
-REQUIRED_EXPECTED_COMMIT = "59d9b8c448f787dd9d37eb025498016aeee7b214"
+REQUIRED_REPOSITORY_REF = "fix/c8-tw-label-torch-load-compat"
+REQUIRED_EXPECTED_COMMIT = "e69bab748d39fee3e6760291e200597fae2f2fff"
 REQUIRED_SUBMODULE_UPDATE = 'git("submodule", "update", "--init", "--recursive")'
 
 
