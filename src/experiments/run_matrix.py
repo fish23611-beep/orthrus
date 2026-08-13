@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import traceback
@@ -23,6 +24,7 @@ if str(SRC_ROOT) not in sys.path:
 from artifact_paths import resolve_artifact_root
 from experiments import run_experiment
 from mstc.experiment_utils import _atomic_json
+_ORIGINAL_RUN_EXPERIMENT_MAIN = run_experiment.main
 
 
 _COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -184,8 +186,32 @@ def _run_argv(dataset: str, config: Path, seed: int, artifact_root: Path, stages
     return argv
 
 
+class ChildRunError(RuntimeError):
+    """A production run_experiment subprocess returned unsuccessfully."""
+
+    def __init__(self, returncode: int):
+        self.returncode = int(returncode)
+        self.signal = -self.returncode if self.returncode < 0 else None
+        if self.signal is not None:
+            try:
+                signal_name = signal.Signals(self.signal).name
+            except ValueError:
+                signal_name = f"signal {self.signal}"
+            message = f"run_experiment child terminated by {signal_name} ({self.signal})"
+        else:
+            message = f"run_experiment child exited with return code {self.returncode}"
+        super().__init__(message)
+
+
+def _production_runner(argv: Sequence[str]) -> subprocess.CompletedProcess:
+    """Run one matrix identity in a fresh interpreter for OS-level cleanup."""
+    command = [sys.executable, str(SRC_ROOT / "experiments" / "run_experiment.py"), *argv]
+    return subprocess.run(command, cwd=SRC_ROOT.parent, check=False)
+
+
 def _record_failure(status_path: Path, dataset: str, config: Path, seed: int, scoped_root: Path,
-                    exc: BaseException, *, exit_code: int | None = None) -> Path:
+                    exc: BaseException, *, returncode: int | None = None,
+                    status_extra: dict | None = None) -> Path:
     failure_path = status_path.with_name("failure.json")
     failure = {
         "dataset": dataset,
@@ -197,21 +223,46 @@ def _record_failure(status_path: Path, dataset: str, config: Path, seed: int, sc
         "timestamp": _utc_now(),
         "git_commit": _git_commit(),
     }
-    if exit_code is not None:
-        failure["exit_code"] = exit_code
+    if returncode is not None:
+        failure["returncode"] = int(returncode)
+        failure["exit_code"] = int(returncode)
+        signal_number = -int(returncode) if int(returncode) < 0 else None
+        failure["signal"] = signal_number
+        if signal_number is not None:
+            try:
+                failure["signal_name"] = signal.Signals(signal_number).name
+            except ValueError:
+                failure["signal_name"] = None
     _atomic_json(failure_path, failure)
     _atomic_json(status_path, _status_payload(
         dataset, config, seed, "failed", scoped_root=scoped_root,
-        failure_path=str(failure_path),
+        failure_path=str(failure_path), **(status_extra or {}),
     ))
     return failure_path
+
+
+def _matching_stale_running(payload: dict | None, dataset: str, config: Path, seed: int) -> bool:
+    return bool(
+        payload
+        and payload.get("status") == "running"
+        and payload.get("dataset") == dataset
+        and payload.get("config") == str(config)
+        and payload.get("seed") == seed
+    )
 
 
 def run_matrix(datasets: Sequence[str], configs: Sequence[Path], seeds: Sequence[int], *,
                artifact_root: Path, stages: str | None = None, force: bool = False,
                runner: Callable[[Sequence[str] | None], object] | None = None) -> MatrixSummary:
-    """Execute a stable dataset → config → seed matrix with per-run isolation."""
-    invoke = runner or run_experiment.main
+    """Execute a stable dataset → config → seed matrix with process isolation."""
+    # Explicit injection stays in-process.  The identity check also preserves
+    # legacy tests/integrations that monkeypatch run_experiment.main.
+    if runner is not None:
+        invoke = runner
+    elif run_experiment.main is not _ORIGINAL_RUN_EXPERIMENT_MAIN:
+        invoke = run_experiment.main
+    else:
+        invoke = _production_runner
     records: list[dict] = []
 
     for dataset in datasets:
@@ -226,20 +277,40 @@ def run_matrix(datasets: Sequence[str], configs: Sequence[Path], seeds: Sequence
                     "status": "running",
                     "artifact_root": str(scoped_root),
                     "failure_path": None,
+                    "stale_running_recovered": False,
                 }
                 if not force and is_completed(artifact_root, dataset, config, seed):
                     record["status"] = "skipped"
                     records.append(record)
                     continue
 
+                previous = _read_json(status_path)
+                stale_running = _matching_stale_running(previous, dataset, config, seed)
+                status_extra = {}
+                if stale_running:
+                    record["stale_running_recovered"] = True
+                    status_extra = {
+                        "stale_running_recovered": True,
+                        "previous_running_timestamp": previous.get("timestamp"),
+                    }
+                    _atomic_json(status_path, _status_payload(
+                        dataset, config, seed, "interrupted", scoped_root=scoped_root,
+                        interruption_reason="stale running marker recovered on scheduler startup",
+                        **status_extra,
+                    ))
+
                 _atomic_json(status_path, _status_payload(
-                    dataset, config, seed, "running", scoped_root=scoped_root,
+                    dataset, config, seed, "running", scoped_root=scoped_root, **status_extra,
                 ))
                 try:
-                    invoke(_run_argv(dataset, config, seed, scoped_root, stages))
+                    result = invoke(_run_argv(dataset, config, seed, scoped_root, stages))
+                    returncode = getattr(result, "returncode", 0)
+                    if returncode:
+                        raise ChildRunError(returncode)
                 except KeyboardInterrupt:
                     _atomic_json(status_path, _status_payload(
                         dataset, config, seed, "interrupted", scoped_root=scoped_root,
+                        **status_extra,
                     ))
                     raise
                 except SystemExit as exc:
@@ -248,21 +319,34 @@ def run_matrix(datasets: Sequence[str], configs: Sequence[Path], seeds: Sequence
                         record["status"] = "completed"
                         _atomic_json(status_path, _status_payload(
                             dataset, config, seed, "completed", scoped_root=scoped_root,
+                            **status_extra,
                         ))
                     else:
                         failure_path = _record_failure(
-                            status_path, dataset, config, seed, scoped_root, exc, exit_code=code,
+                            status_path, dataset, config, seed, scoped_root, exc,
+                            returncode=code, status_extra=status_extra,
                         )
                         record["status"] = "failed"
                         record["failure_path"] = str(failure_path)
+                except ChildRunError as exc:
+                    failure_path = _record_failure(
+                        status_path, dataset, config, seed, scoped_root, exc,
+                        returncode=exc.returncode, status_extra=status_extra,
+                    )
+                    record["status"] = "failed"
+                    record["failure_path"] = str(failure_path)
                 except Exception as exc:
-                    failure_path = _record_failure(status_path, dataset, config, seed, scoped_root, exc)
+                    failure_path = _record_failure(
+                        status_path, dataset, config, seed, scoped_root, exc,
+                        status_extra=status_extra,
+                    )
                     record["status"] = "failed"
                     record["failure_path"] = str(failure_path)
                 else:
                     record["status"] = "completed"
                     _atomic_json(status_path, _status_payload(
                         dataset, config, seed, "completed", scoped_root=scoped_root,
+                        **status_extra,
                     ))
                 records.append(record)
 

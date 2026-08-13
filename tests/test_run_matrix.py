@@ -184,3 +184,72 @@ def test_force_reruns_completed_identity(tmp_path, monkeypatch):
     summary = run_matrix.main(args(root, [c1], extra=("--force",)))
 
     assert len(calls) == 1 and summary.completed == 1 and summary.skipped == 0
+
+
+def test_production_default_uses_fresh_python_subprocess(tmp_path, monkeypatch):
+    c1 = config(tmp_path, "c1.yml").resolve()
+    calls = []
+
+    def fake_subprocess_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return run_matrix.subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(run_matrix.subprocess, "run", fake_subprocess_run)
+    summary = run_matrix.run_matrix(
+        ["THEIA_E3"], [c1], [0], artifact_root=tmp_path / "artifacts"
+    )
+
+    assert summary.completed == 1
+    command, kwargs = calls[0]
+    assert command[0] == sys.executable
+    assert Path(command[1]).name == "run_experiment.py"
+    assert kwargs["check"] is False
+
+
+def test_child_sigkill_records_returncode_signal_and_failed_status(tmp_path):
+    c1 = config(tmp_path, "c1.yml").resolve()
+    root = tmp_path / "artifacts"
+
+    def killed(_argv):
+        return run_matrix.subprocess.CompletedProcess([], -9)
+
+    summary = run_matrix.run_matrix(
+        ["THEIA_E3"], [c1], [0], artifact_root=root, runner=killed
+    )
+
+    assert summary.failed == 1
+    failure = json.loads(Path(summary.runs[0]["failure_path"]).read_text(encoding="utf-8"))
+    assert failure["returncode"] == -9
+    assert failure["signal"] == 9
+    assert failure["signal_name"] == "SIGKILL"
+    status = json.loads(
+        run_matrix.run_status_path(root, "THEIA_E3", c1, 0).read_text(encoding="utf-8")
+    )
+    assert status["status"] == "failed"
+
+
+def test_matching_stale_running_is_recovered_and_safely_rerun(tmp_path):
+    c1 = config(tmp_path, "c1.yml").resolve()
+    root = tmp_path / "artifacts"
+    status_path = run_matrix.run_status_path(root, "THEIA_E3", c1, 0)
+    run_matrix._atomic_json(
+        status_path,
+        run_matrix._status_payload(
+            "THEIA_E3", c1, 0, "running",
+            scoped_root=run_matrix.run_artifact_root(root, c1),
+        ),
+    )
+    calls = []
+
+    summary = run_matrix.run_matrix(
+        ["THEIA_E3"], [c1], [0], artifact_root=root,
+        runner=lambda argv: calls.append(argv),
+    )
+
+    assert len(calls) == 1
+    assert summary.completed == 1
+    assert summary.runs[0]["stale_running_recovered"] is True
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "completed"
+    assert status["stale_running_recovered"] is True
+    assert status["previous_running_timestamp"] is not None
