@@ -153,8 +153,9 @@ class _LazyEventField:
         return self._owner.num_events
 
     @property
-    def shape(self) -> tuple[int]:
-        return (self._owner.num_events,)
+    def shape(self) -> tuple[int, ...]:
+        trailing_shape, _ = self._owner.field_metadata(self._field)
+        return (self._owner.num_events, *trailing_shape)
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -177,7 +178,9 @@ class BoundedFullData:
     }
 
     def __init__(self, cfg, specs: Sequence[_WindowSpec], *, view_mode: str, max_node: int,
-                 telemetry: _LoaderTelemetry, cache_windows: int = 1):
+                 telemetry: _LoaderTelemetry,
+                 field_metadata: dict[str, tuple[tuple[int, ...], torch.dtype]],
+                 cache_windows: int = 1):
         if cache_windows <= 0:
             raise ValueError("cache_windows must be positive")
         self._cfg = cfg
@@ -188,6 +191,7 @@ class BoundedFullData:
         self._cache: OrderedDict[int, TemporalData] = OrderedDict()
         self.max_node = int(max_node)
         self.num_events = sum(spec.num_events for spec in self._specs)
+        self._field_metadata = dict(field_metadata)
         self.loader_telemetry = telemetry.as_dict()
         for field in self._WINDOW_FIELDS | self._DERIVED_FIELDS | set(self._ALIASES):
             setattr(self, field, _LazyEventField(self, field))
@@ -198,6 +202,15 @@ class BoundedFullData:
 
     def release_cache(self) -> None:
         self._cache.clear()
+
+    def field_metadata(self, field: str) -> tuple[tuple[int, ...], torch.dtype]:
+        field = self._ALIASES.get(field, field)
+        if field in self._DERIVED_FIELDS:
+            return (), torch.long
+        try:
+            return self._field_metadata[field]
+        except KeyError as exc:
+            raise AttributeError(f"Unknown full_data field {field!r}") from exc
 
     def _window_for_event(self, event_id: int) -> int:
         if event_id < 0 or event_id >= self.num_events:
@@ -228,7 +241,8 @@ class BoundedFullData:
         original_shape = tuple(ids.shape)
         flat_ids = ids.reshape(-1)
         if flat_ids.numel() == 0:
-            return torch.empty(original_shape, dtype=torch.long)
+            trailing_shape, dtype = self.field_metadata(field)
+            return torch.empty((*original_shape, *trailing_shape), dtype=dtype)
         if field == "global_event_index":
             return flat_ids.clone().reshape(original_shape)
 
@@ -513,6 +527,7 @@ def _scan_lazy_collections(cfg, collections, telemetry):
     """Build exact global offsets while retaining at most one scanned window."""
     scanned_by_split = []
     all_specs = []
+    field_metadata = {}
     global_offset = 0
     global_window_id = 0
     max_node = -1
@@ -524,6 +539,17 @@ def _scan_lazy_collections(cfg, collections, telemetry):
             num_events = int(data.src.numel())
             if num_events:
                 max_node = max(max_node, int(data.src.max()), int(data.dst.max()))
+            for field in BoundedFullData._WINDOW_FIELDS:
+                value = getattr(data, field, None)
+                if not isinstance(value, torch.Tensor):
+                    continue
+                metadata = (tuple(value.shape[1:]), value.dtype)
+                previous = field_metadata.setdefault(field, metadata)
+                if previous != metadata:
+                    raise ValueError(
+                        f"Inconsistent {field} metadata: {previous} != {metadata} "
+                        f"in {base_spec.path}"
+                    )
             spec = _WindowSpec(
                 path=base_spec.path,
                 split_name=base_spec.split_name,
@@ -540,7 +566,12 @@ def _scan_lazy_collections(cfg, collections, telemetry):
             telemetry.observe("window scan peak", emit=False)
             del data
         scanned_by_split.append(collection.with_specs(split_specs))
-    return (*scanned_by_split, tuple(all_specs), max_node + 1 if max_node >= 0 else 0)
+    return (
+        *scanned_by_split,
+        tuple(all_specs),
+        max_node + 1 if max_node >= 0 else 0,
+        field_metadata,
+    )
 
 
 def load_all_datasets(cfg):
@@ -572,15 +603,15 @@ def load_all_datasets(cfg):
 
     view_mode = cfg.dataset_view.mode
     collections = tuple(data.with_view(view_mode) for data in (train_data, val_data, test_data))
-    train_data, val_data, test_data, all_specs, max_node = _scan_lazy_collections(
-        cfg, collections, telemetry,
-    )
+    (train_data, val_data, test_data, all_specs, max_node,
+     field_metadata) = _scan_lazy_collections(cfg, collections, telemetry)
     full_data = BoundedFullData(
         cfg,
         all_specs,
         view_mode=view_mode,
         max_node=max_node,
         telemetry=telemetry,
+        field_metadata=field_metadata,
         cache_windows=1,
     )
     telemetry.observe("after global metadata construction")

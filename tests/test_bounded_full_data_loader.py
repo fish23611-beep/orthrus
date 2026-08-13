@@ -133,6 +133,19 @@ def test_lazy_full_data_matches_eager_reference_for_every_event_field(tmp_path):
     assert torch.equal(actual_offsets, expected_offsets)
 
 
+def test_empty_history_lookup_preserves_eager_shape_and_dtype(tmp_path):
+    _artifacts(tmp_path, counts=(1, 1, 1))
+    _, _, _, full, _ = data_utils.load_all_datasets(_cfg(tmp_path))
+    empty_ids = torch.empty(0, dtype=torch.long)
+
+    empty_edge_type = full.get_event_values("edge_type", empty_ids)
+    empty_msg = full.get_event_values("msg", empty_ids)
+    assert empty_edge_type.shape == (0, 4)
+    assert empty_edge_type.dtype == torch.float32
+    assert empty_msg.shape == (0, 10)
+    assert full.edge_type.shape == (full.num_events, 4)
+
+
 def test_collection_releases_yielded_window_and_full_data_cache_is_fixed(tmp_path):
     _artifacts(tmp_path)
     train, _, _, full, _ = data_utils.load_all_datasets(_cfg(tmp_path))
