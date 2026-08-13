@@ -31,8 +31,9 @@ ENTRYPOINTS = (
     "src/experiments/export_tables.py",
 )
 MASTER_NOTEBOOK_NAME = "ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb"
-REQUIRED_REPOSITORY_REF = "fix/c8-wandb-safe-logging"
-REQUIRED_EXPECTED_COMMIT = "485f8dd6c002c34924c97d9fbbff4e97e5c4476e"
+REQUIRED_REPOSITORY_REF = "fix/c8-ground-truth-metadata"
+REQUIRED_EXPECTED_COMMIT = "59d9b8c448f787dd9d37eb025498016aeee7b214"
+REQUIRED_SUBMODULE_UPDATE = 'git("submodule", "update", "--init", "--recursive")'
 
 
 def _read_notebook(path: Path):
@@ -174,6 +175,7 @@ def test_master_notebook_uses_one_coherent_frozen_ref_mechanism():
     assert "Commit mismatch" in source
     assert "git describe --tags --exact-match" not in source
     assert REQUIRED_EXPECTED_COMMIT in source
+    assert REQUIRED_SUBMODULE_UPDATE in source
 
 
 def test_master_notebook_references_all_entrypoints():
