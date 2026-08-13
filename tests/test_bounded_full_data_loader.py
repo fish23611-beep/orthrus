@@ -185,4 +185,3 @@ def test_loader_does_not_touch_database_and_reports_phase_rss(tmp_path):
         "after global metadata construction",
         "before model construction",
     ]
-
