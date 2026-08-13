@@ -17,7 +17,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import networkx as nx
 import pytest
+import torch
 
 # Add src to path
 src_dir = str(Path(__file__).resolve().parents[1] / "src")
@@ -513,28 +515,101 @@ class TestCacheSemanticSeparation:
             ),
             pipeline=SimpleNamespace(mode="detection_only"),
         )
-        graph_paths = ["tw-0", "tw-1"]
-        bounds = {
-            "tw-0": (ns_2025, ns_2025 + 100),
-            "tw-1": (ns_2025 + 100, ns_2025 + 200),
-        }
+        graph_dir = tmp_path / "graphs"
+        graph_dir.mkdir()
+        graph_paths = [graph_dir / "tw-0.pt", graph_dir / "tw-1.pt"]
+        graph_0 = nx.MultiDiGraph()
+        graph_0.add_edge(0, 1, time=ns_2025)
+        graph_0.add_edge(1, 2, time=ns_2025 + 100)
+        graph_1 = nx.MultiDiGraph()
+        graph_1.add_edge(2, 3, time=ns_2025 + 100)
+        graph_1.add_edge(3, 4, time=ns_2025 + 200)
+        torch.save(graph_0, graph_paths[0])
+        torch.save(graph_1, graph_paths[1])
+
         monkeypatch.setattr(
             eu, "get_all_files_from_folders", lambda *_args: graph_paths
         )
-        real_torch_load = eu.torch.load
-        monkeypatch.setattr(eu.torch, "load", lambda path: path)
-        monkeypatch.setattr(eu, "get_start_end_from_graph", bounds.__getitem__)
+        trusted_loader = MagicMock(wraps=eu.load_trusted_torch_artifact)
+        monkeypatch.setattr(eu, "load_trusted_torch_artifact", trusted_loader)
+        raw_torch_load = MagicMock(
+            side_effect=AssertionError("raw torch.load must not load NetworkX graphs")
+        )
+        monkeypatch.setattr(
+            eu,
+            "torch",
+            SimpleNamespace(save=torch.save, load=raw_torch_load),
+        )
+
+        def _db_should_not_be_called(*_args, **_kwargs):
+            raise AssertionError("detection_only must not access PostgreSQL")
+
+        monkeypatch.setattr(
+            "labelling.init_database_connection", _db_should_not_be_called
+        )
 
         result = eu.compute_tw_labels(cfg)
 
         assert result == {0: {1: 1, 2: 2}, 1: {3: 1}}
+        assert trusted_loader.call_count == 2
+        assert all(
+            call.kwargs["expected_type"] is nx.MultiDiGraph
+            for call in trusted_loader.call_args_list
+        )
+        raw_torch_load.assert_not_called()
         assert cache.load_time_to_malicious_nodes() == before == timestamp_data
         assert all(key >= 10**15 for key in before)
         assert not ({0, 1} & set(before))
 
         tw_artifact = tw_labels_dir / "tw_to_malicious_nodes.pkl"
         assert tw_artifact.is_file()
-        assert real_torch_load(tw_artifact, weights_only=False) == result
+        assert torch.load(tw_artifact, weights_only=False) == result
+
+    def test_graph_load_failure_is_not_relabelled_as_empty_cache(
+        self, tmp_path, monkeypatch
+    ):
+        """A real graph load failure must retain its cause and graph path."""
+        from detection import evaluation_utils as eu
+
+        ns_2025 = 1767225600000000000
+        metadata_dir = tmp_path / "metadata"
+        cache = MetadataCache(metadata_dir)
+        timestamp_data = {ns_2025: ["uuid-known"]}
+        cache.save_time_to_malicious_nodes(timestamp_data)
+        cache.save_ground_truth_nodes({42})
+        cache.save_uuid_to_node_id({"uuid-known": 42})
+
+        graph_path = tmp_path / "graphs" / "broken.pt"
+        cfg = SimpleNamespace(
+            _metadata_dir=str(metadata_dir),
+            dataset=SimpleNamespace(test_files=["graph_test"]),
+            graph_construction=SimpleNamespace(
+                build_graphs=SimpleNamespace(
+                    _graphs_dir=str(graph_path.parent),
+                    _tw_labels=str(tmp_path / "tw_labels"),
+                )
+            ),
+            pipeline=SimpleNamespace(mode="detection_only"),
+        )
+        monkeypatch.setattr(
+            eu, "get_all_files_from_folders", lambda *_args: [graph_path]
+        )
+
+        def _fail_graph_load(*_args, **_kwargs):
+            raise RuntimeError("synthetic graph load failure")
+
+        monkeypatch.setattr(eu, "load_trusted_torch_artifact", _fail_graph_load)
+
+        with pytest.raises(MetadataCacheError) as exc_info:
+            eu.compute_tw_labels(cfg)
+
+        message = str(exc_info.value)
+        assert "synthetic graph load failure" in message
+        assert str(graph_path) in message
+        assert "deserialize time-window graph" in message
+        assert "semantically invalid (empty)" not in message
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
+        assert cache.load_time_to_malicious_nodes() == timestamp_data
 
     def test_uuid_to_node_id_resolution_in_cache_hit(self, tmp_path):
         """Each timestamp entry's UUIDs must be resolved through uuid_to_node_id,

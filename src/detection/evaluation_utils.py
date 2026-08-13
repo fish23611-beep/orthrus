@@ -17,7 +17,9 @@ import csv
 from sklearn.cluster import KMeans
 
 import labelling
+import networkx as nx
 import torch
+from serialization_compat import load_trusted_torch_artifact
 from wandb_control import wandb_is_active as _wandb_is_active
 from mstc.metadata_cache import MetadataCacheError
 
@@ -293,6 +295,19 @@ def _is_detection_only_mode(cfg) -> bool:
     )
 
 
+def _load_time_window_graph(tw_path):
+    """Load an ORTHRUS-generated NetworkX time-window graph."""
+    try:
+        return load_trusted_torch_artifact(
+            tw_path,
+            expected_type=nx.MultiDiGraph,
+        )
+    except Exception as exc:
+        raise MetadataCacheError(
+            f"Failed to deserialize time-window graph {tw_path}: {exc}"
+        ) from exc
+
+
 def compute_tw_labels(cfg):
     """
     Gets the malcious node IDs present in each time window.
@@ -312,27 +327,27 @@ def compute_tw_labels(cfg):
 
     # Try to use cache first
     if cache is not None and cache.has_time_to_malicious_nodes():
-        try:
-            cached_data = cache.load_time_to_malicious_nodes()
-            # C8: Validate that cache has non-empty timestamp->UUID mapping.
-            # An empty dict may indicate a failed export (missing GT files).
-            if not cached_data:
-                raise MetadataCacheError(
-                    "time_to_malicious_nodes cache is empty. "
-                    "This indicates ground truth export failed or GT files were not found. "
-                    "Re-run full_pipeline to regenerate metadata."
-                )
+        cached_data = cache.load_time_to_malicious_nodes()
+        # C8: Validate that cache has non-empty timestamp->UUID mapping.
+        # An empty dict may indicate a failed export (missing GT files).
+        if not cached_data:
+            raise MetadataCacheError(
+                "time_to_malicious_nodes cache is empty. "
+                "This indicates ground truth export failed or GT files were not found. "
+                "Re-run full_pipeline to regenerate metadata."
+            )
 
-            log("Using cached time-window labels from timestamp-level cache")
-            # cached_data is {int(timestamp_ns): [uuid_str, ...]}
-            # Need to convert to {int(tw_index): {node_id: count}}
-            uuid_to_node_id_map = get_ground_truth_uuid_to_node_id(cfg)
-            graph_dir = cfg.graph_construction.build_graphs._graphs_dir
-            test_graphs = get_all_files_from_folders(graph_dir, cfg.dataset.test_files)
+        log("Using cached time-window labels from timestamp-level cache")
+        # cached_data is {int(timestamp_ns): [uuid_str, ...]}
+        # Need to convert to {int(tw_index): {node_id: count}}
+        uuid_to_node_id_map = get_ground_truth_uuid_to_node_id(cfg)
+        graph_dir = cfg.graph_construction.build_graphs._graphs_dir
+        test_graphs = get_all_files_from_folders(graph_dir, cfg.dataset.test_files)
 
-            tw_to_malicious_nodes = defaultdict(list)
-            for i, tw_path in enumerate(test_graphs):
-                graph = torch.load(tw_path)
+        tw_to_malicious_nodes = defaultdict(list)
+        for i, tw_path in enumerate(test_graphs):
+            graph = _load_time_window_graph(tw_path)
+            try:
                 start, end = get_start_end_from_graph(graph)
                 for ts_ns, node_uuids in cached_data.items():
                     if start <= ts_ns < end:
@@ -340,24 +355,25 @@ def compute_tw_labels(cfg):
                             node_id = uuid_to_node_id_map.get(node_uuid)
                             if node_id is not None:
                                 tw_to_malicious_nodes[i].append(node_id)
+            except Exception as exc:
+                raise MetadataCacheError(
+                    "Failed timestamp-to-window conversion for graph "
+                    f"{tw_path}: {exc}"
+                ) from exc
 
-            # Persist window-level labels only in the dedicated TW artifact.
-            # The timestamp-level metadata cache is an immutable source here.
-            result = {}
-            for tw_idx, nodes in tw_to_malicious_nodes.items():
-                unique_nodes, counts = np.unique(nodes, return_counts=True)
-                result[tw_idx] = {
-                    node_id: count
-                    for node_id, count in zip(unique_nodes, counts)
-                }
-                log(f"TW {tw_idx} -> {len(unique_nodes)} malicious nodes + {len(nodes)} malicious edges")
-            os.makedirs(out_path, exist_ok=True)
-            torch.save(result, out_file)
-            return result
-        except MetadataCacheError:
-            raise  # Re-raise semantic errors
-        except Exception:
-            pass  # Fall through to recompute
+        # Persist window-level labels only in the dedicated TW artifact.
+        # The timestamp-level metadata cache is an immutable source here.
+        result = {}
+        for tw_idx, nodes in tw_to_malicious_nodes.items():
+            unique_nodes, counts = np.unique(nodes, return_counts=True)
+            result[tw_idx] = {
+                node_id: count
+                for node_id, count in zip(unique_nodes, counts)
+            }
+            log(f"TW {tw_idx} -> {len(unique_nodes)} malicious nodes + {len(nodes)} malicious edges")
+        os.makedirs(out_path, exist_ok=True)
+        torch.save(result, out_file)
+        return result
 
     # Cache miss or invalid - check mode
     if _is_detection_only_mode(cfg):
@@ -400,17 +416,23 @@ def compute_tw_labels(cfg):
         num_found_event_labels = 0
         tw_to_malicious_nodes = defaultdict(list)
         for i, tw in enumerate(test_graphs):
-            graph = torch.load(tw)
-            start, end  = get_start_end_from_graph(graph)
+            graph = _load_time_window_graph(tw)
+            try:
+                start, end = get_start_end_from_graph(graph)
 
-            # start = tw.t.min().item()
-            # end = tw.t.max().item()
+                # start = tw.t.min().item()
+                # end = tw.t.max().item()
 
-            for t, node_ids in t_to_node.items():
-                if start <= t < end:
-                    for node_id in node_ids: # src, dst, or [src, dst] malicious nodes
-                        tw_to_malicious_nodes[i].append(node_id)
-                    num_found_event_labels += 1
+                for t, node_ids in t_to_node.items():
+                    if start <= t < end:
+                        for node_id in node_ids: # src, dst, or [src, dst] malicious nodes
+                            tw_to_malicious_nodes[i].append(node_id)
+                        num_found_event_labels += 1
+            except Exception as exc:
+                raise MetadataCacheError(
+                    "Failed timestamp-to-window conversion for graph "
+                    f"{tw}: {exc}"
+                ) from exc
 
         log(f"Found {num_found_event_labels}/{len(t_to_node)} edge labels.")
         torch.save(tw_to_malicious_nodes, out_file)
@@ -432,7 +454,6 @@ def compute_tw_labels(cfg):
         tw_to_malicious_nodes[tw] = node_to_count
 
     return tw_to_malicious_nodes
-
 def datetime_to_ns_time_US(nano_date_str):
     date = nano_date_str.split('.')[0]
     nanos = nano_date_str.split('.')[1]
