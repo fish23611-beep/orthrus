@@ -4,9 +4,10 @@ import bisect
 import os
 import resource
 import sys
+import time as time_module
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pickle
@@ -63,6 +64,196 @@ class _LoaderTelemetry:
             "rss_mb_by_phase": dict(self.phases),
             "dataset_loader_peak_rss_mb": self.peak_rss_mb,
         }
+
+
+# --------------------------------------------------------------------------- #
+# Compact History Index: eliminates per-batch full artifact reloads
+# --------------------------------------------------------------------------- #
+
+class _HistoryAccessTelemetry:
+    """Application-level telemetry for history random access."""
+
+    def __init__(self) -> None:
+        self.history_lookup_calls: int = 0
+        self.history_lookup_events: int = 0
+        self.field_lookup_counts: dict[str, int] = {}
+        self.full_artifact_load_count: int = 0
+        self.full_artifact_load_bytes_estimate: int = 0
+        self.compact_lookup_count: int = 0
+        self.compact_cache_hits: int = 0
+        self.compact_cache_misses: int = 0
+        self.index_build_seconds: float = 0.0
+        self.index_rss_mb: float | None = None
+        self.compact_bytes: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "architecture": "compact_history_random_access",
+            "history_lookup_calls": self.history_lookup_calls,
+            "history_lookup_events": self.history_lookup_events,
+            "field_lookup_counts": dict(self.field_lookup_counts),
+            "full_artifact_load_count": self.full_artifact_load_count,
+            "full_artifact_load_bytes_estimate": self.full_artifact_load_bytes_estimate,
+            "compact_lookup_count": self.compact_lookup_count,
+            "compact_cache_hits": self.compact_cache_hits,
+            "compact_cache_misses": self.compact_cache_misses,
+            "index_build_seconds": round(self.index_build_seconds, 3),
+            "index_rss_mb": self.index_rss_mb,
+            "compact_bytes": self.compact_bytes,
+        }
+
+
+class _CompactIndex:
+    """
+    Bounded-memory compact index for efficient per-event field lookups.
+
+    During BoundedFullData init, extracts frequently-accessed small fields into
+    compact global tensors. Large fields (msg, x_src, x_dst) remain in
+    per-window artifacts and are loaded lazily only when needed.
+
+    This eliminates the O(unique_windows_per_batch × full_artifact_size)
+    I/O amplification that occurred with cache_windows=1 and random
+    history e_id access across many windows.
+
+    Memory budget (THEIA_E3 ~1M nodes, ~430 windows):
+        - src/dst (int32):   2 × 4 × 10M ≈ 80 MB
+        - t (int64):         8 × 10M ≈ 80 MB
+        - edge_type (float32): 4 × 10 × 10M ≈ 400 MB
+        - src_type/dst_type: 2 × 4 × 10M ≈ 80 MB
+        - edge_type_index:   4 × 10M ≈ 40 MB
+        - TOTAL compact:     ~680 MB (bounded, not per-window)
+    """
+
+    __slots__ = (
+        "_specs", "_window_paths", "_total_events",
+        "_src", "_dst", "_t",
+        "_src_type", "_dst_type",
+        "_edge_type_index", "_edge_type_num_types",
+        "_split",
+        "_telemetry",
+    )
+
+    # Fields stored as compact global tensors (small, random-access heavy)
+    COMPACT_FIELDS = frozenset({
+        "src", "dst", "t", "src_type", "dst_type",
+        "edge_type_index",
+    })
+
+    def __init__(
+        self,
+        specs: Sequence["_WindowSpec"],
+        total_events: int,
+    ) -> None:
+        self._specs = tuple(specs)
+        self._window_paths: dict[int, str] = {}
+        self._total_events = total_events
+
+        # Compact tensors (all CPU, int/float)
+        self._src = torch.empty(total_events, dtype=torch.int64)
+        self._dst = torch.empty(total_events, dtype=torch.int64)
+        self._t = torch.empty(total_events, dtype=torch.int64)
+        self._src_type = torch.empty(total_events, dtype=torch.int32)
+        self._dst_type = torch.empty(total_events, dtype=torch.int32)
+        self._edge_type_index = torch.empty(total_events, dtype=torch.int32)
+        self._edge_type_num_types = 0
+        self._split = torch.empty(total_events, dtype=torch.int8)
+
+        # Telemetry
+        self._telemetry = _HistoryAccessTelemetry()
+
+    @property
+    def telemetry(self) -> dict[str, Any]:
+        return self._telemetry.as_dict()
+
+    @property
+    def num_events(self) -> int:
+        return self._total_events
+
+    def build(self, cfg: Any, view_mode: str | None) -> None:
+        """
+        Populate compact tensors by scanning each window exactly once.
+
+        Uses the same _prepare_window path as the main loader to ensure
+        identical field semantics (same featurization, same view_mode).
+        """
+        t0 = time_module.time()
+        global_offset = 0
+
+        # Use cfg.dataset.num_edge_types for correct edge_type dimension
+        num_edge_types = getattr(getattr(cfg, "dataset", None), "num_edge_types", 10)
+        self._edge_type_num_types = num_edge_types
+
+        for idx, spec in enumerate(self._specs):
+            data = _prepare_window(cfg, spec.path, view_mode)
+            num_events = int(data.src.numel())
+            if num_events == 0:
+                continue
+
+            end = global_offset + num_events
+            self._src[global_offset:end] = data.src.long()
+            self._dst[global_offset:end] = data.dst.long()
+            self._t[global_offset:end] = data.t.long()
+            self._src_type[global_offset:end] = data.src_type.int()
+            self._dst_type[global_offset:end] = data.dst_type.int()
+            self._edge_type_index[global_offset:end] = data.edge_type_index.int()
+            self._split[global_offset:end] = spec.split_index
+
+            self._window_paths[idx] = spec.path
+
+            global_offset = end
+            del data
+        self._telemetry.index_build_seconds = time_module.time() - t0
+        self._telemetry.index_rss_mb = _current_rss_mb()
+        self._telemetry.compact_bytes = (
+            self._src.element_size() * self._src.numel() +
+            self._dst.element_size() * self._dst.numel() +
+            self._t.element_size() * self._t.numel() +
+            self._src_type.element_size() * self._src_type.numel() +
+            self._dst_type.element_size() * self._dst_type.numel() +
+            self._edge_type_index.element_size() * self._edge_type_index.numel() +
+            self._split.element_size() * self._split.numel()
+        )
+
+    def compact_get(self, field: str, flat_ids: torch.Tensor) -> torch.Tensor:
+        """Get compact field directly from global tensors. O(1) per event.
+
+        Returns values with the same shape as the original window-level tensor
+        (1D for scalar fields like src/dst/t, 2D for edge_type).
+        """
+        self._telemetry.compact_lookup_count += flat_ids.numel()
+        N = flat_ids.numel()
+
+        if field == "src":
+            return self._src[flat_ids].long()
+        if field == "dst":
+            return self._dst[flat_ids].long()
+        if field == "t":
+            return self._t[flat_ids].long()
+        if field == "src_type":
+            return self._src_type[flat_ids].long()
+        if field == "dst_type":
+            return self._dst_type[flat_ids].long()
+        if field == "edge_type_index":
+            return self._edge_type_index[flat_ids].long()
+        if field == "split":
+            return self._split[flat_ids].long()
+        if field == "edge_type":
+            indices = self._edge_type_index[flat_ids].long()
+            num_types = self._edge_type_num_types
+            result = torch.zeros(N, num_types, dtype=torch.float32)
+            result.scatter_(1, indices.unsqueeze(1), 1.0)
+            return result
+        if field == "global_event_index":
+            return flat_ids.clone()
+        raise AttributeError(f"Unknown compact field {field!r}")
+
+    def record_lookup(self, field: str, count: int) -> None:
+        """Record a history lookup for telemetry."""
+        self._telemetry.history_lookup_calls += 1
+        self._telemetry.history_lookup_events += count
+        self._telemetry.field_lookup_counts[field] = (
+            self._telemetry.field_lookup_counts.get(field, 0) + count
+        )
 
 
 @dataclass(frozen=True)
@@ -168,7 +359,15 @@ class _LazyEventField:
 
 
 class BoundedFullData:
-    """Global event view whose large fields remain in per-window artifacts."""
+    """
+    Global event view with bounded memory.
+
+    The compact index stores small fields (src, dst, t, src_type, dst_type,
+    edge_type_index, split) as global tensors during initialization. This
+    eliminates per-batch full artifact reloads when looking up these fields.
+
+    Large fields (msg, x_src, x_dst) remain lazy-loaded from windows.
+    """
 
     _ALIASES = {"event_index": "global_event_index", "event_split": "split"}
     _DERIVED_FIELDS = {"global_event_index", "split"}
@@ -176,11 +375,18 @@ class BoundedFullData:
         "msg", "t", "edge_type", "src", "dst", "src_type", "dst_type",
         "edge_type_index", "x_src", "x_dst",
     }
+    # Fields that the compact index serves directly (O(1) per event)
+    _COMPACT_INDEXED = frozenset({
+        "src", "dst", "t", "src_type", "dst_type",
+        "edge_type_index", "edge_type",
+        "global_event_index", "split",
+    })
 
     def __init__(self, cfg, specs: Sequence[_WindowSpec], *, view_mode: str, max_node: int,
                  telemetry: _LoaderTelemetry,
                  field_metadata: dict[str, tuple[tuple[int, ...], torch.dtype]],
-                 cache_windows: int = 1):
+                 cache_windows: int = 1,
+                 compact_index: "_CompactIndex | None" = None):
         if cache_windows <= 0:
             raise ValueError("cache_windows must be positive")
         self._cfg = cfg
@@ -193,6 +399,10 @@ class BoundedFullData:
         self.num_events = sum(spec.num_events for spec in self._specs)
         self._field_metadata = dict(field_metadata)
         self.loader_telemetry = telemetry.as_dict()
+
+        # Compact history index (built in load_all_datasets)
+        self._compact_index = compact_index
+
         for field in self._WINDOW_FIELDS | self._DERIVED_FIELDS | set(self._ALIASES):
             setattr(self, field, _LazyEventField(self, field))
 
@@ -207,6 +417,18 @@ class BoundedFullData:
         field = self._ALIASES.get(field, field)
         if field in self._DERIVED_FIELDS:
             return (), torch.long
+        if self._compact_index is not None and field in self._COMPACT_INDEXED:
+            if field == "global_event_index":
+                return (), torch.int64
+            if field == "split":
+                return (), torch.int8
+            if field == "edge_type":
+                # edge_type is reconstructed from edge_type_index
+                return self._field_metadata.get("edge_type", ((0,), torch.float32))
+            # src, dst, t, src_type, dst_type, edge_type_index
+            return self._field_metadata.get(field, self._field_metadata.get(
+                field, ((), torch.int64 if field in ("t",) else torch.int32)
+            ))
         try:
             return self._field_metadata[field]
         except KeyError as exc:
@@ -240,9 +462,24 @@ class BoundedFullData:
         ids = torch.as_tensor(event_ids, dtype=torch.long).cpu()
         original_shape = tuple(ids.shape)
         flat_ids = ids.reshape(-1)
+
         if flat_ids.numel() == 0:
             trailing_shape, dtype = self.field_metadata(field)
             return torch.empty((*original_shape, *trailing_shape), dtype=dtype)
+
+        # Serve compact fields from the compact index (fast path)
+        if self._compact_index is not None and field in self._COMPACT_INDEXED:
+            self._compact_index.record_lookup(field, flat_ids.numel())
+            values = self._compact_index.compact_get(field, flat_ids)
+            # Reshape to match original shape, preserving trailing dims
+            if values.dim() == 1:
+                # Scalar field: reshape to original 1D shape
+                return values.reshape(original_shape)
+            else:
+                # Multi-dim field (e.g., edge_type): preserve trailing dims
+                return values.reshape((*original_shape, *values.shape[1:]))
+
+        # Slow path: window-based lookup for lazy fields
         if field == "global_event_index":
             return flat_ids.clone().reshape(original_shape)
 
@@ -257,6 +494,7 @@ class BoundedFullData:
             for window_index, positions in grouped.items():
                 result[[position for position, _ in positions]] = self._specs[window_index].split_index
             return result.reshape(original_shape)
+
         if field not in self._WINDOW_FIELDS:
             raise AttributeError(f"Unknown full_data field {field!r}")
 
@@ -575,7 +813,11 @@ def _scan_lazy_collections(cfg, collections, telemetry):
 
 
 def load_all_datasets(cfg):
-    """Return full chronological data through a bounded-memory production view."""
+    """Return full chronological data through a bounded-memory production view.
+
+    Uses CompactHistoryIndex for efficient per-event field lookups without
+    per-batch full artifact reloads.
+    """
     telemetry = _LoaderTelemetry()
     telemetry.observe("before dataset loading")
     path = cfg.edge_featurization.embed_edges._edge_embeds_dir
@@ -605,6 +847,14 @@ def load_all_datasets(cfg):
     collections = tuple(data.with_view(view_mode) for data in (train_data, val_data, test_data))
     (train_data, val_data, test_data, all_specs, max_node,
      field_metadata) = _scan_lazy_collections(cfg, collections, telemetry)
+
+    # Build compact history index for efficient random access
+    total_events = sum(spec.num_events for spec in all_specs)
+    compact_index = _CompactIndex(specs=all_specs, total_events=total_events)
+    telemetry.observe("before compact index build")
+    compact_index.build(cfg, view_mode)
+    telemetry.observe("after compact index build")
+
     full_data = BoundedFullData(
         cfg,
         all_specs,
@@ -613,10 +863,16 @@ def load_all_datasets(cfg):
         telemetry=telemetry,
         field_metadata=field_metadata,
         cache_windows=1,
+        compact_index=compact_index,
     )
     telemetry.observe("after global metadata construction")
     telemetry.observe("before model construction")
     full_data.loader_telemetry = telemetry.as_dict()
+
+    # Add history access telemetry
+    if hasattr(full_data, "loader_telemetry") and full_data.loader_telemetry:
+        full_data.loader_telemetry["history_access"] = compact_index.telemetry
+
     print(f"Max node in {cfg.dataset.name}: {max_node}")
     return train_data, val_data, test_data, full_data, max_node
 
