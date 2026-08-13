@@ -97,6 +97,8 @@ class MultiScaleOrthrusEncoder(nn.Module):
     def _full_values(full_data: Any, field: str, event_ids: Tensor, device: torch.device) -> Tensor:
         if not hasattr(full_data, field):
             raise ValueError(f"full_data is missing required field '{field}'")
+        if hasattr(full_data, "get_event_values"):
+            return full_data.get_event_values(field, event_ids).to(device)
         values = getattr(full_data, field)
         return values.cpu()[event_ids.cpu()].to(device)
 

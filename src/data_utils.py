@@ -1,4 +1,13 @@
+from __future__ import annotations
+
+import bisect
 import os
+import resource
+import sys
+from collections import OrderedDict
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
+from typing import Any
 
 import pickle
 import warnings
@@ -16,6 +25,243 @@ from serialization_compat import load_trusted_torch_artifact
 SPLIT_NAME_TO_INDEX = {"train": 0, "val": 1, "test": 2}
 INDEX_TO_SPLIT_NAME = {v: k for k, v in SPLIT_NAME_TO_INDEX.items()}
 
+
+
+def _current_rss_mb() -> float | None:
+    """Return current resident memory without adding a psutil dependency."""
+    try:
+        with open("/proc/self/statm", encoding="ascii") as handle:
+            resident_pages = int(handle.read().split()[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024 ** 2)
+    except (OSError, ValueError, IndexError):
+        try:
+            value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            return value / (1024 * 1024) if sys.platform == "darwin" else value / 1024
+        except Exception:
+            return None
+
+
+class _LoaderTelemetry:
+    """Small phase recorder used by the loader and persisted in runtime.json."""
+
+    def __init__(self) -> None:
+        self.phases: dict[str, float | None] = {}
+        self.peak_rss_mb: float | None = None
+
+    def observe(self, phase: str, *, emit: bool = True) -> None:
+        rss = _current_rss_mb()
+        self.phases[phase] = rss
+        if rss is not None:
+            self.peak_rss_mb = rss if self.peak_rss_mb is None else max(self.peak_rss_mb, rss)
+        if emit:
+            suffix = "unavailable" if rss is None else f"{rss:.2f} MB"
+            print(f"[Dataset loader RSS] {phase}: {suffix}")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "architecture": "path_backed_bounded_memory",
+            "rss_mb_by_phase": dict(self.phases),
+            "dataset_loader_peak_rss_mb": self.peak_rss_mb,
+        }
+
+
+@dataclass(frozen=True)
+class _WindowSpec:
+    path: str
+    split_name: str
+    split_index: int
+    split_window_index: int
+    global_window_id: int = -1
+    global_offset: int = -1
+    num_events: int = -1
+
+
+def _prepare_window(cfg, filepath: str, view_mode: str | None = None) -> TemporalData:
+    """Load and transform exactly one trusted edge-embedding artifact."""
+    data = load_trusted_torch_artifact(filepath, expected_type=TemporalData).to("cpu")
+    if cfg.edge_featurization.embed_nodes.used_method.strip() == "only_type":
+        data = extract_msg_node_type_only([data], cfg)[0]
+    else:
+        data = extract_msg_from_data([data], cfg)[0]
+    _inject_event_indices(data, cfg)
+    if view_mode is not None:
+        from mstc.dataset_views import apply_dataset_view
+        data = apply_dataset_view(data, view_mode)
+    return data
+
+
+class LazyTemporalWindowCollection(Sequence):
+    """Chronological path-backed window sequence with no permanent payload cache."""
+
+    def __init__(self, cfg, specs: Sequence[_WindowSpec], *, view_mode: str | None = None):
+        self._cfg = cfg
+        self._specs = tuple(specs)
+        self._view_mode = view_mode
+
+    @property
+    def window_paths(self) -> tuple[str, ...]:
+        return tuple(spec.path for spec in self._specs)
+
+    def with_view(self, view_mode: str) -> "LazyTemporalWindowCollection":
+        return type(self)(self._cfg, self._specs, view_mode=view_mode)
+
+    def with_specs(self, specs: Sequence[_WindowSpec]) -> "LazyTemporalWindowCollection":
+        return type(self)(self._cfg, specs, view_mode=self._view_mode)
+
+    def _load(self, spec: _WindowSpec) -> TemporalData:
+        data = _prepare_window(self._cfg, spec.path, self._view_mode)
+        if spec.global_offset >= 0:
+            actual_events = int(data.src.numel())
+            if actual_events != spec.num_events:
+                raise RuntimeError(
+                    f"Window event count changed for {spec.path}: "
+                    f"manifest={spec.num_events}, loaded={actual_events}"
+                )
+            data.global_event_index = torch.arange(
+                spec.global_offset, spec.global_offset + spec.num_events, dtype=torch.long,
+            )
+            data.event_index = data.global_event_index
+            data.split = spec.split_index
+            data.split_name = spec.split_name
+            data.window_id = spec.global_window_id
+        return data
+
+    def __len__(self) -> int:
+        return len(self._specs)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self._load(spec) for spec in self._specs[index]]
+        return self._load(self._specs[index])
+
+    def __iter__(self) -> Iterator[TemporalData]:
+        for spec in self._specs:
+            yield self._load(spec)
+
+
+class _LazyEventField:
+    """Tensor-like compatibility facade backed by BoundedFullData lookups."""
+
+    def __init__(self, owner: "BoundedFullData", field: str):
+        self._owner = owner
+        self._field = field
+
+    def cpu(self):
+        return self
+
+    def __len__(self) -> int:
+        return self._owner.num_events
+
+    @property
+    def shape(self) -> tuple[int]:
+        return (self._owner.num_events,)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self._owner.num_events)
+            index = torch.arange(start, stop, step, dtype=torch.long)
+        elif not isinstance(index, torch.Tensor):
+            index = torch.tensor([index], dtype=torch.long)
+            return self._owner.get_event_values(self._field, index)[0]
+        return self._owner.get_event_values(self._field, index)
+
+
+class BoundedFullData:
+    """Global event view whose large fields remain in per-window artifacts."""
+
+    _ALIASES = {"event_index": "global_event_index", "event_split": "split"}
+    _DERIVED_FIELDS = {"global_event_index", "split"}
+    _WINDOW_FIELDS = {
+        "msg", "t", "edge_type", "src", "dst", "src_type", "dst_type",
+        "edge_type_index", "x_src", "x_dst",
+    }
+
+    def __init__(self, cfg, specs: Sequence[_WindowSpec], *, view_mode: str, max_node: int,
+                 telemetry: _LoaderTelemetry, cache_windows: int = 1):
+        if cache_windows <= 0:
+            raise ValueError("cache_windows must be positive")
+        self._cfg = cfg
+        self._specs = tuple(specs)
+        self._starts = tuple(spec.global_offset for spec in self._specs)
+        self._view_mode = view_mode
+        self._cache_windows = int(cache_windows)
+        self._cache: OrderedDict[int, TemporalData] = OrderedDict()
+        self.max_node = int(max_node)
+        self.num_events = sum(spec.num_events for spec in self._specs)
+        self.loader_telemetry = telemetry.as_dict()
+        for field in self._WINDOW_FIELDS | self._DERIVED_FIELDS | set(self._ALIASES):
+            setattr(self, field, _LazyEventField(self, field))
+
+    @property
+    def cached_window_count(self) -> int:
+        return len(self._cache)
+
+    def release_cache(self) -> None:
+        self._cache.clear()
+
+    def _window_for_event(self, event_id: int) -> int:
+        if event_id < 0 or event_id >= self.num_events:
+            raise IndexError(f"global event index {event_id} outside [0, {self.num_events})")
+        window_index = bisect.bisect_right(self._starts, event_id) - 1
+        spec = self._specs[window_index]
+        if event_id >= spec.global_offset + spec.num_events:
+            raise IndexError(f"global event index {event_id} falls in no window")
+        return window_index
+
+    def _load_window(self, window_index: int) -> TemporalData:
+        cached = self._cache.pop(window_index, None)
+        if cached is not None:
+            self._cache[window_index] = cached
+            return cached
+        spec = self._specs[window_index]
+        data = _prepare_window(self._cfg, spec.path, self._view_mode)
+        if int(data.src.numel()) != spec.num_events:
+            raise RuntimeError(f"Window event count changed for {spec.path}")
+        self._cache[window_index] = data
+        while len(self._cache) > self._cache_windows:
+            self._cache.popitem(last=False)
+        return data
+
+    def get_event_values(self, field: str, event_ids: torch.Tensor) -> torch.Tensor:
+        field = self._ALIASES.get(field, field)
+        ids = torch.as_tensor(event_ids, dtype=torch.long).cpu()
+        original_shape = tuple(ids.shape)
+        flat_ids = ids.reshape(-1)
+        if flat_ids.numel() == 0:
+            return torch.empty(original_shape, dtype=torch.long)
+        if field == "global_event_index":
+            return flat_ids.clone().reshape(original_shape)
+
+        grouped: OrderedDict[int, list[tuple[int, int]]] = OrderedDict()
+        for output_position, event_id in enumerate(flat_ids.tolist()):
+            window_index = self._window_for_event(int(event_id))
+            local_index = int(event_id) - self._specs[window_index].global_offset
+            grouped.setdefault(window_index, []).append((output_position, local_index))
+
+        if field == "split":
+            result = torch.empty(flat_ids.numel(), dtype=torch.long)
+            for window_index, positions in grouped.items():
+                result[[position for position, _ in positions]] = self._specs[window_index].split_index
+            return result.reshape(original_shape)
+        if field not in self._WINDOW_FIELDS:
+            raise AttributeError(f"Unknown full_data field {field!r}")
+
+        result = None
+        for window_index, positions in grouped.items():
+            data = self._load_window(window_index)
+            if not hasattr(data, field):
+                raise ValueError(f"Window {self._specs[window_index].path} lacks field {field!r}")
+            local_indices = torch.tensor([local for _, local in positions], dtype=torch.long)
+            values = getattr(data, field).cpu().index_select(0, local_indices)
+            if result is None:
+                result = torch.empty((flat_ids.numel(), *values.shape[1:]), dtype=values.dtype)
+            result.index_copy_(
+                0,
+                torch.tensor([position for position, _ in positions], dtype=torch.long),
+                values,
+            )
+        assert result is not None
+        return result.reshape((*original_shape, *result.shape[1:]))
 
 def _validate_event_fields(g: TemporalData, cfg) -> None:
     """
@@ -224,12 +470,10 @@ def _inject_full_data_event_fields(
     return full_data
 
 
-def load_all_datasets(cfg):
-    train_data = load_data_set(cfg, path=cfg.edge_featurization.embed_edges._edge_embeds_dir, split="train")
-    val_data = load_data_set(cfg, path=cfg.edge_featurization.embed_edges._edge_embeds_dir, split="val")
-    test_data = load_data_set(cfg, path=cfg.edge_featurization.embed_edges._edge_embeds_dir, split="test")
-    # C6-B8: transform each window before any full-data/history indices exist.
+def _eager_load_all_datasets(cfg, train_data, val_data, test_data):
+    """Legacy in-memory reference retained for injected/synthetic callers."""
     from mstc.dataset_views import apply_dataset_view
+
     view_mode = cfg.dataset_view.mode
     train_data = [apply_dataset_view(data, view_mode) for data in train_data]
     val_data = [apply_dataset_view(data, view_mode) for data in val_data]
@@ -237,7 +481,7 @@ def load_all_datasets(cfg):
 
     all_msg, all_t, all_edge_types, all_src, all_dst = [], [], [], [], []
     max_node = -1
-    for dataset in [train_data, val_data, test_data]:
+    for dataset in (train_data, val_data, test_data):
         for data in dataset:
             all_msg.append(data.msg)
             all_t.append(data.t)
@@ -245,49 +489,117 @@ def load_all_datasets(cfg):
             all_src.append(data.src)
             all_dst.append(data.dst)
             if data.src.numel() > 0:
-                max_node = max(max_node, torch.cat([data.src, data.dst]).max().item())
+                max_node = max(max_node, int(data.src.max()), int(data.dst.max()))
 
-    all_msg = torch.cat(all_msg)
-    all_t = torch.cat(all_t)
-    all_edge_types = torch.cat(all_edge_types)
-    all_src = torch.cat(all_src)
-    all_dst = torch.cat(all_dst)
     full_data = Data(
-        msg=all_msg,
-        t=all_t,
-        edge_type=all_edge_types,
-        src=all_src,
-        dst=all_dst,
+        msg=torch.cat(all_msg),
+        t=torch.cat(all_t),
+        edge_type=torch.cat(all_edge_types),
+        src=torch.cat(all_src),
+        dst=torch.cat(all_dst),
     )
     max_node = max_node + 1 if max_node >= 0 else 0
     print(f"Max node in {cfg.dataset.name}: {max_node}")
+    return (
+        train_data,
+        val_data,
+        test_data,
+        _inject_full_data_event_fields(train_data, val_data, test_data, full_data),
+        max_node,
+    )
 
-    full_data = _inject_full_data_event_fields(train_data, val_data, test_data, full_data)
 
+def _scan_lazy_collections(cfg, collections, telemetry):
+    """Build exact global offsets while retaining at most one scanned window."""
+    scanned_by_split = []
+    all_specs = []
+    global_offset = 0
+    global_window_id = 0
+    max_node = -1
+
+    for collection in collections:
+        split_specs = []
+        for base_spec in collection._specs:
+            data = collection._load(base_spec)
+            num_events = int(data.src.numel())
+            if num_events:
+                max_node = max(max_node, int(data.src.max()), int(data.dst.max()))
+            spec = _WindowSpec(
+                path=base_spec.path,
+                split_name=base_spec.split_name,
+                split_index=base_spec.split_index,
+                split_window_index=base_spec.split_window_index,
+                global_window_id=global_window_id,
+                global_offset=global_offset,
+                num_events=num_events,
+            )
+            split_specs.append(spec)
+            all_specs.append(spec)
+            global_offset += num_events
+            global_window_id += 1
+            telemetry.observe("window scan peak", emit=False)
+            del data
+        scanned_by_split.append(collection.with_specs(split_specs))
+    return (*scanned_by_split, tuple(all_specs), max_node + 1 if max_node >= 0 else 0)
+
+
+def load_all_datasets(cfg):
+    """Return full chronological data through a bounded-memory production view."""
+    telemetry = _LoaderTelemetry()
+    telemetry.observe("before dataset loading")
+    path = cfg.edge_featurization.embed_edges._edge_embeds_dir
+
+    # The lazy keyword is deliberately optional at the call boundary so tests
+    # and downstream integrations that inject the historical 3-argument loader
+    # continue to use the eager semantic reference.
+    try:
+        train_data = load_data_set(cfg, path=path, split="train", lazy=True)
+        telemetry.observe("after train index/path resolution")
+        val_data = load_data_set(cfg, path=path, split="val", lazy=True)
+        telemetry.observe("after val index/path resolution")
+        test_data = load_data_set(cfg, path=path, split="test", lazy=True)
+        telemetry.observe("after test index/path resolution")
+    except TypeError as exc:
+        if "lazy" not in str(exc):
+            raise
+        train_data = load_data_set(cfg, path=path, split="train")
+        val_data = load_data_set(cfg, path=path, split="val")
+        test_data = load_data_set(cfg, path=path, split="test")
+
+    if not all(isinstance(data, LazyTemporalWindowCollection)
+               for data in (train_data, val_data, test_data)):
+        return _eager_load_all_datasets(cfg, train_data, val_data, test_data)
+
+    view_mode = cfg.dataset_view.mode
+    collections = tuple(data.with_view(view_mode) for data in (train_data, val_data, test_data))
+    train_data, val_data, test_data, all_specs, max_node = _scan_lazy_collections(
+        cfg, collections, telemetry,
+    )
+    full_data = BoundedFullData(
+        cfg,
+        all_specs,
+        view_mode=view_mode,
+        max_node=max_node,
+        telemetry=telemetry,
+        cache_windows=1,
+    )
+    telemetry.observe("after global metadata construction")
+    telemetry.observe("before model construction")
+    full_data.loader_telemetry = telemetry.as_dict()
+    print(f"Max node in {cfg.dataset.name}: {max_node}")
     return train_data, val_data, test_data, full_data, max_node
 
-def load_data_set(cfg, path: str, split: str) -> list[TemporalData]:
-    """
-    Returns a list of time window graphs for a given `split` (train/val/test set).
 
-    When ``cfg._max_windows_per_split`` is set to a positive integer, only the
-    first N files (sorted alphabetically) are loaded. This enables bounded
-    smoke tests that avoid loading the full dataset into RAM. When the limit
-    is ``None`` (default), all windows are loaded — preserving existing
-    behaviour for formal experiments.
-    """
+def _resolve_window_specs(cfg, path: str, split: str) -> list[_WindowSpec]:
+    requested_split = split
     if cfg._test_mode:
         split = "train"
 
     split_dir = os.path.join(path, split)
     all_files = sorted(os.listdir(split_dir))
     available = len(all_files)
-
-    # C8-B: Bounded smoke limit — applied BEFORE torch.load to save RAM
     limit = getattr(cfg, "_max_windows_per_split", None)
-
     if limit is not None:
-        # limit=0 or negative is an error (loading 0 windows makes no sense for smoke)
         if limit <= 0:
             raise ValueError(
                 f"max_windows_per_split must be a positive integer; got {limit}"
@@ -297,24 +609,28 @@ def load_data_set(cfg, path: str, split: str) -> list[TemporalData]:
     else:
         selected = all_files
 
-    data_list = []
-    for f in selected:
-        filepath = os.path.join(split_dir, f)
-        # ORTHRUS-generated TemporalData artifacts require full pickle deserialization
-        # (weights_only=False). Using trusted loader ensures PyTorch 2.6 compatibility
-        # while maintaining trust boundary and type verification.
-        data = load_trusted_torch_artifact(filepath, expected_type=TemporalData).to("cpu")
-        data_list.append(data)
+    # Preserve the historical test-mode artifact source while keeping the
+    # requested logical split identity and its global split label.
+    return [
+        _WindowSpec(
+            path=os.path.join(split_dir, filename),
+            split_name=requested_split,
+            split_index=SPLIT_NAME_TO_INDEX[requested_split],
+            split_window_index=index,
+        )
+        for index, filename in enumerate(selected)
+    ]
 
-    if cfg.edge_featurization.embed_nodes.used_method.strip() == "only_type":
-        data_list = extract_msg_node_type_only(data_list, cfg)
-    else:
-        data_list = extract_msg_from_data(data_list, cfg)
 
-    for g in data_list:
-        _inject_event_indices(g, cfg)
+def load_data_set(cfg, path: str, split: str, *, lazy: bool = False):
+    """Resolve a deterministic split, optionally loading each selected window."""
+    specs = _resolve_window_specs(cfg, path, split)
+    if lazy:
+        return LazyTemporalWindowCollection(cfg, specs)
 
-    return data_list
+    # Public compatibility mode remains eager.  Formal load_all_datasets uses
+    # the path-backed mode above, including when no smoke limit is configured.
+    return [_prepare_window(cfg, spec.path) for spec in specs]
 
 def extract_msg_node_type_only(data_set: list[TemporalData], cfg) -> list[TemporalData]:
     """

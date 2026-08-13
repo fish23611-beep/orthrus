@@ -71,6 +71,8 @@ def main(cfg):
     training_started = timer()
 
     train_data, _, _, full_data, max_node_num = load_all_datasets(cfg)
+    if hasattr(full_data, "loader_telemetry"):
+        update_runtime(runtime_dir, "dataset_loader", full_data.loader_telemetry)
 
     time_gap_statistics = None
     model_variant = getattr(getattr(cfg, "model", None), "variant", None)

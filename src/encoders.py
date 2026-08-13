@@ -153,12 +153,18 @@ class OrthrusEncoder(nn.Module):
         
         # Edge features
         edge_feats = []
+
+        def full_values(field):
+            if hasattr(full_data, "get_event_values"):
+                values = full_data.get_event_values(field, e_id.cpu())
+            else:
+                values = getattr(full_data, field)[e_id.cpu()]
+            return values.to(self.device)
+
         if "edge_type" in self.edge_features:
-            curr_msg = full_data.edge_type[e_id.cpu()].to(self.device)
-            edge_feats.append(curr_msg)
+            edge_feats.append(full_values("edge_type"))
         if "msg" in self.edge_features:
-            curr_msg = full_data.msg[e_id.cpu()].to(self.device)
-            edge_feats.append(curr_msg)
+            edge_feats.append(full_values("msg"))
         edge_feats = torch.cat(edge_feats, dim=-1) if len(edge_feats) > 0 else None
         
         h = self.encoder(h, edge_index, edge_feats=edge_feats)

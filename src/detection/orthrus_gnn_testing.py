@@ -250,6 +250,8 @@ def main(cfg):
     if not isinstance(runtime_dir, (str, os.PathLike)) or not os.fspath(runtime_dir):
         runtime_dir = os.path.dirname(gnn_models_dir)
     dump_environment(cfg, runtime_dir)
+    if hasattr(full_data, "loader_telemetry"):
+        update_runtime(runtime_dir, "dataset_loader", full_data.loader_telemetry)
 
     device = get_device(cfg)
     if device.type == "cuda":
