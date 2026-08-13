@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -14,10 +15,17 @@ import numpy as np
 import pytest
 import torch
 
+SRC = Path(__file__).resolve().parents[1] / "src"
+sys.path.insert(0, str(SRC))
+
 from config import get_runtime_required_args, get_yml_cfg
 from edge_featurization import build_feature_word2vec as build_w2v
 from edge_featurization import embed_edges_feature_word2vec as embed_w2v
-from mstc.metadata_cache import MetadataCache, metadata_complete
+from mstc.metadata_cache import (
+    MetadataCache,
+    metadata_complete,
+    metadata_validation_status,
+)
 from mstc.metadata_export import REQUIRED_METADATA, export_metadata, stream_query
 from pipeline_stages import check_preprocess_stage_complete
 import colab_postgres
@@ -146,7 +154,7 @@ def test_corpus_scope_changes_only_semantic_task_hash_chain():
     assert train_paths[2] != official_paths[2]
 
 
-def _metadata_cfg(tmp_path):
+def _metadata_cfg(tmp_path, *, dataset="THEIA_E3", with_gt=True, with_time_window=True):
     return SimpleNamespace(
         _metadata_dir=str(tmp_path / "metadata"),
         _ground_truth_dir=str(tmp_path / "gt"),
@@ -161,14 +169,16 @@ def _metadata_cfg(tmp_path):
             )
         ),
         dataset=SimpleNamespace(
-            name="THEIA_E3",
+            name=dataset,
             num_node_types=3,
             num_edge_types=10,
             train_files=["graph_2"],
             val_files=["graph_9"],
             test_files=["graph_10"],
-            ground_truth_relative_path=[],
-            attack_to_time_window=[],
+            ground_truth_relative_path=["E3-THEIA/node_X.csv"] if with_gt else [],
+            attack_to_time_window=[
+                ["E3-THEIA/node_X.csv", "2018-04-12 12:40:00", "2018-04-12 13:30:00"]
+            ] if with_time_window else [],
         ),
     )
 
@@ -176,7 +186,9 @@ def _metadata_cfg(tmp_path):
 def test_metadata_export_generates_every_required_file_atomically(tmp_path, monkeypatch):
     from mstc import metadata_export
 
-    cfg = _metadata_cfg(tmp_path)
+    # Legacy fixture: dataset declares neither GT nor time window, so the
+    # mocked empty ``_ground_truth_mappings`` is acceptable.
+    cfg = _metadata_cfg(tmp_path, dataset="LEGACY", with_gt=False, with_time_window=False)
     cursor = MagicMock()
     connection = MagicMock()
     monkeypatch.setattr(
@@ -199,7 +211,12 @@ def test_metadata_export_generates_every_required_file_atomically(tmp_path, monk
     )
 
     cache = export_metadata(cfg)
-    assert metadata_complete(cache)
+    # C8: explicit tuple-unpack avoids the legacy (False, "...") truthiness
+    # bug — a non-empty tuple is always truthy in Python.
+    is_complete, detail = metadata_validation_status(cache, cfg=cfg)
+    assert is_complete is True, f"expected complete, got detail={detail!r}"
+    assert detail == "complete"
+    assert metadata_complete(cache, cfg=cfg) is True
     assert cache.validate_required(list(REQUIRED_METADATA)) == []
     assert not list(Path(cfg._metadata_dir).glob("*.tmp"))
     manifest = cache.load_dataset_manifest()
@@ -207,6 +224,79 @@ def test_metadata_export_generates_every_required_file_atomically(tmp_path, monk
     assert manifest["word2vec_model_hash"] is None
     cursor.close.assert_called_once()
     connection.close.assert_called_once()
+
+
+def test_export_metadata_only_refresh_skips_graph_stages(tmp_path, monkeypatch):
+    """``export_metadata(cfg, force=True)`` is the supported metadata-only
+    repair path. It must:
+
+    - populate the metadata cache from PostgreSQL;
+    - NOT touch ``build_graphs``, ``embed_nodes`` or ``embed_edges``;
+    - raise a clear ``MetadataCacheError`` (not a generic exception) when
+      PostgreSQL is unreachable, so the user knows to restore the DB dump
+      instead of rerunning ``--stages preprocess``.
+    """
+    from graph_construction import build_orthrus_graphs
+    from mstc import metadata_export
+
+    cfg = _metadata_cfg(tmp_path)  # THEIA_E3 with GT + time_window declared
+    stale_cache = MetadataCache(cfg._metadata_dir)
+    stale_cache.save_uuid_to_node_id({"stale-uuid": 99})
+    cursor = MagicMock()
+    connection = MagicMock()
+    monkeypatch.setattr(
+        "provnet_utils.init_database_connection",
+        lambda _cfg: (cursor, connection),
+    )
+
+    # If any of these are touched, the metadata-only contract is broken.
+    sentinel = MagicMock(side_effect=AssertionError(
+        "metadata-only refresh must not invoke build_graphs/embed_nodes/embed_edges"
+    ))
+    monkeypatch.setattr(build_orthrus_graphs, "main", sentinel)
+    monkeypatch.setattr(build_w2v, "main", sentinel)
+    monkeypatch.setattr(embed_w2v, "main", sentinel)
+
+    # Provide minimal non-empty data so the THEIA_E3 contract is satisfied.
+    monkeypatch.setattr(metadata_export, "_node_metadata_from_db", lambda _cur: {
+        7: {"uuid": "uuid-7", "type": "file", "path": "/tmp/x", "cmd": None,
+            "local_ip": None, "local_port": None, "remote_ip": None,
+            "remote_port": None, "display": "file:/tmp/x"}
+    })
+    monkeypatch.setattr(
+        metadata_export, "_ground_truth_mappings", lambda _cfg, _mapping: ({7}, {0: {7}}),
+    )
+    monkeypatch.setattr(
+        metadata_export, "_time_to_malicious_nodes",
+        lambda _cfg, _cur, _attacks, _ids: {1_767_225_600_000_000_000: ["uuid-7"]},
+    )
+
+    cache = export_metadata(cfg, force=True)
+    is_complete, detail = metadata_validation_status(cache, cfg=cfg)
+    assert is_complete is True, detail
+    assert detail == "complete"
+    assert cache.load_uuid_to_node_id() == {"uuid-7": 7}
+    sentinel.assert_not_called()
+
+
+def test_export_metadata_only_refresh_raises_clear_error_when_db_unreachable(
+    tmp_path, monkeypatch,
+):
+    """When PostgreSQL is not available, ``export_metadata`` must raise
+    ``MetadataCacheError`` with a clear repair instruction (NOT a generic
+    psycopg2 error) telling the user to restore the dump."""
+    from mstc import metadata_export
+    from mstc.metadata_cache import MetadataCacheError
+
+    cfg = _metadata_cfg(tmp_path)
+
+    def _boom(_cfg):
+        raise RuntimeError("psycopg2.OperationalError: could not connect")
+
+    monkeypatch.setattr("provnet_utils.init_database_connection", _boom)
+
+    with pytest.raises(MetadataCacheError, match="database|restore|dump"):
+        export_metadata(cfg, force=True)
 
 
 class _StreamingCursor:

@@ -289,7 +289,7 @@ def _stage_artifacts_valid(cfg, stage):
         if not metadata_dir:
             return False
         from mstc.metadata_cache import MetadataCache, metadata_complete
-        return metadata_complete(MetadataCache(metadata_dir))
+        return bool(metadata_complete(MetadataCache(metadata_dir), cfg=cfg))
 
     return False
 

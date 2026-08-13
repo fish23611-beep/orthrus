@@ -94,21 +94,57 @@ def _node_metadata_from_db(cur):
 
 
 def _ground_truth_mappings(cfg, uuid_to_node_id):
+    """Extract ground truth node mappings from configured CSV files.
+
+    Raises
+    ------
+    MetadataCacheError
+        - When a configured ground truth CSV does not exist.
+        - When a CSV has no valid rows.
+        - When zero UUIDs from the CSV match the uuid_to_node_id mapping.
+    """
     ground_truth_nodes = set()
     attack_to_nodes = {}
+
     for attack_id, relative_path in enumerate(cfg.dataset.ground_truth_relative_path):
-        attack_nodes = set()
         gt_path = Path(cfg._ground_truth_dir) / relative_path
-        if gt_path.is_file():
-            with gt_path.open("r", encoding="utf-8") as handle:
-                for row in csv.reader(handle):
-                    if not row:
-                        continue
-                    node_id = uuid_to_node_id.get(row[0])
-                    if node_id is not None:
-                        attack_nodes.add(int(node_id))
+
+        # C8: Fail closed — missing GT file is a hard error.
+        if not gt_path.is_file():
+            raise MetadataCacheError(
+                f"Ground truth CSV not found: {gt_path}. "
+                f"Ensure ground truth root resolves correctly and submodule is initialized."
+            )
+
+        attack_nodes = set()
+        total_rows = 0
+        matched_rows = 0
+
+        with gt_path.open("r", encoding="utf-8") as handle:
+            for row in csv.reader(handle):
+                total_rows += 1
+                if not row:
+                    continue
+                node_id = uuid_to_node_id.get(row[0])
+                if node_id is not None:
+                    attack_nodes.add(int(node_id))
+                    matched_rows += 1
+
+        # C8: Fail closed — empty CSV or zero matched UUIDs.
+        if total_rows == 0:
+            raise MetadataCacheError(
+                f"Ground truth CSV has no data rows: {gt_path}"
+            )
+
+        if matched_rows == 0:
+            raise MetadataCacheError(
+                f"Ground truth CSV has {total_rows} rows but 0 UUIDs matched "
+                f"the uuid_to_node_id cache. File: {gt_path}"
+            )
+
         attack_to_nodes[attack_id] = attack_nodes
         ground_truth_nodes.update(attack_nodes)
+
     return ground_truth_nodes, attack_to_nodes
 
 
@@ -184,9 +220,184 @@ def _write_completion_marker(cache):
         raise
 
 
-def metadata_complete(cache):
+def metadata_complete(cache, cfg=None):
+    """Check if metadata export is complete and semantically valid.
+
+    Returns ``bool``. Diagnostic detail (which file/cache is missing or empty)
+    is intentionally NOT exposed here to keep this function safe against
+    accidental ``if metadata_complete(cache):`` truthiness checks on the
+    legacy ``(bool, str)`` tuple shape. Use :func:`metadata_validation_status`
+    when a human-readable reason is required (logging / error messages).
+
+    A cache is considered complete only when:
+
+    - the completion marker exists;
+    - every required file is present;
+    - :class:`MetadataCache` payloads (``uuid_to_node_id``,
+      ``ground_truth_nodes``, ``attack_to_nodes``) are non-empty;
+    - when ``cfg.dataset.attack_to_time_window`` is non-empty (i.e. the
+      dataset declares a ground-truth attack timeline), the
+      ``time_to_malicious_nodes`` cache must also be non-empty. Empty
+      time cache while attacks are declared is the THEIA_E3 / CADETS_E5
+      family symptom that must NOT be reported as complete.
+
+    Parameters
+    ----------
+    cache : MetadataCache
+    cfg : optional
+        When provided, the function uses ``cfg.dataset.attack_to_time_window``
+        and ``cfg.dataset.ground_truth_relative_path`` to decide whether the
+        time cache emptiness is a hard contract violation. When ``cfg`` is
+        ``None``, the manifest's ``dataset`` name is consulted through the
+        built-in ``DATASET_HAS_TIME_WINDOW`` registry (best-effort). If both
+        lookups are unavailable the function falls back to the legacy
+        "complete when files exist" semantics, which matches the v1 contract
+        used by pre-C8 callers.
+    """
+    is_complete, _detail = metadata_validation_status(cache, cfg=cfg)
+    return is_complete
+
+
+def metadata_validation_status(cache, cfg=None):
+    """Return ``(is_complete, detail_message)`` for metadata export.
+
+    This is the diagnostic twin of :func:`metadata_complete`. Callers MUST
+    unpack the tuple explicitly (``ok, detail = ...``) and MUST NOT use it
+    directly in boolean contexts. See :func:`metadata_complete` for the
+    safe-by-construction bool wrapper.
+
+    ``detail_message`` values:
+
+    - ``"complete"``                     – all required files exist and pass
+      semantic validation;
+    - ``"missing: completion marker"``   – marker file absent;
+    - ``"missing: [...]"``               – one or more required cache files
+      are missing;
+    - ``"empty: uuid_to_node_id"``       – uuid map is empty while required
+      cache files exist (export incomplete);
+    - ``"empty: ground_truth"``          – ``ground_truth_nodes`` is empty
+      while ground truth is configured;
+    - ``"empty: attack_to_nodes"``       – ``attack_to_nodes`` is empty /
+      every attack has zero nodes;
+    - ``"empty: time_to_malicious_nodes"`` – the configured dataset has
+      ``attack_to_time_window`` declarations but the timestamp -> UUID
+      cache is empty (THEIA_E3 / CADETS_E5 symptom);
+    - ``"corrupt: <file> (<reason>)"``   – a cache file is present but
+      cannot be loaded (pickle / JSON parse failure).
+    """
     marker = cache.cache_root / cache.COMPLETION_MARKER_FILE
-    return marker.is_file() and not cache.validate_required(list(REQUIRED_METADATA))
+    if not marker.is_file():
+        return False, "missing: completion marker"
+
+    missing = cache.validate_required(list(REQUIRED_METADATA))
+    if missing:
+        return False, f"missing: {missing}"
+
+    gt_declared = _dataset_declares_ground_truth(cache, cfg)
+    time_window_declared = _dataset_declares_time_window(cache, cfg)
+
+    try:
+        uuid_map = cache.load_uuid_to_node_id()
+        gt_nodes = cache.load_ground_truth_nodes()
+        attack_map = cache.load_attack_to_nodes()
+        time_to_nodes = cache.load_time_to_malicious_nodes()
+    except MetadataCacheError as exc:
+        return False, f"corrupt: {exc}"
+
+    if not uuid_map:
+        return False, "empty: uuid_to_node_id"
+
+    # GT semantic checks only apply when the dataset declares ground truth
+    # (legacy caches without ``ground_truth_relative_path`` are exempt).
+    if gt_declared:
+        if not gt_nodes:
+            return False, "empty: ground_truth"
+        if not attack_map or all(not nodes for nodes in attack_map.values()):
+            return False, "empty: attack_to_nodes"
+
+    # THEIA_E3 / CADETS_E5 contract: when the dataset declares
+    # attack_to_time_window, an empty time_to_malicious_nodes cache is the
+    # exact symptom of the C8 ground-truth metadata export bug. We refuse to
+    # certify the cache as complete in that state.
+    if time_window_declared and not time_to_nodes:
+        return False, "empty: time_to_malicious_nodes"
+
+    return True, "complete"
+
+
+_DATASET_HAS_TIME_WINDOW = frozenset({
+    "THEIA_E3",
+    "THEIA_E5",
+    "CADETS_E5",
+    "CADETS_E3",
+    "E3-THEIA",
+    "E5-THEIA",
+    "E5-CADETS",
+})
+
+
+def _dataset_declares_ground_truth(cache, cfg):
+    """Return ``True`` when the active dataset declares ground truth CSVs.
+
+    Resolution order:
+
+    1. ``cfg.dataset.ground_truth_relative_path`` non-empty (preferred).
+    2. ``cache.load_dataset_manifest()["dataset"]`` matched against
+       the well-known DARPA dataset names that always declare GT.
+    """
+    if cfg is not None:
+        dataset = getattr(cfg, "dataset", None)
+        if dataset is not None:
+            gt_rel = getattr(dataset, "ground_truth_relative_path", None)
+            if gt_rel:
+                return True
+            # No GT configured: legacy cache.
+            return False
+
+    try:
+        manifest = cache.load_dataset_manifest()
+    except MetadataCacheError:
+        return False
+    dataset_name = manifest.get("dataset") if isinstance(manifest, dict) else None
+    return dataset_name in _DATASET_HAS_TIME_WINDOW
+
+
+def _dataset_declares_time_window(cache, cfg):
+    """Return ``True`` when the active dataset is known to declare an
+    ``attack_to_time_window`` block.
+
+    Resolution order:
+
+    1. ``cfg.dataset.attack_to_time_window`` (preferred; works for both
+       production runs and tests).
+    2. ``cfg.dataset.ground_truth_relative_path`` – if non-empty AND no
+       time window attribute is present we still treat the dataset as
+       configured (THEIA_E3 has both, but defensive callers might strip
+       one).
+    3. ``cache.load_dataset_manifest()["dataset"]`` matched against
+       :data:`_DATASET_HAS_TIME_WINDOW`.
+    """
+    if cfg is not None:
+        dataset = getattr(cfg, "dataset", None)
+        if dataset is not None:
+            time_window = getattr(dataset, "attack_to_time_window", None)
+            if time_window:
+                return True
+            gt_rel = getattr(dataset, "ground_truth_relative_path", None)
+            if not gt_rel:
+                # No GT declarations at all: legacy cache has no time
+                # contract obligation.
+                return False
+            name = getattr(dataset, "name", None)
+            if name in _DATASET_HAS_TIME_WINDOW:
+                return True
+
+    try:
+        manifest = cache.load_dataset_manifest()
+    except MetadataCacheError:
+        return False
+    dataset_name = manifest.get("dataset") if isinstance(manifest, dict) else None
+    return dataset_name in _DATASET_HAS_TIME_WINDOW
 
 
 def dump_from_postgres(cfg, cache):
@@ -240,12 +451,34 @@ def dump_from_postgres(cfg, cache):
 
 
 def export_metadata(cfg, force=False):
-    """Idempotently ensure production metadata exists for the configured dataset."""
+    """Idempotently ensure production metadata exists for the configured dataset.
+
+    This is the metadata-only refresh entry point. It deliberately touches
+    only the metadata cache (PostgreSQL → disk) and never re-runs:
+
+    - ``build_graphs`` (graph construction)
+    - ``embed_nodes``  (Word2Vec)
+    - ``embed_edges``  (edge embeddings)
+
+    Pre-existing graph artifacts, the Word2Vec model, and the edge embeddings
+    are read-only inputs to the metadata refresh. If PostgreSQL is required
+    (which is currently the case), only a database restore + this function
+    call is needed; the user does not need to rerun ``--stages preprocess``.
+
+    When ``force=False`` (the default), the function short-circuits if the
+    metadata cache is already complete. When ``force=True``, the cache is
+    unconditionally re-exported.
+    """
     cache = MetadataCache(cfg._metadata_dir)
-    if metadata_complete(cache) and not force:
+    is_complete, detail = metadata_validation_status(cache, cfg=cfg)
+    if is_complete and not force:
         return cache
     dump_from_postgres(cfg, cache)
-    if not metadata_complete(cache):
-        missing = cache.validate_required(list(REQUIRED_METADATA))
-        raise MetadataCacheError(f"Metadata export incomplete; missing: {missing}")
+    is_complete, detail = metadata_validation_status(cache, cfg=cfg)
+    if not is_complete:
+        raise MetadataCacheError(
+            f"Metadata export incomplete; reason: {detail}. "
+            f"Call export_metadata(cfg, force=True) to retry, "
+            f"or restore the PostgreSQL dump first."
+        )
     return cache

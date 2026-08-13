@@ -28,6 +28,56 @@ ROOT_ARTIFACT_DIR = "./artifacts" # Destination folder for generated files. Will
 ROOT_GROUND_TRUTH_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Ground_Truth/darpa/")
 
 
+# C8: Ground truth path resolution for DARPA submodule layout.
+#
+# Repository contract:
+#   - Legacy layout:  Ground_Truth/darpa/E3-THEIA/...  (flat, pre-submodule)
+#   - Nested layout:  Ground_Truth/darpa/darpa/E3-THEIA/...  (git submodule)
+#
+# The resolver detects which layout is present and returns the correct root
+# path where E3-THEIA/, E5-THEIA/, etc. subdirectories live.
+def _resolve_ground_truth_dir(cfg=None):
+    """Resolve the actual ground truth root directory.
+
+    Parameters
+    ----------
+    cfg : CfgNode, optional
+        Not used; retained for API compatibility.
+
+    Returns
+    -------
+    str
+        Absolute path to the directory that contains E3-THEIA/, E5-THEIA/, etc.
+    """
+    base = ROOT_GROUND_TRUTH_DIR  # e.g. .../Ground_Truth/darpa/
+
+    # Nested layout: Ground_Truth/darpa/darpa/ exists and contains E3-THEIA/
+    nested_root = os.path.join(base, "darpa")
+    if os.path.isdir(nested_root):
+        # Verify this is actually the nested layout by checking for a known
+        # subdirectory that exists only inside the submodule.
+        e3_theia_path = os.path.join(nested_root, "E3-THEIA")
+        e5_theia_path = os.path.join(nested_root, "E5-THEIA")
+        if os.path.isdir(e3_theia_path) or os.path.isdir(e5_theia_path):
+            return os.path.join(nested_root, "")  # ensure trailing slash
+
+    # Legacy layout: E3-THEIA/ exists directly under base
+    e3_theia_path = os.path.join(base, "E3-THEIA")
+    e5_theia_path = os.path.join(base, "E5-THEIA")
+    if os.path.isdir(e3_theia_path) or os.path.isdir(e5_theia_path):
+        return os.path.join(base, "")
+
+    # Neither layout is valid
+    raise FileNotFoundError(
+        f"Ground truth root not found. Checked:\n"
+        f"  nested: {nested_root}\n"
+        f"  legacy: {base}\n"
+        f"Neither contains E3-THEIA/ or E5-THEIA/. "
+        f"Ensure the git submodule 'Ground_Truth/darpa' is initialized "
+        f"(git submodule update --init --recursive)."
+    )
+
+
 DATABASE_DEFAULT_CONFIG = {
      "host": 'postgres',  # Host machine where the db is located
      "user": 'postgres',  # Database user
@@ -617,8 +667,8 @@ def set_task_paths(cfg):
      cfg.detection.evaluation.node_evaluation._precision_recall_dir = os.path.join(cfg.detection.evaluation._task_path, "precision_recall_dir/") # TODO: move to cfg.detection._precision_recall_dir
      cfg.detection.evaluation._evaluation_results_dir = os.path.join(cfg.detection.evaluation._task_path, "evaluation_results/")
 
-     # Ground Truth paths
-     cfg._ground_truth_dir = os.path.join(ROOT_GROUND_TRUTH_DIR, cfg.detection.evaluation.ground_truth_version + '/')
+     # Ground Truth paths (C8: use resolver that handles nested submodule layout)
+     cfg._ground_truth_dir = _resolve_ground_truth_dir()
 
      # Triage paths
      cfg.attack_reconstruction.tracing._tracing_graph_dir = os.path.join(cfg.attack_reconstruction.tracing._task_path, "tracing_graphs")

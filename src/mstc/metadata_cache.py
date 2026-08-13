@@ -432,6 +432,30 @@ def update_dataset_manifest(cfg, cache: Optional[MetadataCache] = None) -> None:
     _update(cfg, cache=cache)
 
 
-def metadata_complete(cache: MetadataCache) -> bool:
+def metadata_complete(cache: MetadataCache, cfg=None) -> bool:
+    """Check if metadata export is complete and semantically valid.
+
+    Returns ``bool``. Safe against accidental truthiness on the legacy
+    ``(bool, str)`` tuple shape. Use :func:`metadata_validation_status`
+    when a human-readable reason is required for logs / error messages.
+
+    Parameters
+    ----------
+    cache : MetadataCache
+    cfg : optional
+        Forwarded to :func:`mstc.metadata_export.metadata_validation_status`
+        so the THEIA_E3 / CADETS_E5 attack-to-time-window contract is
+        enforced. Safe to pass ``None`` for legacy callers.
+    """
     from mstc.metadata_export import metadata_complete as _complete
-    return _complete(cache)
+    return _complete(cache, cfg=cfg)
+
+
+def metadata_validation_status(cache: MetadataCache, cfg=None):
+    """Return ``(is_complete, detail_message)`` for metadata export.
+
+    Diagnostic twin of :func:`metadata_complete`. Callers MUST unpack the
+    tuple explicitly and MUST NOT use it directly in boolean contexts.
+    """
+    from mstc.metadata_export import metadata_validation_status as _status
+    return _status(cache, cfg=cfg)

@@ -249,14 +249,19 @@ class TestCompletionMarkers:
         (edge_dir / ".preprocess_embed_edges_complete").write_text(json.dumps(marker_data))
 
         cache = MetadataCache(mock_cfg._metadata_dir)
-        cache.save_node_metadata({1: {"type": "file"}})
-        cache.save_uuid_to_node_id({"uuid": 1})
-        cache.save_node_id_to_uuid({1: "uuid"})
-        cache.save_ground_truth_nodes(set())
-        cache.save_attack_to_nodes({})
-        cache.save_time_to_malicious_nodes({})
+        cache.save_node_metadata({1: {"uuid": "uuid-1", "type": "file", "display": "file:test"}})
+        cache.save_uuid_to_node_id({"uuid-1": 1})
+        cache.save_node_id_to_uuid({1: "uuid-1"})
+        # C8: ground_truth_nodes and attack_to_nodes must be non-empty for valid metadata.
+        # Empty values indicate a failed export (GT files not found).
+        cache.save_ground_truth_nodes({1})  # Non-empty for valid THEIA_E3 metadata
+        cache.save_attack_to_nodes({0: {1}})  # Non-empty for valid THEIA_E3 metadata
+        # C8: empty time_to_malicious_nodes is now rejected when the dataset
+        # declares attack_to_time_window. We deliberately populate a
+        # non-empty timestamp entry so the cache is correctly evaluated.
+        cache.save_time_to_malicious_nodes({1_767_225_600_000_000_000: ["uuid-1"]})
         cache.save_relation_mapping({})
-        cache.save_nodeid2msg({1: "file"})
+        cache.save_nodeid2msg({1: "file:test"})
         cache.save_dataset_manifest(
             dataset="THEIA_E3", num_node_types=3, num_edge_types=10,
             train_files=[], val_files=[], test_files=[], word2vec_dim=128,

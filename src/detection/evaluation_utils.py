@@ -19,6 +19,7 @@ from sklearn.cluster import KMeans
 import labelling
 import torch
 from wandb_control import wandb_is_active as _wandb_is_active
+from mstc.metadata_cache import MetadataCacheError
 
 
 def get_threshold(val_tw_path, threshold_method: str):
@@ -300,6 +301,10 @@ def compute_tw_labels(cfg):
     - If cache hit with valid data: use cache (no deletion, no recompute)
     - If cache miss + full_pipeline: compute from DB/cache
     - If cache miss + detection_only: raise clear error
+
+    C8: time_to_malicious_nodes cache uses timestamp keys (nanoseconds since epoch).
+    The tw_to_malicious_nodes result uses integer window indices (0, 1, 2, ...).
+    The cache-hit path converts timestamp keys to TW indices using test graph boundaries.
     """
     cache = _get_metadata_cache(cfg)
     out_path = cfg.graph_construction.build_graphs._tw_labels
@@ -309,19 +314,48 @@ def compute_tw_labels(cfg):
     if cache is not None and cache.has_time_to_malicious_nodes():
         try:
             cached_data = cache.load_time_to_malicious_nodes()
-            # Validate cached data
-            if cached_data and len(cached_data) > 0:
-                log("Using cached time-window labels")
-                uuid_to_node_id = get_ground_truth_uuid_to_node_id(cfg)
-                # Convert to expected format
-                tw_to_malicious_nodes = {}
-                for tw, nodes in cached_data.items():
-                    unique_nodes, counts = np.unique(nodes, return_counts=True)
-                    node_to_count = {node: count for node, count in zip(unique_nodes, counts)}
-                    log(f"TW {tw} -> {len(unique_nodes)} malicious nodes + {len(nodes)} malicious edges")
-                    node_to_count = {uuid_to_node_id[node_id]: count for node_id, count in node_to_count.items()}
-                    tw_to_malicious_nodes[tw] = node_to_count
-                return tw_to_malicious_nodes
+            # C8: Validate that cache has non-empty timestamp->UUID mapping.
+            # An empty dict may indicate a failed export (missing GT files).
+            if not cached_data:
+                raise MetadataCacheError(
+                    "time_to_malicious_nodes cache is empty. "
+                    "This indicates ground truth export failed or GT files were not found. "
+                    "Re-run full_pipeline to regenerate metadata."
+                )
+
+            log("Using cached time-window labels from timestamp-level cache")
+            # cached_data is {int(timestamp_ns): [uuid_str, ...]}
+            # Need to convert to {int(tw_index): {node_id: count}}
+            uuid_to_node_id_map = get_ground_truth_uuid_to_node_id(cfg)
+            graph_dir = cfg.graph_construction.build_graphs._graphs_dir
+            test_graphs = get_all_files_from_folders(graph_dir, cfg.dataset.test_files)
+
+            tw_to_malicious_nodes = defaultdict(list)
+            for i, tw_path in enumerate(test_graphs):
+                graph = torch.load(tw_path)
+                start, end = get_start_end_from_graph(graph)
+                for ts_ns, node_uuids in cached_data.items():
+                    if start <= ts_ns < end:
+                        for node_uuid in node_uuids:
+                            node_id = uuid_to_node_id_map.get(node_uuid)
+                            if node_id is not None:
+                                tw_to_malicious_nodes[i].append(node_id)
+
+            # Persist window-level labels only in the dedicated TW artifact.
+            # The timestamp-level metadata cache is an immutable source here.
+            result = {}
+            for tw_idx, nodes in tw_to_malicious_nodes.items():
+                unique_nodes, counts = np.unique(nodes, return_counts=True)
+                result[tw_idx] = {
+                    node_id: count
+                    for node_id, count in zip(unique_nodes, counts)
+                }
+                log(f"TW {tw_idx} -> {len(unique_nodes)} malicious nodes + {len(nodes)} malicious edges")
+            os.makedirs(out_path, exist_ok=True)
+            torch.save(result, out_file)
+            return result
+        except MetadataCacheError:
+            raise  # Re-raise semantic errors
         except Exception:
             pass  # Fall through to recompute
 
@@ -329,9 +363,16 @@ def compute_tw_labels(cfg):
     if _is_detection_only_mode(cfg):
         if cache is not None:
             missing = cache.validate_required(["time_to_malicious_nodes"])
-            raise FileNotFoundError(
-                f"detection_only mode: required caches missing: {missing}. "
-                f"Run in full_pipeline mode or provide cached metadata."
+            if missing:
+                raise FileNotFoundError(
+                    f"detection_only mode: required caches missing: {missing}. "
+                    f"Run in full_pipeline mode or provide cached metadata."
+                )
+            # C8: Cache file exists but is semantically invalid (empty).
+            raise MetadataCacheError(
+                "detection_only mode: time_to_malicious_nodes cache is semantically invalid (empty). "
+                "This indicates ground truth export failed. "
+                "Re-run full_pipeline to regenerate metadata."
             )
         else:
             raise FileNotFoundError(
@@ -366,20 +407,13 @@ def compute_tw_labels(cfg):
             # end = tw.t.max().item()
 
             for t, node_ids in t_to_node.items():
-                if start < t < end:
+                if start <= t < end:
                     for node_id in node_ids: # src, dst, or [src, dst] malicious nodes
                         tw_to_malicious_nodes[i].append(node_id)
                     num_found_event_labels += 1
 
         log(f"Found {num_found_event_labels}/{len(t_to_node)} edge labels.")
         torch.save(tw_to_malicious_nodes, out_file)
-
-        # Also save to metadata cache if available
-        if cache is not None:
-            try:
-                cache.save_time_to_malicious_nodes(dict(tw_to_malicious_nodes))
-            except Exception:
-                pass  # Best effort
 
     # Used to retrieve node ID from node raw UUID
     # node_labels_path = os.path.join(cfg._ground_truth_dir, cfg.dataset.ground_truth_events_relative_path)
@@ -442,7 +476,7 @@ def compute_tw_labels_for_magic(cfg):
             end = datetime_to_ns_time_US(end_time)
 
             for t, node_ids in t_to_node.items():
-                if start < t < end:
+                if start <= t < end:
                     for node_id in node_ids:  # src, dst, or [src, dst] malicious nodes
                         tw_to_malicious_nodes[i].append(node_id)
                     num_found_event_labels += 1
