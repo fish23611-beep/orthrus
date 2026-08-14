@@ -9,7 +9,7 @@ from model import *
 from factory import *
 import torch
 
-from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime
+from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime, update_runtime_nested
 
 
 @torch.no_grad()
@@ -251,7 +251,7 @@ def main(cfg):
         runtime_dir = os.path.dirname(gnn_models_dir)
     dump_environment(cfg, runtime_dir)
     if hasattr(full_data, "loader_telemetry"):
-        update_runtime(runtime_dir, "dataset_loader", full_data.loader_telemetry)
+        update_runtime_nested(runtime_dir, "dataset_loader", "testing", full_data.loader_telemetry)
 
     device = get_device(cfg)
     if device.type == "cuda":

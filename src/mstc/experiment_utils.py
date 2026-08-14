@@ -193,6 +193,58 @@ def update_runtime(out_dir: str | Path, section: str, values: Mapping[str, Any])
     return path
 
 
+def update_runtime_nested(out_dir: str | Path, section: str, subsection: str, values: Mapping[str, Any]) -> Path:
+    """
+    Atomically merge values into a nested subsection of a runtime section.
+
+    This enables pipeline stages to write telemetry without overwriting other
+    stages' data. For example:
+        update_runtime_nested(run_dir, "dataset_loader", "training", telemetry)
+        update_runtime_nested(run_dir, "dataset_loader", "testing", telemetry)
+
+    Produces: {"dataset_loader": {"training": {...}, "testing": {...}}}
+
+    Parameters
+    ----------
+    out_dir:
+        Directory containing runtime.json (or where it will be created).
+    section:
+        Top-level section name (e.g., "dataset_loader").
+    subsection:
+        Sub-section name (e.g., "training", "testing").
+    values:
+        Telemetry data to merge into the subsection.
+
+    Returns
+    -------
+    Path to the runtime.json file.
+    """
+    if not _valid_out_dir(out_dir):
+        return Path()
+    path = Path(out_dir) / "runtime.json"
+    existing: dict[str, Any] = {}
+    try:
+        with path.open(encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            existing = loaded
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    # Ensure the section exists as a dict
+    if section not in existing or not isinstance(existing.get(section), dict):
+        existing[section] = {}
+
+    # Merge values into the subsection
+    current = existing[section].get(subsection)
+    merged = dict(current) if isinstance(current, dict) else {}
+    merged.update(_to_plain(dict(values), redact=False))
+    existing[section][subsection] = merged
+
+    _atomic_json(path, existing)
+    return path
+
+
 def events_per_second(processed_event_count: int, measured_seconds: float) -> float:
     """Return true event throughput, or NaN when elapsed time is not positive."""
     return float(processed_event_count) / measured_seconds if measured_seconds > 0 else float("nan")

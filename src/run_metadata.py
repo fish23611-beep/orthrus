@@ -316,6 +316,8 @@ def dump_runtime(
 
     # C8 stages may already have recorded detailed runtime sections.  Preserve
     # them when the pipeline-level summary is written at shutdown.
+    # Preserve structured telemetry sections that may have been written by
+    # individual pipeline stages (e.g., dataset_loader with nested training/testing).
     runtime_path = run_dir / "runtime.json"
     try:
         with runtime_path.open(encoding="utf-8") as handle:
@@ -323,7 +325,7 @@ def dump_runtime(
     except (OSError, json.JSONDecodeError):
         previous_runtime = {}
     if isinstance(previous_runtime, dict):
-        for section in ("training", "testing", "model"):
+        for section in ("dataset_loader", "training", "testing", "model"):
             if isinstance(previous_runtime.get(section), dict):
                 runtime[section] = previous_runtime[section]
 

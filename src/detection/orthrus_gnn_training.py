@@ -8,7 +8,7 @@ from model import MSTCOrthrus
 from config import *
 from data_utils import *
 from factory import *
-from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime
+from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime, update_runtime_nested
 from wandb_control import wandb_log
 
 
@@ -72,7 +72,7 @@ def main(cfg):
 
     train_data, _, _, full_data, max_node_num = load_all_datasets(cfg)
     if hasattr(full_data, "loader_telemetry"):
-        update_runtime(runtime_dir, "dataset_loader", full_data.loader_telemetry)
+        update_runtime_nested(runtime_dir, "dataset_loader", "training", full_data.loader_telemetry)
 
     time_gap_statistics = None
     model_variant = getattr(getattr(cfg, "model", None), "variant", None)
