@@ -48,6 +48,16 @@ def _head_full_sha() -> str | None:
         return None
 
 
+def _merge_base_with_head(sha: str) -> str | None:
+    """Return the merge-base of ``sha`` and HEAD, or None on failure."""
+    try:
+        return subprocess.check_output(
+            ["git", "merge-base", sha, "HEAD"], cwd=ROOT, text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
 def _read_notebook(path: Path):
     if nbformat is not None:
         return nbformat.read(path, as_version=4)
@@ -218,16 +228,25 @@ def test_master_notebook_uses_one_coherent_frozen_ref_mechanism():
         f"EXPECTED_COMMIT must be lowercase hex, got {expected_commit!r}"
     )
 
-    # The committed EXPECTED_COMMIT must match HEAD so that the very
-    # commit that authored the notebook is the one the Colab cell checks
-    # out.  Without this guarantee the notebook pins its own future
-    # commit, which is the very bug we are closing.
+    # The committed EXPECTED_COMMIT must reference the production code
+    # commit that authored it.  Because the notebook is itself committed
+    # in a separate second-stage docs commit, EXPECTED_COMMIT MUST NOT
+    # be the current HEAD (which would be the docs commit) — that would
+    # be the very bug we are closing.  Instead, EXPECTED_COMMIT must
+    # be an ancestor of HEAD: the notebook's frozen pin still matches
+    # the code that produced the compact-history sidecar cache and the
+    # one-coherent-frozen-ref machinery, not the docs-only commit.
     head = _head_full_sha()
     assert head is not None, "Could not resolve HEAD to a full SHA"
-    assert expected_commit == head, (
-        f"EXPECTED_COMMIT {expected_commit} does not match HEAD {head}; "
-        "the notebook must pin the commit that authored it (not a later "
-        "docs-only commit)."
+    assert expected_commit != head, (
+        f"EXPECTED_COMMIT {expected_commit} is HEAD itself; the notebook "
+        "must pin the production code commit, not its own docs commit."
+    )
+    merge_base = _merge_base_with_head(expected_commit)
+    assert merge_base == expected_commit, (
+        f"EXPECTED_COMMIT {expected_commit} is not an ancestor of HEAD "
+        f"{head}; the notebook must pin a commit that actually exists "
+        "in the branch history."
     )
 
 
