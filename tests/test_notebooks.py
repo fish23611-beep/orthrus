@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -31,9 +33,19 @@ ENTRYPOINTS = (
     "src/experiments/export_tables.py",
 )
 MASTER_NOTEBOOK_NAME = "ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb"
-REQUIRED_REPOSITORY_REF = "fix/c8-full-data-ram"
-REQUIRED_EXPECTED_COMMIT = "f850c018b5cf2465d8fc0d92a52dd74114847196"
+REQUIRED_REPOSITORY_REF = "fix/c8-full-data-io"
+REQUIRED_EXPECTED_COMMIT = "099604e139f6f4139af793658ee0bbfde931bd9e"
 REQUIRED_SUBMODULE_UPDATE = 'git("submodule", "update", "--init", "--recursive")'
+
+
+def _head_full_sha() -> str | None:
+    """Return the full 40-char SHA of HEAD, or None if it cannot be resolved."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
 
 
 def _read_notebook(path: Path):
@@ -49,6 +61,12 @@ def _source(notebook) -> str:
         value = cell.get("source", "")
         sources.append("".join(value) if isinstance(value, list) else value)
     return "\n".join(sources)
+
+
+def _extract_expected_commit(source: str) -> str | None:
+    """Pull the EXPECTED_COMMIT assignment from the notebook source."""
+    match = re.search(r"EXPECTED_COMMIT\s*=\s*['\"]([0-9a-fA-F]+)['\"]", source)
+    return match.group(1) if match else None
 
 
 @pytest.fixture(scope="module")
@@ -164,7 +182,15 @@ def test_master_notebook_has_required_cells():
 
 
 def test_master_notebook_uses_one_coherent_frozen_ref_mechanism():
-    """Branch/tag checkout and strict commit verification stay coherent."""
+    """Branch/tag checkout and strict commit verification stay coherent.
+
+    The Master Notebook must:
+      * pin REPOSITORY_REF == "fix/c8-full-data-io"
+      * pin EXPECTED_COMMIT to a 40-character hex SHA
+      * reject ``git rev-parse HEAD`` mismatches via ``actual_commit``
+      * never use ``git describe --tags --exact-match`` (commit-only pin)
+      * initialize the Ground Truth submodule idempotently
+    """
     master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME
     notebook = _read_notebook(master_path)
     source = _source(notebook)
@@ -174,8 +200,35 @@ def test_master_notebook_uses_one_coherent_frozen_ref_mechanism():
     assert "actual_commit" in source
     assert "Commit mismatch" in source
     assert "git describe --tags --exact-match" not in source
-    assert REQUIRED_EXPECTED_COMMIT in source
     assert REQUIRED_SUBMODULE_UPDATE in source
+
+    # The notebook's EXPECTED_COMMIT must be a 40-character hex SHA.  A
+    # 7-character short SHA fails the post-checkout equality test because
+    # `git rev-parse HEAD` always returns the full 40-character form.
+    expected_commit = _extract_expected_commit(source)
+    assert expected_commit is not None, (
+        "Master Notebook does not define EXPECTED_COMMIT"
+    )
+    assert len(expected_commit) == 40, (
+        f"EXPECTED_COMMIT must be a 40-character full SHA, got "
+        f"{len(expected_commit)} chars: {expected_commit!r}"
+    )
+    int(expected_commit, 16)  # raises ValueError on non-hex
+    assert re.fullmatch(r"[0-9a-f]{40}", expected_commit), (
+        f"EXPECTED_COMMIT must be lowercase hex, got {expected_commit!r}"
+    )
+
+    # The committed EXPECTED_COMMIT must match HEAD so that the very
+    # commit that authored the notebook is the one the Colab cell checks
+    # out.  Without this guarantee the notebook pins its own future
+    # commit, which is the very bug we are closing.
+    head = _head_full_sha()
+    assert head is not None, "Could not resolve HEAD to a full SHA"
+    assert expected_commit == head, (
+        f"EXPECTED_COMMIT {expected_commit} does not match HEAD {head}; "
+        "the notebook must pin the commit that authored it (not a later "
+        "docs-only commit)."
+    )
 
 
 def test_master_notebook_references_all_entrypoints():
