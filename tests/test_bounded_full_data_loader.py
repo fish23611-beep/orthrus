@@ -199,3 +199,11 @@ def test_loader_does_not_touch_database_and_reports_phase_rss(tmp_path):
     assert "compact_bytes" in history
     assert "source_artifact_scan_count" in history
     assert "fallback_full_window_load_count" in history
+    # Two-phase source load bookkeeping is exposed on every cold run.
+    assert "metadata_source_load_count" in history
+    assert "compact_build_source_load_count" in history
+    assert "total_source_artifact_load_count" in history
+    # Source-metadata and semantic-config fingerprint fields appear once a
+    # sidecar has been written.
+    assert "sidecar_semantic_config_fingerprint_sha256" in history
+    assert "sidecar_source_metadata_fingerprint_sha256" in history

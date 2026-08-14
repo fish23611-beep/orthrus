@@ -85,6 +85,20 @@ class _HistoryAccessTelemetry:
         random-access lookups served entirely from the in-memory index.
     """
 
+    DISTINGUISHING_KEYS = (
+        "metadata_source_load_count",
+        "compact_build_source_load_count",
+        "total_source_artifact_load_count",
+        "metadata_source_load_bytes_estimate",
+        "compact_build_source_load_bytes_estimate",
+        "total_source_artifact_load_bytes_estimate",
+        "sidecar_directory",
+        "sidecar_view_mode",
+        "sidecar_semantic_config_fingerprint_sha256",
+        "sidecar_source_metadata_fingerprint_sha256",
+        "sidecar_dataset_name",
+    )
+
     def __init__(self) -> None:
         # Lookup counters
         self.history_lookup_calls: int = 0
@@ -99,7 +113,26 @@ class _HistoryAccessTelemetry:
         # Fallback loads: full TemporalData torch.load after index build
         self.fallback_full_window_load_count: int = 0
         self.fallback_full_window_load_bytes_estimate: int = 0
-        # Source-artifact scan counters (one-time index build)
+        # Two distinct source-artifact load phases:
+        #   - metadata_source_load_count: _scan_lazy_collections' window scan
+        #     (loads every source artifact ONCE to learn per-window event counts,
+        #     global offsets, and per-window field metadata).
+        #   - compact_build_source_load_count: _CompactIndex.build's single
+        #     streaming scan that finalizes the compact tensors and node-level
+        #     x_src/x_dst table.
+        # Together they equal total_source_artifact_load_count, which is the
+        # truthful number of full TemporalData torch.load calls the
+        # load_all_datasets path performs on the cold first run.
+        self.metadata_source_load_count: int = 0
+        self.compact_build_source_load_count: int = 0
+        self.total_source_artifact_load_count: int = 0
+        self.metadata_source_load_bytes_estimate: int = 0
+        self.compact_build_source_load_bytes_estimate: int = 0
+        self.total_source_artifact_load_bytes_estimate: int = 0
+        # Back-compat alias: source_artifact_scan_count / ..._bytes_estimate
+        # expose the compact-build phase only, which is the one that streams
+        # per-event fields into the index.  The metadata-scan phase is now
+        # surfaced separately so first-run telemetry is honest.
         self.source_artifact_scan_count: int = 0
         self.source_artifact_scan_bytes_estimate: int = 0
         # Index-build metadata
@@ -113,6 +146,14 @@ class _HistoryAccessTelemetry:
         # build config have not changed).
         self.persistent_cache_hit: bool = False
         self.persistent_cache_hit_count: int = 0
+        # Sidecar identity telemetry — exposes the manifest fields that
+        # gated the cache hit decision so the runtime audit can prove the
+        # baseline/MSTC sidecar-misuse case is impossible.
+        self.sidecar_directory: str | None = None
+        self.sidecar_dataset_name: str = ""
+        self.sidecar_view_mode: str = ""
+        self.sidecar_semantic_config_fingerprint_sha256: str | None = None
+        self.sidecar_source_metadata_fingerprint_sha256: str | None = None
         # Backwards-compat alias kept for the v1 telemetry contract.
         self.full_artifact_load_count: int = 0
         self.full_artifact_load_bytes_estimate: int = 0
@@ -129,8 +170,21 @@ class _HistoryAccessTelemetry:
             "compact_lookup_events": self.compact_lookup_count + self.node_lookup_count + self.msg_lookup_count,
             "fallback_full_window_load_count": self.fallback_full_window_load_count,
             "fallback_full_window_load_bytes_estimate": self.fallback_full_window_load_bytes_estimate,
-            "source_artifact_scan_count": self.source_artifact_scan_count,
-            "source_artifact_scan_bytes_estimate": self.source_artifact_scan_bytes_estimate,
+            # First-run source-artifact load bookkeeping.  The two phases add
+            # up to total_source_artifact_load_count, which is the honest
+            # answer to "how many full TemporalData torch.load calls did the
+            # cold start perform?".
+            "metadata_source_load_count": self.metadata_source_load_count,
+            "compact_build_source_load_count": self.compact_build_source_load_count,
+            "total_source_artifact_load_count": self.total_source_artifact_load_count,
+            "metadata_source_load_bytes_estimate": self.metadata_source_load_bytes_estimate,
+            "compact_build_source_load_bytes_estimate": self.compact_build_source_load_bytes_estimate,
+            "total_source_artifact_load_bytes_estimate": self.total_source_artifact_load_bytes_estimate,
+            # Back-compat alias: source_artifact_scan_count exposes only the
+            # compact-build phase (it is the streaming per-event scan, while
+            # the metadata scan is a lighter phase that just learns counts).
+            "source_artifact_scan_count": self.compact_build_source_load_count,
+            "source_artifact_scan_bytes_estimate": self.compact_build_source_load_bytes_estimate,
             "index_build_count": self.index_build_count,
             "index_build_seconds": round(self.index_build_seconds, 3),
             "index_rss_mb": self.index_rss_mb,
@@ -138,6 +192,12 @@ class _HistoryAccessTelemetry:
             "node_table_bytes": self.node_table_bytes,
             "persistent_cache_hit": self.persistent_cache_hit,
             "persistent_cache_hit_count": self.persistent_cache_hit_count,
+            # Sidecar identity exposed for audit.
+            "sidecar_directory": self.sidecar_directory,
+            "sidecar_dataset_name": self.sidecar_dataset_name,
+            "sidecar_view_mode": self.sidecar_view_mode,
+            "sidecar_semantic_config_fingerprint_sha256": self.sidecar_semantic_config_fingerprint_sha256,
+            "sidecar_source_metadata_fingerprint_sha256": self.sidecar_source_metadata_fingerprint_sha256,
             # Backwards-compat keys
             "full_artifact_load_count": self.fallback_full_window_load_count,
             "full_artifact_load_bytes_estimate": self.fallback_full_window_load_bytes_estimate,
@@ -259,20 +319,61 @@ class _CompactIndex:
     # ------------------------------------------------------------------
     # Sidecar layout (next to ``edge_embeds_dir``):
     #   _compact_index_v2/
-    #     manifest.json    {schema_version, dataset, view_mode, fingerprint,
+    #     manifest.json    {schema_version, dataset, view_mode,
+    #                       source_metadata_fingerprint_sha256,
+    #                       semantic_config_fingerprint_sha256,
     #                       total_events, edge_type_num_types, msg_dim,
     #                       node_table_dim, node_table_max_node,
-    #                       msg_predict_edge_type, completed=true}
+    #                       msg_predict_edge_type, num_node_types,
+    #                       split_counts, view_mode, completed=true}
     #     compact.pt       {src, dst, t, src_type, dst_type,
     #                       edge_type_index, split}
     #     nodes.pt         {x_src, x_dst}
     #
-    # Fingerprint = sha256 of a sorted list of (relpath, size, mtime_ns)
-    # tuples from every source window referenced by the specs.
+    # Two distinct fingerprints gate the sidecar:
+    #
+    #   - source_metadata_fingerprint_sha256: SHA-256 over a sorted list of
+    #     (relative_path, size, mtime_ns) tuples for every source window
+    #     referenced by the specs.  Detects any change to the on-disk
+    #     preprocessed edge-embeddings.  relative_path is computed against
+    #     ``edge_embeds_dir`` so two artifacts with the same basename in
+    #     different splits cannot collide.
+    #
+    #   - semantic_config_fingerprint_sha256: SHA-256 over a canonical
+    #     JSON-serialised view of the resolved cfg fields that actually
+    #     influence the compact representation / layout:
+    #         dataset.name
+    #         dataset.num_node_types
+    #         dataset.num_edge_types
+    #         embed_nodes.used_method
+    #         embed_nodes.emb_dim
+    #         detector encoder.use_node_type_in_node_feats
+    #         detector decoder.used_methods (predict_edge_type presence)
+    #         dataset_view.mode
+    #         edge_embeds_dir (relative)
+    #     Pure training hyperparameters (lr, optimizer, batch_size, …) are
+    #     intentionally excluded so unrelated re-runs do not invalidate the
+    #     sidecar.
+    #
     # Stale/invalid sidecars are silently rebuilt.
     # ------------------------------------------------------------------
-    PERSISTENT_SCHEMA_VERSION = 2
+    PERSISTENT_SCHEMA_VERSION = 3
     PERSISTENT_DIR_NAME = "_compact_index_v2"
+
+    # The cfg attribute paths that actually influence the compact index
+    # representation.  Order is preserved so the JSON canonical form is
+    # deterministic.  Anything not in this tuple is a "pure training
+    # parameter" and intentionally excluded from the semantic fingerprint.
+    SEMANTIC_CONFIG_KEYS = (
+        "dataset.name",
+        "dataset.num_node_types",
+        "dataset.num_edge_types",
+        "edge_featurization.embed_nodes.used_method",
+        "edge_featurization.embed_nodes.emb_dim",
+        "detection.gnn_training.encoder.use_node_type_in_node_feats",
+        "detection.gnn_training.decoder.used_methods",
+        "dataset_view.mode",
+    )
 
     def _persistent_root(self, cfg: Any) -> str | None:
         """Return the sidecar directory for ``cfg``, or None to disable."""
@@ -292,35 +393,98 @@ class _CompactIndex:
             persistent_root, f"manifest__{safe_dataset}__{safe_view}.json"
         )
 
-    def _compute_fingerprint(self) -> dict[str, Any]:
-        """Return a JSON-serialisable fingerprint for current specs."""
+    def _compute_source_metadata_fingerprint(self) -> dict[str, Any]:
+        """Return a JSON-serialisable source-metadata fingerprint for current specs.
+
+        The fingerprint covers (relative_path, size, mtime_ns) for every
+        source window.  Using a path *relative to the edge-embeds root*
+        means two artifacts with the same basename in different splits
+        produce distinct entries and cannot collide.
+
+        NOTE: this is *not* a content SHA.  It detects any rename,
+        creation, deletion, mtime change, or size change in the source
+        artifacts without having to read the 9.63 GB of tensor data.
+        """
+        root = self._edge_embeds_root()
         items: list[tuple[str, int, int]] = []
         for spec in self._specs:
             path = spec.path
             try:
                 st = os.stat(path)
-                items.append((os.path.basename(path), int(st.st_size),
-                              int(st.st_mtime_ns)))
             except OSError:
                 # Missing files make the fingerprint empty; any pre-existing
                 # sidecar will be invalidated.
                 return {"items": [], "sha256": "missing-source"}
+            try:
+                relpath = os.path.relpath(path, root) if root else os.path.basename(path)
+            except ValueError:
+                relpath = os.path.basename(path)
+            items.append((relpath, int(st.st_size), int(st.st_mtime_ns)))
         items.sort()
         h = hashlib.sha256()
-        for name, size, mtime in items:
-            h.update(name.encode())
-            h.update(str(size).encode())
-            h.update(str(mtime).encode())
+        for relpath, size, mtime in items:
+            h.update(relpath.encode())
             h.update(b"|")
+            h.update(str(size).encode())
+            h.update(b"|")
+            h.update(str(mtime).encode())
+            h.update(b"\n")
         return {"items": items, "sha256": h.hexdigest()}
+
+    def _compute_semantic_config_fingerprint(self, cfg: Any) -> str:
+        """SHA-256 over the resolved cfg fields that influence the compact layout.
+
+        The keys are listed in ``SEMANTIC_CONFIG_KEYS``; each is resolved via
+        dotted-path lookup (``getattr(getattr(cfg, part, None), …)``).  We
+        fall back to the string ``"<absent>"`` for missing attributes so
+        the canonical form is stable across optional cfg shapes.
+        """
+        resolved: dict[str, Any] = {}
+        for dotted in self.SEMANTIC_CONFIG_KEYS:
+            parts = dotted.split(".")
+            value: Any = cfg
+            for part in parts:
+                if value is None:
+                    value = None
+                    break
+                value = getattr(value, part, None)
+            resolved[dotted] = "<absent>" if value is None else value
+        resolved["edge_embeds_dir"] = (
+            self._edge_embeds_root() or "<absent>"
+        )
+        canonical = json.dumps(resolved, sort_keys=True, default=str)
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def _edge_embeds_root(self) -> str | None:
+        """Return the directory used as anchor for relative paths in the fingerprint.
+
+        Heuristic: the edge_embeds root is the parent directory of the
+        immediate parent of the first source window's path.  Every source
+        window is <edge_embeds>/<split>/<file>, so the root is
+        ``dirname(dirname(spec.path))``.  This is robust to the only legal
+        layout used by ``load_all_datasets``.
+        """
+        if not self._specs:
+            return None
+        first = self._specs[0].path
+        if not first:
+            return None
+        return os.path.dirname(os.path.dirname(first))
 
     def _try_load_persistent(self, cfg: Any, view_mode: str | None) -> bool:
         """
         Attempt to restore the compact index from the persistent sidecar.
 
         Returns True if the sidecar was successfully loaded (matches schema,
-        dataset name, view_mode and fingerprint). On miss/mismatch the index
-        is left untouched and ``build()`` will perform a full rebuild.
+        dataset name, view_mode, semantic-config fingerprint, and
+        source-metadata fingerprint). On miss/mismatch the index is left
+        untouched and ``build()`` will perform a full rebuild.
+
+        The two-fingerprint contract is the correctness gate that prevents
+        baseline → MSTC sidecar reuse: changing only training hyperparameters
+        keeps the semantic fingerprint identical (so unrelated re-runs may
+        reuse the sidecar), but flipping any field that affects compact
+        semantics forces a rebuild.
         """
         root = self._persistent_root(cfg)
         if root is None:
@@ -344,8 +508,13 @@ class _CompactIndex:
                     or manifest.get("dataset") != dataset_name
                     or manifest.get("view_mode") != (view_mode or "")):
                 return False
-            current_fp = self._compute_fingerprint()
-            if manifest.get("fingerprint_sha256") != current_fp["sha256"]:
+            current_src_fp = self._compute_source_metadata_fingerprint()
+            current_sem_fp = self._compute_semantic_config_fingerprint(cfg)
+            if (manifest.get("source_metadata_fingerprint_sha256")
+                    != current_src_fp["sha256"]):
+                return False
+            if (manifest.get("semantic_config_fingerprint_sha256")
+                    != current_sem_fp):
                 return False
             if not manifest.get("completed", False):
                 return False
@@ -374,12 +543,27 @@ class _CompactIndex:
             )
             self._msg_use_edge_type = not self._msg_predict_edge_type
             self._telemetry.index_build_count += 1
+            # Cache hit: the cold-start scans did not happen on this run.
+            self._telemetry.compact_build_source_load_count = 0
+            self._telemetry.compact_build_source_load_bytes_estimate = 0
+            self._telemetry.metadata_source_load_count = 0
+            self._telemetry.metadata_source_load_bytes_estimate = 0
+            self._telemetry.total_source_artifact_load_count = 0
+            self._telemetry.total_source_artifact_load_bytes_estimate = 0
             self._telemetry.source_artifact_scan_count = 0
             self._telemetry.source_artifact_scan_bytes_estimate = 0
             self._telemetry.persistent_cache_hit_count = (
                 self._telemetry.persistent_cache_hit_count + 1
             )
             self._telemetry.persistent_cache_hit = True
+            # Audit-trail telemetry.
+            self._telemetry.sidecar_directory = root
+            self._telemetry.sidecar_dataset_name = dataset_name
+            self._telemetry.sidecar_view_mode = view_mode or ""
+            self._telemetry.sidecar_source_metadata_fingerprint_sha256 = (
+                current_src_fp["sha256"]
+            )
+            self._telemetry.sidecar_semantic_config_fingerprint_sha256 = current_sem_fp
             return True
         except (OSError, ValueError, KeyError, RuntimeError):
             # Any failure means "sidecar unusable"; rebuild from source.
@@ -435,12 +619,14 @@ class _CompactIndex:
             }
             torch.save(blob, os.path.join(stage_dir, "compact.pt"))
             torch.save(nodes, os.path.join(stage_dir, "nodes.pt"))
-            fp = self._compute_fingerprint()
+            src_fp = self._compute_source_metadata_fingerprint()
+            sem_fp = self._compute_semantic_config_fingerprint(cfg)
             manifest = {
                 "schema_version": self.PERSISTENT_SCHEMA_VERSION,
                 "dataset": dataset_name,
                 "view_mode": view_mode or "",
-                "fingerprint_sha256": fp["sha256"],
+                "source_metadata_fingerprint_sha256": src_fp["sha256"],
+                "semantic_config_fingerprint_sha256": sem_fp,
                 "total_events": int(self._total_events),
                 "edge_type_num_types": int(self._edge_type_num_types),
                 "node_table_dim": int(self._node_table_dim),
@@ -466,6 +652,12 @@ class _CompactIndex:
                 os.path.join(stage_dir, "nodes.pt"),
                 os.path.join(root, "nodes.pt"),
             )
+            # Sidecar identity telemetry for the audit trail.
+            self._telemetry.sidecar_directory = root
+            self._telemetry.sidecar_dataset_name = dataset_name
+            self._telemetry.sidecar_view_mode = view_mode or ""
+            self._telemetry.sidecar_source_metadata_fingerprint_sha256 = src_fp["sha256"]
+            self._telemetry.sidecar_semantic_config_fingerprint_sha256 = sem_fp
         except OSError:
             # Disk-full / permission-denied: silently skip the sidecar.
             pass
@@ -558,8 +750,10 @@ class _CompactIndex:
                 scan_size = os.path.getsize(spec.path)
             except OSError:
                 pass
-            self._telemetry.source_artifact_scan_count += 1
-            self._telemetry.source_artifact_scan_bytes_estimate += int(scan_size)
+            self._telemetry.compact_build_source_load_count += 1
+            self._telemetry.compact_build_source_load_bytes_estimate += int(scan_size)
+            self._telemetry.total_source_artifact_load_count += 1
+            self._telemetry.total_source_artifact_load_bytes_estimate += int(scan_size)
 
             if n_events > 0:
                 end = global_offset + n_events
@@ -1350,8 +1544,15 @@ def _eager_load_all_datasets(cfg, train_data, val_data, test_data):
     )
 
 
-def _scan_lazy_collections(cfg, collections, telemetry):
-    """Build exact global offsets while retaining at most one scanned window."""
+def _scan_lazy_collections(cfg, collections, telemetry, history_telemetry=None):
+    """Build exact global offsets while retaining at most one scanned window.
+
+    Every call to ``collection._load(base_spec)`` causes a full
+    ``load_trusted_torch_artifact`` on the source file.  When
+    ``history_telemetry`` is provided we charge each such load to the
+    metadata-source-load counter so the truth about how many full artifact
+    loads the cold run performed is preserved.
+    """
     scanned_by_split = []
     all_specs = []
     field_metadata = {}
@@ -1364,6 +1565,16 @@ def _scan_lazy_collections(cfg, collections, telemetry):
         for base_spec in collection._specs:
             data = collection._load(base_spec)
             num_events = int(data.src.numel())
+            if history_telemetry is not None:
+                size = 0
+                try:
+                    size = os.path.getsize(base_spec.path)
+                except OSError:
+                    pass
+                history_telemetry.metadata_source_load_count += 1
+                history_telemetry.metadata_source_load_bytes_estimate += int(size)
+                history_telemetry.total_source_artifact_load_count += 1
+                history_telemetry.total_source_artifact_load_bytes_estimate += int(size)
             if num_events:
                 max_node = max(max_node, int(data.src.max()), int(data.dst.max()))
             for field in BoundedFullData._WINDOW_FIELDS:
@@ -1434,12 +1645,37 @@ def load_all_datasets(cfg):
 
     view_mode = cfg.dataset_view.mode
     collections = tuple(data.with_view(view_mode) for data in (train_data, val_data, test_data))
+    # Pre-allocate the compact index so its telemetry can be charged for
+    # *both* the metadata scan phase and the compact-build phase.  The
+    # total_events value is provisional (it is re-aligned to the true
+    # cumulative event count once _scan_lazy_collections returns).
+    compact_index = _CompactIndex(
+        specs=tuple(spec for collection in collections for spec in collection._specs),
+        total_events=0,
+    )
     (train_data, val_data, test_data, all_specs, max_node,
-     field_metadata) = _scan_lazy_collections(cfg, collections, telemetry)
+     field_metadata) = _scan_lazy_collections(
+        cfg, collections, telemetry, history_telemetry=compact_index._telemetry,
+    )
 
-    # Build compact history index for efficient random access
+    # Build compact history index for efficient random access.  The
+    # compact_index was constructed earlier so the metadata-scan phase
+    # could charge its telemetry; reuse it here and realign its
+    # ``_total_events`` and backing tensor sizes to the cumulative
+    # event count produced by _scan_lazy_collections.
     total_events = sum(spec.num_events for spec in all_specs)
-    compact_index = _CompactIndex(specs=all_specs, total_events=total_events)
+    compact_index._total_events = total_events
+    for attr, dtype in (
+        ("_src", torch.int64),
+        ("_dst", torch.int64),
+        ("_t", torch.int64),
+        ("_src_type", torch.int32),
+        ("_dst_type", torch.int32),
+        ("_edge_type_index", torch.int32),
+        ("_split", torch.int8),
+    ):
+        setattr(compact_index, attr, torch.empty(total_events, dtype=dtype))
+    compact_index._specs = tuple(all_specs)
     telemetry.observe("before compact index build")
     compact_index.build(cfg, view_mode)
     telemetry.observe("after compact index build")
@@ -1472,7 +1708,23 @@ def _resolve_window_specs(cfg, path: str, split: str) -> list[_WindowSpec]:
         split = "train"
 
     split_dir = os.path.join(path, split)
+    # Source-window discovery only sees files inside the split directory.
+    # The persistent sidecar lives under <edge_embeds>/_compact_index_v2/
+    # so it is structurally absent from this listdir call; we still
+    # additionally filter out any directory or non-source-file entry to
+    # make the contract explicit and resilient to future layout changes.
     all_files = sorted(os.listdir(split_dir))
+    selected: list[str] = []
+    for name in all_files:
+        full_path = os.path.join(split_dir, name)
+        if not os.path.isfile(full_path):
+            continue
+        # Defensive: nothing inside <edge_embeds>/<split>/ should ever match
+        # the sidecar directory name, but the explicit check keeps the
+        # discovery contract observable.
+        if name == _CompactIndex.PERSISTENT_DIR_NAME:
+            continue
+        selected.append(name)
     available = len(all_files)
     limit = getattr(cfg, "_max_windows_per_split", None)
     if limit is not None:
@@ -1480,10 +1732,8 @@ def _resolve_window_specs(cfg, path: str, split: str) -> list[_WindowSpec]:
             raise ValueError(
                 f"max_windows_per_split must be a positive integer; got {limit}"
             )
-        selected = all_files[:limit]
+        selected = selected[:limit]
         print(f"[Bounded smoke] split={split}: selected {len(selected)} / {available} windows")
-    else:
-        selected = all_files
 
     # Preserve the historical test-mode artifact source while keeping the
     # requested logical split identity and its global split label.

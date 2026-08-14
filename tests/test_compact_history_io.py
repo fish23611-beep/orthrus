@@ -241,7 +241,11 @@ def test_persistent_sidecar_avoids_rescan_on_second_load():
         with open(manifest_files[0], "r", encoding="utf-8") as f:
             manifest = json.load(f)
         assert manifest.get("completed") is True
-        assert manifest.get("schema_version") == 2
+        assert manifest.get("schema_version") == 3
+        # v3 manifest records distinct source-metadata and semantic-config
+        # fingerprints; both must be present for cache-hit validation.
+        assert "source_metadata_fingerprint_sha256" in manifest
+        assert "semantic_config_fingerprint_sha256" in manifest
 
         # Second load: sidecar must be a hit, no source scan.
         _, _, _, full_data2, _ = load_all_datasets(cfg)
