@@ -176,19 +176,24 @@ def test_loader_does_not_touch_database_and_reports_phase_rss(tmp_path):
     telemetry = full.loader_telemetry
     assert telemetry["architecture"] == "path_backed_bounded_memory"
     assert telemetry["dataset_loader_peak_rss_mb"] is not None
-    # Verify all expected phases are present (order may vary with compact index)
+    # Verify all cold-path phases expose current and kernel peak RSS.
     expected_phases = {
         "before dataset loading",
         "after train index/path resolution",
         "after val index/path resolution",
         "after test index/path resolution",
+        "before sidecar load",
+        "before source metadata scan",
         "window scan peak",
+        "after source metadata scan",
         "before compact index build",
         "after compact index build",
+        "after BoundedFullData construction",
         "after global metadata construction",
         "before model construction",
     }
-    assert set(telemetry["rss_mb_by_phase"].keys()) == expected_phases
+    assert expected_phases <= set(telemetry["rss_mb_by_phase"])
+    assert expected_phases <= set(telemetry["peak_rss_mb_by_phase"])
 
     # Verify history_access telemetry is populated
     assert "history_access" in telemetry

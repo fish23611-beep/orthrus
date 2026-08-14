@@ -7,9 +7,7 @@ Covers:
   3. sidecar is structurally absent from source-window discovery
   4. window count and global_event_index are stable across sidecar runs
   5. metadata-scan and compact-build source-load phases are distinguished
-  6. second load_all_datasets still does NOT touch source artifacts in
-     the compact-build phase (the metadata-scan phase is a separate
-     count and is documented to be additive)
+  6. valid warm restore performs zero source TemporalData loads
 """
 
 from __future__ import annotations
@@ -361,14 +359,7 @@ def test_metadata_scan_vs_compact_build_distinguished_in_telemetry():
 
 
 def test_second_load_hit_keeps_compact_build_phase_at_zero():
-    """On a sidecar cache hit the compact-build phase must not load any
-    source artifact (the previous build is restored from disk).
-
-    The metadata-scan phase is allowed to re-run because it is needed to
-    learn per-window offsets and field metadata for BoundedFullData
-    regardless of whether the sidecar is valid; the truthful answer is
-    exposed via ``metadata_source_load_count``.
-    """
+    """A valid sidecar restores metadata and tensors without source loads."""
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         _artifacts(root, counts=(2, 1, 1))
@@ -382,17 +373,14 @@ def test_second_load_hit_keeps_compact_build_phase_at_zero():
         _, _, _, full2, _ = data_utils.load_all_datasets(cfg)
         tel = full2._compact_index.telemetry
         assert tel["persistent_cache_hit"] is True
-        # The compact-build phase is the one that costs the per-event copy;
-        # the sidecar is exactly designed to skip it.
         assert tel["compact_build_source_load_count"] == 0
-        # Total source load on a cache hit is exactly the metadata phase.
-        assert (
-            tel["total_source_artifact_load_count"]
-            == tel["metadata_source_load_count"]
-        )
+        assert tel["metadata_source_load_count"] == 0
+        assert tel["total_source_artifact_load_count"] == 0
+        assert tel["warm_source_temporaldata_load_count"] == 0
+        assert tel["sidecar_manifest_hit"] is True
+        assert tel["sidecar_tensor_load_count"] == 2
         print(
-            "PASSED: warm-hit run does compact-build=0 and only re-runs "
-            "the metadata phase (which is required for BoundedFullData)"
+            "PASSED: warm-hit restores manifest/tensors with zero source loads"
         )
 
 
@@ -412,7 +400,7 @@ def test_sidecar_manifest_records_fingerprints_with_accurate_names():
         manifest = _manifest(sidecar)
         assert "source_metadata_fingerprint_sha256" in manifest
         assert "semantic_config_fingerprint_sha256" in manifest
-        # The legacy alias must NOT be present in a v3 manifest.
+        # The legacy alias must NOT be present in a v4 manifest.
         assert "fingerprint_sha256" not in manifest
         # Both are 64 hex chars (SHA-256).
         for key in (

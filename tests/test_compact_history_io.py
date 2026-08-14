@@ -241,11 +241,14 @@ def test_persistent_sidecar_avoids_rescan_on_second_load():
         with open(manifest_files[0], "r", encoding="utf-8") as f:
             manifest = json.load(f)
         assert manifest.get("completed") is True
-        assert manifest.get("schema_version") == 3
-        # v3 manifest records distinct source-metadata and semantic-config
-        # fingerprints; both must be present for cache-hit validation.
+        assert manifest.get("schema_version") == 4
         assert "source_metadata_fingerprint_sha256" in manifest
         assert "semantic_config_fingerprint_sha256" in manifest
+        assert "window_specs" in manifest
+        assert "field_metadata" in manifest
+        assert "num_src_active_nodes" in manifest
+        assert "num_dst_active_nodes" in manifest
+        assert "node_feature_storage_bytes" in manifest
 
         # Second load: sidecar must be a hit, no source scan.
         _, _, _, full_data2, _ = load_all_datasets(cfg)
@@ -256,6 +259,11 @@ def test_persistent_sidecar_avoids_rescan_on_second_load():
             f"{second_scan_count}"
         )
         assert second_tel["persistent_cache_hit"] is True
+        assert second_tel["metadata_source_load_count"] == 0
+        assert second_tel["total_source_artifact_load_count"] == 0
+        assert second_tel["warm_source_temporaldata_load_count"] == 0
+        assert second_tel["sidecar_manifest_hit"] is True
+        assert second_tel["sidecar_tensor_load_count"] == 2
         assert second_tel["persistent_cache_hit_count"] == 1
 
         # Telemetry values must match across the two loads (no semantic drift).

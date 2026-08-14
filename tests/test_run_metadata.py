@@ -205,6 +205,10 @@ def test_runtime_json_written(tmp_path):
 
     rt_file = run_dir / "runtime.json"
     assert rt_file.exists(), "runtime.json was not created"
+    runtime = _read_json(rt_file)
+    assert runtime["is_smoke"] is False
+    assert runtime["max_windows_per_split"] is None
+    json.dumps(runtime)  # every telemetry value must be JSON-serialisable
 
 
 def test_runtime_json_re_read(tmp_path):
