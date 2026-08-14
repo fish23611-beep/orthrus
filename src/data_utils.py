@@ -44,26 +44,48 @@ def _current_rss_mb() -> float | None:
             return None
 
 
+def _peak_rss_mb() -> float | None:
+    """Return the process high-water RSS reported by the kernel."""
+    try:
+        value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        return value / (1024 * 1024) if sys.platform == "darwin" else value / 1024
+    except Exception:
+        return None
+
+
 class _LoaderTelemetry:
     """Small phase recorder used by the loader and persisted in runtime.json."""
 
     def __init__(self) -> None:
         self.phases: dict[str, float | None] = {}
+        self.peak_phases: dict[str, float | None] = {}
         self.peak_rss_mb: float | None = None
 
     def observe(self, phase: str, *, emit: bool = True) -> None:
         rss = _current_rss_mb()
+        peak_rss = _peak_rss_mb()
         self.phases[phase] = rss
-        if rss is not None:
-            self.peak_rss_mb = rss if self.peak_rss_mb is None else max(self.peak_rss_mb, rss)
+        self.peak_phases[phase] = peak_rss
+        observed = [value for value in (rss, peak_rss) if value is not None]
+        if observed:
+            phase_peak = max(observed)
+            self.peak_rss_mb = (
+                phase_peak if self.peak_rss_mb is None
+                else max(self.peak_rss_mb, phase_peak)
+            )
         if emit:
-            suffix = "unavailable" if rss is None else f"{rss:.2f} MB"
-            print(f"[Dataset loader RSS] {phase}: {suffix}")
+            current_text = "unavailable" if rss is None else f"{rss:.2f} MB"
+            peak_text = "unavailable" if peak_rss is None else f"{peak_rss:.2f} MB"
+            print(
+                f"[Dataset loader RSS] {phase}: current={current_text}, "
+                f"peak={peak_text}"
+            )
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "architecture": "path_backed_bounded_memory",
             "rss_mb_by_phase": dict(self.phases),
+            "peak_rss_mb_by_phase": dict(self.peak_phases),
             "dataset_loader_peak_rss_mb": self.peak_rss_mb,
         }
 
@@ -97,6 +119,10 @@ class _HistoryAccessTelemetry:
         "sidecar_semantic_config_fingerprint_sha256",
         "sidecar_source_metadata_fingerprint_sha256",
         "sidecar_dataset_name",
+        "sidecar_manifest_hit",
+        "sidecar_tensor_load_count",
+        "warm_source_temporaldata_load_count",
+        "cold_source_temporaldata_load_count",
     )
 
     def __init__(self) -> None:
@@ -141,11 +167,19 @@ class _HistoryAccessTelemetry:
         self.index_rss_mb: float | None = None
         self.compact_bytes: int = 0
         self.node_table_bytes: int = 0
+        self.node_feature_storage_bytes: int = 0
+        self.node_id_index_bytes: int = 0
+        self.num_src_active_nodes: int = 0
+        self.num_dst_active_nodes: int = 0
         # Persistent sidecar cache (the on-disk fast path that lets us skip
         # the streaming source-artifact scan when the source artifacts and
         # build config have not changed).
         self.persistent_cache_hit: bool = False
         self.persistent_cache_hit_count: int = 0
+        self.sidecar_manifest_hit: bool = False
+        self.sidecar_tensor_load_count: int = 0
+        self.warm_source_temporaldata_load_count: int = 0
+        self.cold_source_temporaldata_load_count: int = 0
         # Sidecar identity telemetry — exposes the manifest fields that
         # gated the cache hit decision so the runtime audit can prove the
         # baseline/MSTC sidecar-misuse case is impossible.
@@ -160,7 +194,7 @@ class _HistoryAccessTelemetry:
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "architecture": "compact_history_random_access_v2",
+            "architecture": "compact_history_random_access_sparse_sidecar_v4",
             "history_lookup_calls": self.history_lookup_calls,
             "history_lookup_events": self.history_lookup_events,
             "field_lookup_counts": dict(self.field_lookup_counts),
@@ -190,8 +224,16 @@ class _HistoryAccessTelemetry:
             "index_rss_mb": self.index_rss_mb,
             "compact_bytes": self.compact_bytes,
             "node_table_bytes": self.node_table_bytes,
+            "node_feature_storage_bytes": self.node_feature_storage_bytes,
+            "node_id_index_bytes": self.node_id_index_bytes,
+            "num_src_active_nodes": self.num_src_active_nodes,
+            "num_dst_active_nodes": self.num_dst_active_nodes,
             "persistent_cache_hit": self.persistent_cache_hit,
             "persistent_cache_hit_count": self.persistent_cache_hit_count,
+            "sidecar_manifest_hit": self.sidecar_manifest_hit,
+            "sidecar_tensor_load_count": self.sidecar_tensor_load_count,
+            "warm_source_temporaldata_load_count": self.warm_source_temporaldata_load_count,
+            "cold_source_temporaldata_load_count": self.cold_source_temporaldata_load_count,
             # Sidecar identity exposed for audit.
             "sidecar_directory": self.sidecar_directory,
             "sidecar_dataset_name": self.sidecar_dataset_name,
@@ -210,7 +252,7 @@ class _CompactIndex:
 
     During BoundedFullData init, extracts frequently-accessed small fields into
     compact global tensors. Per-node semantic features (x_src/x_dst) are stored
-    in a node-level table once each (with strict consistency validation).
+    once per active node and role (with strict consistency validation).
     msg is derived on demand from x_src / x_dst / edge_type without loading
     the source TemporalData.
 
@@ -218,14 +260,8 @@ class _CompactIndex:
     I/O amplification that occurred with cache_windows=1 and random
     history e_id access across many windows.
 
-    Memory budget (THEIA_E3 ~1M nodes, ~430 windows):
-        - src/dst (int64):   2 × 8 × 10M ≈ 160 MB
-        - t (int64):         8 × 10M ≈ 80 MB
-        - edge_type_index (int32): 4 × 10M ≈ 40 MB
-        - src_type/dst_type: 2 × 4 × 10M ≈ 80 MB
-        - split (int8):      10M ≈ 10 MB
-        - node table (float32, 131 dim): 1M × 4 × 131 ≈ 524 MB
-        - TOTAL compact:     ~900 MB (bounded, not per-window)
+    Node-feature memory is O(active role-nodes * feature_dim), independent of
+    the largest sparse node identifier.
     """
 
     __slots__ = (
@@ -234,8 +270,9 @@ class _CompactIndex:
         "_src_type", "_dst_type",
         "_edge_type_index", "_edge_type_num_types",
         "_split",
-        # Node-level semantic feature table
-        "_node_table_x_src", "_node_table_x_dst",
+        # Sparse role-specific node semantic feature tables
+        "_src_node_ids", "_src_node_features",
+        "_dst_node_ids", "_dst_node_features",
         "_node_table_dim", "_node_table_max_node",
         # msg derivation config
         "_msg_predict_edge_type", "_msg_use_edge_type",
@@ -278,9 +315,11 @@ class _CompactIndex:
         self._edge_type_num_types = 0
         self._split = torch.empty(total_events, dtype=torch.int8)
 
-        # Node-level semantic feature table. Allocated lazily by build().
-        self._node_table_x_src: torch.Tensor | None = None
-        self._node_table_x_dst: torch.Tensor | None = None
+        # Sparse role-specific node tables. Allocated lazily by build().
+        self._src_node_ids: torch.Tensor | None = None
+        self._src_node_features: torch.Tensor | None = None
+        self._dst_node_ids: torch.Tensor | None = None
+        self._dst_node_features: torch.Tensor | None = None
         self._node_table_dim: int = -1
         self._node_table_max_node: int = -1
 
@@ -305,7 +344,12 @@ class _CompactIndex:
         return self._node_table_dim
 
     def has_node_table(self) -> bool:
-        return self._node_table_x_src is not None and self._node_table_x_dst is not None
+        return all(tensor is not None for tensor in (
+            self._src_node_ids,
+            self._src_node_features,
+            self._dst_node_ids,
+            self._dst_node_features,
+        ))
 
     def has_msg_derivation(self) -> bool:
         return (
@@ -319,16 +363,19 @@ class _CompactIndex:
     # ------------------------------------------------------------------
     # Sidecar layout (next to ``edge_embeds_dir``):
     #   _compact_index_v2/
-    #     manifest.json    {schema_version, dataset, view_mode,
+    #     manifest__<dataset>__<view>.json
+    #                      {schema_version, dataset, view_mode,
     #                       source_metadata_fingerprint_sha256,
     #                       semantic_config_fingerprint_sha256,
     #                       total_events, edge_type_num_types, msg_dim,
     #                       node_table_dim, node_table_max_node,
-    #                       msg_predict_edge_type, num_node_types,
-    #                       split_counts, view_mode, completed=true}
-    #     compact.pt       {src, dst, t, src_type, dst_type,
+    #                       num_src_active_nodes, num_dst_active_nodes,
+    #                       node_feature_storage_bytes, window_specs,
+    #                       field_metadata, max_node, completed=true}
+    #     compact__<generation>.pt {src, dst, t, src_type, dst_type,
     #                       edge_type_index, split}
-    #     nodes.pt         {x_src, x_dst}
+    #     nodes__<generation>.pt {src_node_ids, src_features,
+    #                       dst_node_ids, dst_features}
     #
     # Two distinct fingerprints gate the sidecar:
     #
@@ -357,7 +404,7 @@ class _CompactIndex:
     #
     # Stale/invalid sidecars are silently rebuilt.
     # ------------------------------------------------------------------
-    PERSISTENT_SCHEMA_VERSION = 3
+    PERSISTENT_SCHEMA_VERSION = 4
     PERSISTENT_DIR_NAME = "_compact_index_v2"
 
     # The cfg attribute paths that actually influence the compact index
@@ -471,60 +518,265 @@ class _CompactIndex:
             return None
         return os.path.dirname(os.path.dirname(first))
 
-    def _try_load_persistent(self, cfg: Any, view_mode: str | None) -> bool:
-        """
-        Attempt to restore the compact index from the persistent sidecar.
+    @staticmethod
+    def _encode_field_metadata(
+        field_metadata: dict[str, tuple[tuple[int, ...], torch.dtype]],
+    ) -> dict[str, dict[str, Any]]:
+        return {
+            field: {"shape": list(shape), "dtype": str(dtype)}
+            for field, (shape, dtype) in sorted(field_metadata.items())
+        }
 
-        Returns True if the sidecar was successfully loaded (matches schema,
-        dataset name, view_mode, semantic-config fingerprint, and
-        source-metadata fingerprint). On miss/mismatch the index is left
-        untouched and ``build()`` will perform a full rebuild.
+    @staticmethod
+    def _decode_field_metadata(
+        payload: Any,
+    ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        if not isinstance(payload, dict):
+            raise ValueError("sidecar field_metadata must be a mapping")
+        supported_dtypes = {
+            str(dtype): dtype for dtype in (
+                torch.float16, torch.float32, torch.float64,
+                torch.int8, torch.int16, torch.int32, torch.int64,
+                torch.uint8, torch.bool,
+            )
+        }
+        result: dict[str, tuple[tuple[int, ...], torch.dtype]] = {}
+        for field, metadata in payload.items():
+            if not isinstance(field, str) or not isinstance(metadata, dict):
+                raise ValueError("invalid sidecar field_metadata entry")
+            shape_raw = metadata.get("shape")
+            dtype_raw = metadata.get("dtype")
+            if (
+                not isinstance(shape_raw, list)
+                or any(not isinstance(dim, int) or dim < 0 for dim in shape_raw)
+                or dtype_raw not in supported_dtypes
+            ):
+                raise ValueError(f"invalid sidecar metadata for field {field!r}")
+            result[field] = (tuple(shape_raw), supported_dtypes[dtype_raw])
+        return result
 
-        The two-fingerprint contract is the correctness gate that prevents
-        baseline → MSTC sidecar reuse: changing only training hyperparameters
-        keeps the semantic fingerprint identical (so unrelated re-runs may
-        reuse the sidecar), but flipping any field that affects compact
-        semantics forces a rebuild.
-        """
+    def _encoded_window_specs(self) -> list[dict[str, Any]]:
+        root = self._edge_embeds_root()
+        result = []
+        for spec in self._specs:
+            relpath = os.path.relpath(spec.path, root) if root else os.path.basename(spec.path)
+            result.append({
+                "relative_path": relpath,
+                "split_name": spec.split_name,
+                "split_index": int(spec.split_index),
+                "split_window_index": int(spec.split_window_index),
+                "global_window_id": int(spec.global_window_id),
+                "global_offset": int(spec.global_offset),
+                "num_events": int(spec.num_events),
+            })
+        return result
+
+    def _restore_specs_from_manifest(
+        self, manifest: dict[str, Any]
+    ) -> tuple[
+        tuple["_WindowSpec", ...],
+        int,
+        dict[str, tuple[tuple[int, ...], torch.dtype]],
+    ]:
+        encoded = manifest.get("window_specs")
+        if not isinstance(encoded, list) or len(encoded) != len(self._specs):
+            raise ValueError("sidecar window_specs do not match resolved sources")
+        root = self._edge_embeds_root()
+        restored: list[_WindowSpec] = []
+        expected_offset = 0
+        for index, (base_spec, item) in enumerate(zip(self._specs, encoded)):
+            if not isinstance(item, dict):
+                raise ValueError("invalid sidecar window spec")
+            expected_relpath = (
+                os.path.relpath(base_spec.path, root)
+                if root else os.path.basename(base_spec.path)
+            )
+            identity = (
+                item.get("relative_path") == expected_relpath
+                and item.get("split_name") == base_spec.split_name
+                and int(item.get("split_index", -1)) == base_spec.split_index
+                and int(item.get("split_window_index", -1)) == base_spec.split_window_index
+                and int(item.get("global_window_id", -1)) == index
+                and int(item.get("global_offset", -1)) == expected_offset
+            )
+            if not identity:
+                raise ValueError("sidecar window ordering/identity mismatch")
+            num_events = int(item.get("num_events", -1))
+            if num_events < 0:
+                raise ValueError("sidecar window has invalid num_events")
+            restored.append(_WindowSpec(
+                path=base_spec.path,
+                split_name=base_spec.split_name,
+                split_index=base_spec.split_index,
+                split_window_index=base_spec.split_window_index,
+                global_window_id=index,
+                global_offset=expected_offset,
+                num_events=num_events,
+            ))
+            expected_offset += num_events
+        if expected_offset != int(manifest.get("total_events", -1)):
+            raise ValueError("sidecar total_events does not match window specs")
+        max_node = int(manifest.get("max_node", -1))
+        if max_node < 0:
+            raise ValueError("sidecar max_node is invalid")
+        field_metadata = self._decode_field_metadata(manifest.get("field_metadata"))
+        return tuple(restored), max_node, field_metadata
+
+    def _read_valid_manifest(
+        self, cfg: Any, view_mode: str | None
+    ) -> tuple[
+        dict[str, Any], tuple["_WindowSpec", ...], int,
+        dict[str, tuple[tuple[int, ...], torch.dtype]], str, str, str,
+    ] | None:
         root = self._persistent_root(cfg)
         if root is None:
-            return False
-        try:
-            dataset_name = getattr(getattr(cfg, "dataset", None), "name", "")
-        except AttributeError:
-            dataset_name = ""
+            return None
+        dataset_name = getattr(getattr(cfg, "dataset", None), "name", "")
         manifest_path = self._manifest_path(root, dataset_name, view_mode)
         if not os.path.isfile(manifest_path):
+            return None
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            if (
+                manifest.get("schema_version") != self.PERSISTENT_SCHEMA_VERSION
+                or manifest.get("dataset") != dataset_name
+                or manifest.get("view_mode") != (view_mode or "")
+                or not manifest.get("completed", False)
+            ):
+                return None
+            source_fp = self._compute_source_metadata_fingerprint()["sha256"]
+            semantic_fp = self._compute_semantic_config_fingerprint(cfg)
+            if manifest.get("source_metadata_fingerprint_sha256") != source_fp:
+                return None
+            if manifest.get("semantic_config_fingerprint_sha256") != semantic_fp:
+                return None
+            for key in ("compact_file", "nodes_file"):
+                filename = manifest.get(key)
+                if (
+                    not isinstance(filename, str)
+                    or os.path.basename(filename) != filename
+                    or not os.path.isfile(os.path.join(root, filename))
+                ):
+                    return None
+            specs, max_node, field_metadata = self._restore_specs_from_manifest(manifest)
+            return (
+                manifest, specs, max_node, field_metadata,
+                root, source_fp, semantic_fp,
+            )
+        except (OSError, TypeError, ValueError, KeyError):
+            return None
+
+    def try_restore_metadata(
+        self, cfg: Any, view_mode: str | None
+    ) -> tuple[
+        tuple["_WindowSpec", ...], int,
+        dict[str, tuple[tuple[int, ...], torch.dtype]],
+    ] | None:
+        """Restore window metadata without loading any source TemporalData."""
+        restored = self._read_valid_manifest(cfg, view_mode)
+        if restored is None:
+            return None
+        _, specs, max_node, field_metadata, root, source_fp, semantic_fp = restored
+        self._telemetry.sidecar_manifest_hit = True
+        self._telemetry.sidecar_directory = root
+        self._telemetry.sidecar_dataset_name = getattr(cfg.dataset, "name", "")
+        self._telemetry.sidecar_view_mode = view_mode or ""
+        self._telemetry.sidecar_source_metadata_fingerprint_sha256 = source_fp
+        self._telemetry.sidecar_semantic_config_fingerprint_sha256 = semantic_fp
+        return specs, max_node, field_metadata
+
+    def _try_load_persistent(
+        self, cfg: Any, view_mode: str | None,
+        loader_telemetry: _LoaderTelemetry | None = None,
+    ) -> bool:
+        """Load a fully validated schema-v4 compact and sparse-node sidecar."""
+        restored = self._read_valid_manifest(cfg, view_mode)
+        if restored is None:
+            return False
+        manifest, specs, max_node, _, root, source_fp, semantic_fp = restored
+        total_events = int(manifest["total_events"])
+        if self._total_events not in (0, total_events):
             return False
         try:
-            with open(manifest_path, "r", encoding="utf-8") as f:
-                manifest = json.load(f)
-            blob_path = os.path.join(root, "compact.pt")
-            nodes_path = os.path.join(root, "nodes.pt")
-            if not (os.path.isfile(blob_path) and os.path.isfile(nodes_path)):
-                return False
-            # Validate schema & dataset identity.
-            if (manifest.get("schema_version") != self.PERSISTENT_SCHEMA_VERSION
-                    or manifest.get("dataset") != dataset_name
-                    or manifest.get("view_mode") != (view_mode or "")):
-                return False
-            current_src_fp = self._compute_source_metadata_fingerprint()
-            current_sem_fp = self._compute_semantic_config_fingerprint(cfg)
-            if (manifest.get("source_metadata_fingerprint_sha256")
-                    != current_src_fp["sha256"]):
-                return False
-            if (manifest.get("semantic_config_fingerprint_sha256")
-                    != current_sem_fp):
-                return False
-            if not manifest.get("completed", False):
-                return False
-            # Validate stored dimensions match the current total_events.
-            if int(manifest.get("total_events", -1)) != int(self._total_events):
-                return False
-            # Load the index tensors. torch.load keeps things simple; sources
-            # are trusted because we own the sidecar directory.
+            blob_path = os.path.join(root, manifest["compact_file"])
+            nodes_path = os.path.join(root, manifest["nodes_file"])
             blob = torch.load(blob_path, map_location="cpu", weights_only=True)
+            self._telemetry.sidecar_tensor_load_count += 1
+            if loader_telemetry is not None:
+                loader_telemetry.observe("after compact sidecar load")
             nodes = torch.load(nodes_path, map_location="cpu", weights_only=True)
+            self._telemetry.sidecar_tensor_load_count += 1
+            if loader_telemetry is not None:
+                loader_telemetry.observe("after sparse node sidecar load")
+
+            compact_dtypes = {
+                "src": torch.int64,
+                "dst": torch.int64,
+                "t": torch.int64,
+                "src_type": torch.int32,
+                "dst_type": torch.int32,
+                "edge_type_index": torch.int32,
+                "split": torch.int8,
+            }
+            for key, expected_dtype in compact_dtypes.items():
+                value = blob.get(key)
+                if (
+                    not isinstance(value, torch.Tensor)
+                    or value.dtype != expected_dtype
+                    or tuple(value.shape) != (total_events,)
+                ):
+                    raise ValueError(f"invalid compact sidecar tensor {key!r}")
+
+            src_node_ids = nodes.get("src_node_ids")
+            src_features = nodes.get("src_features")
+            dst_node_ids = nodes.get("dst_node_ids")
+            dst_features = nodes.get("dst_features")
+            node_dim = int(manifest.get("node_table_dim", -1))
+            role_tensors = (
+                ("src", src_node_ids, src_features),
+                ("dst", dst_node_ids, dst_features),
+            )
+            for role, node_ids, features in role_tensors:
+                if (
+                    not isinstance(node_ids, torch.Tensor)
+                    or node_ids.dtype != torch.int64
+                    or node_ids.ndim != 1
+                    or not isinstance(features, torch.Tensor)
+                    or features.dtype != torch.float32
+                    or features.ndim != 2
+                    or features.shape != (node_ids.numel(), node_dim)
+                ):
+                    raise ValueError(f"invalid sparse {role} node tensors")
+                if node_ids.numel() > 1 and not bool((node_ids[1:] > node_ids[:-1]).all()):
+                    raise ValueError(f"sparse {role} node IDs are not strictly sorted")
+
+            assert isinstance(src_node_ids, torch.Tensor)
+            assert isinstance(src_features, torch.Tensor)
+            assert isinstance(dst_node_ids, torch.Tensor)
+            assert isinstance(dst_features, torch.Tensor)
+            if src_node_ids.numel() != int(manifest.get("num_src_active_nodes", -1)):
+                raise ValueError("src active-node count mismatch")
+            if dst_node_ids.numel() != int(manifest.get("num_dst_active_nodes", -1)):
+                raise ValueError("dst active-node count mismatch")
+            feature_bytes = (
+                src_features.element_size() * src_features.numel()
+                + dst_features.element_size() * dst_features.numel()
+            )
+            if feature_bytes != int(manifest.get("node_feature_storage_bytes", -1)):
+                raise ValueError("node feature storage size mismatch")
+            observed_max = max(
+                int(src_node_ids[-1]) if src_node_ids.numel() else -1,
+                int(dst_node_ids[-1]) if dst_node_ids.numel() else -1,
+            )
+            if observed_max != int(manifest.get("node_table_max_node", -2)):
+                raise ValueError("sparse node max ID mismatch")
+            if max_node != (observed_max + 1 if observed_max >= 0 else 0):
+                raise ValueError("loader max_node mismatch")
+
+            self._specs = specs
+            self._total_events = total_events
+            self._window_paths = {index: spec.path for index, spec in enumerate(specs)}
             self._src = blob["src"]
             self._dst = blob["dst"]
             self._t = blob["t"]
@@ -532,76 +784,49 @@ class _CompactIndex:
             self._dst_type = blob["dst_type"]
             self._edge_type_index = blob["edge_type_index"]
             self._split = blob["split"]
+            self._src_node_ids = src_node_ids
+            self._src_node_features = src_features
+            self._dst_node_ids = dst_node_ids
+            self._dst_node_features = dst_features
             self._edge_type_num_types = int(manifest.get("edge_type_num_types", 0))
-            self._node_table_x_src = nodes["x_src"]
-            self._node_table_x_dst = nodes["x_dst"]
-            self._node_table_dim = int(manifest.get("node_table_dim", -1))
-            self._node_table_max_node = int(manifest.get("node_table_max_node", -1))
+            self._node_table_dim = node_dim
+            self._node_table_max_node = observed_max
             self._msg_dim = int(manifest.get("msg_dim", -1))
-            self._msg_predict_edge_type = bool(
-                manifest.get("msg_predict_edge_type", False)
-            )
+            self._msg_predict_edge_type = bool(manifest.get("msg_predict_edge_type", False))
             self._msg_use_edge_type = not self._msg_predict_edge_type
             self._telemetry.index_build_count += 1
-            # Cache hit: the cold-start scans did not happen on this run.
-            self._telemetry.compact_build_source_load_count = 0
-            self._telemetry.compact_build_source_load_bytes_estimate = 0
-            self._telemetry.metadata_source_load_count = 0
-            self._telemetry.metadata_source_load_bytes_estimate = 0
-            self._telemetry.total_source_artifact_load_count = 0
-            self._telemetry.total_source_artifact_load_bytes_estimate = 0
-            self._telemetry.source_artifact_scan_count = 0
-            self._telemetry.source_artifact_scan_bytes_estimate = 0
-            self._telemetry.persistent_cache_hit_count = (
-                self._telemetry.persistent_cache_hit_count + 1
-            )
+            self._telemetry.persistent_cache_hit_count += 1
             self._telemetry.persistent_cache_hit = True
-            # Audit-trail telemetry.
+            self._telemetry.sidecar_manifest_hit = True
             self._telemetry.sidecar_directory = root
-            self._telemetry.sidecar_dataset_name = dataset_name
+            self._telemetry.sidecar_dataset_name = getattr(cfg.dataset, "name", "")
             self._telemetry.sidecar_view_mode = view_mode or ""
-            self._telemetry.sidecar_source_metadata_fingerprint_sha256 = (
-                current_src_fp["sha256"]
-            )
-            self._telemetry.sidecar_semantic_config_fingerprint_sha256 = current_sem_fp
+            self._telemetry.sidecar_source_metadata_fingerprint_sha256 = source_fp
+            self._telemetry.sidecar_semantic_config_fingerprint_sha256 = semantic_fp
             return True
-        except (OSError, ValueError, KeyError, RuntimeError):
-            # Any failure means "sidecar unusable"; rebuild from source.
+        except (OSError, TypeError, ValueError, KeyError, RuntimeError):
             return False
 
-    def _write_persistent(self, cfg: Any, view_mode: str | None) -> None:
-        """
-        Atomically write the freshly-built compact index to disk.
-
-        The build is staged in ``<root>/incomplete-<uuid>`` and renamed into
-        place via ``os.replace``, which is atomic on POSIX. An interrupted
-        build leaves only ``incomplete-*`` artifacts that are ignored on the
-        next startup.
-        """
+    def _write_persistent(
+        self, cfg: Any, view_mode: str | None,
+        field_metadata: dict[str, tuple[tuple[int, ...], torch.dtype]] | None,
+    ) -> None:
+        """Publish generation-named tensors first and the manifest last."""
         root = self._persistent_root(cfg)
-        if root is None:
+        if root is None or field_metadata is None or not self.has_node_table():
             return
-        try:
-            dataset_name = getattr(getattr(cfg, "dataset", None), "name", "")
-        except AttributeError:
-            dataset_name = ""
+        dataset_name = getattr(getattr(cfg, "dataset", None), "name", "")
         os.makedirs(root, exist_ok=True)
-        # Stage the write into a per-process temp dir so a crashed build does
-        # not corrupt the canonical manifest/compact.pt/nodes.pt.
-        stage = f".build-{os.getpid()}-{int(time_module.time()*1000)}"
+        timestamp = int(time_module.time() * 1000)
+        stage = f".build-{os.getpid()}-{timestamp}"
         stage_dir = os.path.join(root, stage)
         manifest_path = self._manifest_path(root, dataset_name, view_mode)
-        # If a previous canonical manifest exists, move it aside so the new
-        # build cannot atomically clobber a working sidecar until the temp
-        # write succeeds.
-        backup_manifest = manifest_path + ".prev"
-        if os.path.isfile(manifest_path):
-            try:
-                os.replace(manifest_path, backup_manifest)
-            except OSError:
-                backup_manifest = None  # type: ignore[assignment]
         try:
             os.makedirs(stage_dir, exist_ok=False)
+            assert self._src_node_ids is not None
+            assert self._src_node_features is not None
+            assert self._dst_node_ids is not None
+            assert self._dst_node_features is not None
             blob = {
                 "src": self._src.cpu(),
                 "dst": self._dst.cpu(),
@@ -612,72 +837,93 @@ class _CompactIndex:
                 "split": self._split.cpu(),
             }
             nodes = {
-                "x_src": self._node_table_x_src.cpu()
-                if self._node_table_x_src is not None else torch.empty(0, 0),
-                "x_dst": self._node_table_x_dst.cpu()
-                if self._node_table_x_dst is not None else torch.empty(0, 0),
+                "src_node_ids": self._src_node_ids.cpu(),
+                "src_features": self._src_node_features.cpu(),
+                "dst_node_ids": self._dst_node_ids.cpu(),
+                "dst_features": self._dst_node_features.cpu(),
             }
-            torch.save(blob, os.path.join(stage_dir, "compact.pt"))
-            torch.save(nodes, os.path.join(stage_dir, "nodes.pt"))
-            src_fp = self._compute_source_metadata_fingerprint()
-            sem_fp = self._compute_semantic_config_fingerprint(cfg)
+            source_fp = self._compute_source_metadata_fingerprint()["sha256"]
+            semantic_fp = self._compute_semantic_config_fingerprint(cfg)
+            safe_dataset = (dataset_name or "default").replace(os.sep, "_")
+            safe_view = (view_mode or "default").replace(os.sep, "_")
+            generation = (
+                f"{safe_dataset}__{safe_view}__{source_fp[:12]}_"
+                f"{semantic_fp[:12]}_{os.getpid()}_{timestamp}"
+            )
+            compact_file = f"compact__{generation}.pt"
+            nodes_file = f"nodes__{generation}.pt"
+            torch.save(blob, os.path.join(stage_dir, compact_file))
+            torch.save(nodes, os.path.join(stage_dir, nodes_file))
+
+            feature_bytes = (
+                self._src_node_features.element_size() * self._src_node_features.numel()
+                + self._dst_node_features.element_size() * self._dst_node_features.numel()
+            )
+            id_bytes = (
+                self._src_node_ids.element_size() * self._src_node_ids.numel()
+                + self._dst_node_ids.element_size() * self._dst_node_ids.numel()
+            )
             manifest = {
                 "schema_version": self.PERSISTENT_SCHEMA_VERSION,
                 "dataset": dataset_name,
                 "view_mode": view_mode or "",
-                "source_metadata_fingerprint_sha256": src_fp["sha256"],
-                "semantic_config_fingerprint_sha256": sem_fp,
+                "source_metadata_fingerprint_sha256": source_fp,
+                "semantic_config_fingerprint_sha256": semantic_fp,
+                "compact_file": compact_file,
+                "nodes_file": nodes_file,
                 "total_events": int(self._total_events),
                 "edge_type_num_types": int(self._edge_type_num_types),
                 "node_table_dim": int(self._node_table_dim),
                 "node_table_max_node": int(self._node_table_max_node),
+                "num_src_active_nodes": int(self._src_node_ids.numel()),
+                "num_dst_active_nodes": int(self._dst_node_ids.numel()),
+                "node_feature_storage_bytes": int(feature_bytes),
+                "node_id_index_bytes": int(id_bytes),
+                "max_node": int(self._node_table_max_node + 1),
                 "msg_dim": int(self._msg_dim),
                 "msg_predict_edge_type": bool(self._msg_predict_edge_type),
+                "window_specs": self._encoded_window_specs(),
+                "field_metadata": self._encode_field_metadata(field_metadata),
                 "completed": True,
             }
             manifest_filename = os.path.basename(manifest_path)
-            with open(os.path.join(stage_dir, manifest_filename), "w",
-                      encoding="utf-8") as f:
-                json.dump(manifest, f, sort_keys=True)
-            # Atomic rename of staged files into the canonical names.
+            with open(
+                os.path.join(stage_dir, manifest_filename), "w", encoding="utf-8"
+            ) as handle:
+                json.dump(manifest, handle, sort_keys=True)
+
+            # Tensor generations become visible first. The manifest is the
+            # single atomic commit point and is replaced only after both exist.
             os.replace(
-                os.path.join(stage_dir, manifest_filename),
-                manifest_path,
+                os.path.join(stage_dir, compact_file), os.path.join(root, compact_file)
             )
             os.replace(
-                os.path.join(stage_dir, "compact.pt"),
-                os.path.join(root, "compact.pt"),
+                os.path.join(stage_dir, nodes_file), os.path.join(root, nodes_file)
             )
             os.replace(
-                os.path.join(stage_dir, "nodes.pt"),
-                os.path.join(root, "nodes.pt"),
+                os.path.join(stage_dir, manifest_filename), manifest_path
             )
-            # Sidecar identity telemetry for the audit trail.
             self._telemetry.sidecar_directory = root
             self._telemetry.sidecar_dataset_name = dataset_name
             self._telemetry.sidecar_view_mode = view_mode or ""
-            self._telemetry.sidecar_source_metadata_fingerprint_sha256 = src_fp["sha256"]
-            self._telemetry.sidecar_semantic_config_fingerprint_sha256 = sem_fp
-        except OSError:
-            # Disk-full / permission-denied: silently skip the sidecar.
+            self._telemetry.sidecar_source_metadata_fingerprint_sha256 = source_fp
+            self._telemetry.sidecar_semantic_config_fingerprint_sha256 = semantic_fp
+        except (OSError, RuntimeError):
             pass
         finally:
-            # Clean up stage + backup.
             try:
                 import shutil
                 if os.path.isdir(stage_dir):
                     shutil.rmtree(stage_dir, ignore_errors=True)
             except Exception:
                 pass
-            if backup_manifest and os.path.isfile(backup_manifest):
-                # If the new write succeeded, the previous manifest is no
-                # longer authoritative; remove it.
-                try:
-                    os.remove(backup_manifest)
-                except OSError:
-                    pass
 
-    def build(self, cfg: Any, view_mode: str | None) -> None:
+    def build(
+        self, cfg: Any, view_mode: str | None, *,
+        field_metadata: dict[str, tuple[tuple[int, ...], torch.dtype]] | None = None,
+        loader_telemetry: _LoaderTelemetry | None = None,
+        allow_persistent: bool = True,
+    ) -> None:
         """
         Populate compact tensors AND the node-level x_src/x_dst table by scanning
         each window exactly once.
@@ -696,7 +942,9 @@ class _CompactIndex:
         persisted atomically.
         """
         t0 = time_module.time()
-        if self._try_load_persistent(cfg, view_mode):
+        if allow_persistent and self._try_load_persistent(
+            cfg, view_mode, loader_telemetry=loader_telemetry
+        ):
             self._telemetry.index_build_seconds += time_module.time() - t0
             self._telemetry.index_rss_mb = _current_rss_mb()
             self._telemetry.compact_bytes = (
@@ -708,11 +956,24 @@ class _CompactIndex:
                 self._edge_type_index.element_size() * self._edge_type_index.numel() +
                 self._split.element_size() * self._split.numel()
             )
-            if self._node_table_x_src is not None:
-                self._telemetry.node_table_bytes = (
-                    self._node_table_x_src.element_size() * self._node_table_x_src.numel() +
-                    self._node_table_x_dst.element_size() * self._node_table_x_dst.numel()
+            if self.has_node_table():
+                assert self._src_node_ids is not None
+                assert self._src_node_features is not None
+                assert self._dst_node_ids is not None
+                assert self._dst_node_features is not None
+                feature_bytes = (
+                    self._src_node_features.element_size() * self._src_node_features.numel()
+                    + self._dst_node_features.element_size() * self._dst_node_features.numel()
                 )
+                id_bytes = (
+                    self._src_node_ids.element_size() * self._src_node_ids.numel()
+                    + self._dst_node_ids.element_size() * self._dst_node_ids.numel()
+                )
+                self._telemetry.node_feature_storage_bytes = feature_bytes
+                self._telemetry.node_id_index_bytes = id_bytes
+                self._telemetry.node_table_bytes = feature_bytes + id_bytes
+                self._telemetry.num_src_active_nodes = self._src_node_ids.numel()
+                self._telemetry.num_dst_active_nodes = self._dst_node_ids.numel()
             return
 
         # ---- Pass 1: gather per-window metadata, collect node ids, max node ----
@@ -736,11 +997,6 @@ class _CompactIndex:
         self._msg_predict_edge_type = "predict_edge_type" in decoder_methods
         self._msg_use_edge_type = not self._msg_predict_edge_type
 
-        # We also need x_src dim and (optionally) src_type to know msg_dim.
-        # msg_dim = in_dim + in_dim + (edge_type_dim if not predict_edge_type else 0)
-        use_node_type_in_node_feats = bool(
-            getattr(cfg.detection.gnn_training.encoder, "use_node_type_in_node_feats", True)
-        )
 
         for idx, spec in enumerate(self._specs):
             data = _prepare_window(cfg, spec.path, view_mode)
@@ -753,8 +1009,31 @@ class _CompactIndex:
             self._telemetry.compact_build_source_load_count += 1
             self._telemetry.compact_build_source_load_bytes_estimate += int(scan_size)
             self._telemetry.total_source_artifact_load_count += 1
+            self._telemetry.cold_source_temporaldata_load_count += 1
             self._telemetry.total_source_artifact_load_bytes_estimate += int(scan_size)
 
+            x_src = getattr(data, "x_src", None)
+            x_dst = getattr(data, "x_dst", None)
+            if not isinstance(x_src, torch.Tensor) or not isinstance(x_dst, torch.Tensor):
+                raise RuntimeError(
+                    f"Window {spec.path} lacks x_src/x_dst; cannot build "
+                    "node-level feature table"
+                )
+            if x_src.ndim != 2 or x_dst.ndim != 2:
+                raise RuntimeError(f"Window {spec.path} has invalid x_src/x_dst rank")
+            if feature_dim < 0:
+                feature_dim = int(x_src.shape[1])
+                if int(x_dst.shape[1]) != feature_dim:
+                    raise RuntimeError(
+                        f"Window {spec.path} has mismatched x_src/x_dst "
+                        f"dims: {x_src.shape[1]} vs {x_dst.shape[1]}"
+                    )
+            elif int(x_src.shape[1]) != feature_dim or int(x_dst.shape[1]) != feature_dim:
+                raise RuntimeError(
+                    f"Window {spec.path} has inconsistent feature dim "
+                    f"(expected {feature_dim}, got "
+                    f"x_src={x_src.shape[1]}, x_dst={x_dst.shape[1]})"
+                )
             if n_events > 0:
                 end = global_offset + n_events
                 self._src[global_offset:end] = data.src.long()
@@ -768,56 +1047,26 @@ class _CompactIndex:
                 # Populate the node-level feature table for x_src/x_dst.
                 # x_src / x_dst must be invariant per node across windows; we
                 # enforce that with first-write-wins consistency check.
-                x_src = data.x_src
-                x_dst = data.x_dst
-                if x_src is None or x_dst is None:
-                    raise RuntimeError(
-                        f"Window {spec.path} lacks x_src/x_dst; cannot build "
-                        "node-level feature table"
-                    )
-                if feature_dim < 0:
-                    feature_dim = int(x_src.shape[1])
-                    if int(x_dst.shape[1]) != feature_dim:
-                        raise RuntimeError(
-                            f"Window {spec.path} has mismatched x_src/x_dst "
-                            f"dims: {x_src.shape[1]} vs {x_dst.shape[1]}"
-                        )
-                elif int(x_src.shape[1]) != feature_dim or int(x_dst.shape[1]) != feature_dim:
-                    raise RuntimeError(
-                        f"Window {spec.path} has inconsistent feature dim "
-                        f"(expected {feature_dim}, got "
-                        f"x_src={x_src.shape[1]}, x_dst={x_dst.shape[1]})"
-                    )
-
                 src_cpu = data.src.long().cpu().tolist()
-                # Vectorised uniqueness: keep order of first appearance.
-                seen_in_window: set[int] = set()
                 for i, node_id in enumerate(src_cpu):
-                    if node_id in seen_in_window:
-                        continue
-                    seen_in_window.add(node_id)
-                    feat = x_src[i].detach().cpu()
+                    feat = x_src[i].detach().cpu().to(torch.float32).clone()
                     if node_id in node_x_src:
                         if not torch.equal(node_x_src[node_id], feat):
                             inconsistent_nodes.append((node_id, "x_src"))
-                            if len(inconsistent_nodes) > 8:
+                            if len(inconsistent_nodes) >= 8:
                                 break
                     else:
                         node_x_src[node_id] = feat
                     if node_id > max_node:
                         max_node = node_id
 
-                seen_in_window.clear()
                 dst_cpu = data.dst.long().cpu().tolist()
                 for i, node_id in enumerate(dst_cpu):
-                    if node_id in seen_in_window:
-                        continue
-                    seen_in_window.add(node_id)
-                    feat = x_dst[i].detach().cpu()
+                    feat = x_dst[i].detach().cpu().to(torch.float32).clone()
                     if node_id in node_x_dst:
                         if not torch.equal(node_x_dst[node_id], feat):
                             inconsistent_nodes.append((node_id, "x_dst"))
-                            if len(inconsistent_nodes) > 8:
+                            if len(inconsistent_nodes) >= 8:
                                 break
                     else:
                         node_x_dst[node_id] = feat
@@ -825,7 +1074,7 @@ class _CompactIndex:
                         max_node = node_id
 
                 global_offset = end
-                if len(inconsistent_nodes) > 0 and len(inconsistent_nodes) > 8:
+                if len(inconsistent_nodes) >= 8:
                     break
             self._window_paths[idx] = spec.path
             del data
@@ -840,24 +1089,26 @@ class _CompactIndex:
                 f"{sample}"
             )
 
-        # ---- Build the dense node table ----
-        if feature_dim < 0 or max_node < 0:
-            # No events at all — provide a minimal empty table so consumers
-            # don't need special-casing.
-            self._node_table_dim = 0
+        # ---- Build sorted sparse role-specific node tables ----
+        if max_node < 0:
+            empty_dim = max(feature_dim, 0)
+            self._node_table_dim = empty_dim
             self._node_table_max_node = -1
-            self._node_table_x_src = torch.empty(0, 0, dtype=torch.float32)
-            self._node_table_x_dst = torch.empty(0, 0, dtype=torch.float32)
+            self._src_node_ids = torch.empty(0, dtype=torch.int64)
+            self._src_node_features = torch.empty(0, empty_dim, dtype=torch.float32)
+            self._dst_node_ids = torch.empty(0, dtype=torch.int64)
+            self._dst_node_features = torch.empty(0, empty_dim, dtype=torch.float32)
         else:
-            n_nodes = max_node + 1
-            x_src_table = torch.zeros((n_nodes, feature_dim), dtype=torch.float32)
-            x_dst_table = torch.zeros((n_nodes, feature_dim), dtype=torch.float32)
-            for node_id, feat in node_x_src.items():
-                x_src_table[node_id] = feat
-            for node_id, feat in node_x_dst.items():
-                x_dst_table[node_id] = feat
-            self._node_table_x_src = x_src_table
-            self._node_table_x_dst = x_dst_table
+            src_ids = sorted(node_x_src)
+            dst_ids = sorted(node_x_dst)
+            self._src_node_ids = torch.tensor(src_ids, dtype=torch.int64)
+            self._src_node_features = torch.stack(
+                [node_x_src[node_id] for node_id in src_ids]
+            ).to(torch.float32)
+            self._dst_node_ids = torch.tensor(dst_ids, dtype=torch.int64)
+            self._dst_node_features = torch.stack(
+                [node_x_dst[node_id] for node_id in dst_ids]
+            ).to(torch.float32)
             self._node_table_dim = feature_dim
             self._node_table_max_node = max_node
 
@@ -886,14 +1137,27 @@ class _CompactIndex:
             self._edge_type_index.element_size() * self._edge_type_index.numel() +
             self._split.element_size() * self._split.numel()
         )
-        if self._node_table_x_src is not None:
-            self._telemetry.node_table_bytes = (
-                self._node_table_x_src.element_size() * self._node_table_x_src.numel() +
-                self._node_table_x_dst.element_size() * self._node_table_x_dst.numel()
+        if self.has_node_table():
+            assert self._src_node_ids is not None
+            assert self._src_node_features is not None
+            assert self._dst_node_ids is not None
+            assert self._dst_node_features is not None
+            feature_bytes = (
+                self._src_node_features.element_size() * self._src_node_features.numel()
+                + self._dst_node_features.element_size() * self._dst_node_features.numel()
             )
+            id_bytes = (
+                self._src_node_ids.element_size() * self._src_node_ids.numel()
+                + self._dst_node_ids.element_size() * self._dst_node_ids.numel()
+            )
+            self._telemetry.node_feature_storage_bytes = feature_bytes
+            self._telemetry.node_id_index_bytes = id_bytes
+            self._telemetry.node_table_bytes = feature_bytes + id_bytes
+            self._telemetry.num_src_active_nodes = self._src_node_ids.numel()
+            self._telemetry.num_dst_active_nodes = self._dst_node_ids.numel()
 
         # Persist the freshly-built index for next run.
-        self._write_persistent(cfg, view_mode)
+        self._write_persistent(cfg, view_mode, field_metadata)
 
     def _build_edge_type_onehot(self, indices: torch.Tensor) -> torch.Tensor:
         """Return float32 one-hot [N, num_edge_types]."""
@@ -951,41 +1215,57 @@ class _CompactIndex:
     def _node_field_lookup(
         self, kind: str, flat_ids: torch.Tensor, N: int
     ) -> torch.Tensor:
-        """Serve x_src or x_dst from the per-node table."""
-        if self._node_table_x_src is None:
+        """Serve x_src or x_dst from a sorted sparse active-node table."""
+        if not self.has_node_table():
             raise AttributeError(
                 "x_src/x_dst are not served by the compact index for this "
                 "dataset; the consumer must load them from a window."
             )
         self._telemetry.node_lookup_count += N
-        # Resolve per-event source node ids for the requested kind.
-        node_ids = self._src if kind == "x_src" else self._dst
-        # flat_ids are global event ids; gather the corresponding node ids.
-        per_event_node = node_ids[flat_ids].long().clamp_min(0)
-        if per_event_node.numel() == 0:
-            return torch.zeros(0, self._node_table_dim, dtype=torch.float32)
-        max_node_id = int(per_event_node.max().item())
-        if max_node_id >= self._node_table_x_src.shape[0]:
+        event_nodes = self._src if kind == "x_src" else self._dst
+        return self._lookup_node_features(kind, event_nodes[flat_ids].long())
+
+    def _lookup_node_features(
+        self, kind: str, requested_node_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Map arbitrary node IDs through a sorted index with exact validation."""
+        index_ids = self._src_node_ids if kind == "x_src" else self._dst_node_ids
+        features = (
+            self._src_node_features if kind == "x_src"
+            else self._dst_node_features
+        )
+        if index_ids is None or features is None:
+            raise AttributeError(f"Sparse node table {kind!r} is unavailable")
+        if requested_node_ids.numel() == 0:
+            return torch.empty(0, self._node_table_dim, dtype=torch.float32)
+        if index_ids.numel() == 0:
+            raise IndexError(f"Sparse node table {kind!r} is empty")
+        positions = torch.searchsorted(index_ids, requested_node_ids)
+        in_range = positions < index_ids.numel()
+        safe_positions = positions.clamp_max(index_ids.numel() - 1)
+        exact = in_range & (index_ids[safe_positions] == requested_node_ids)
+        if not bool(exact.all()):
+            missing = requested_node_ids[~exact][:5].tolist()
             raise IndexError(
-                f"node id {max_node_id} exceeds node table size "
-                f"{self._node_table_x_src.shape[0]}; data is inconsistent"
+                f"Node IDs {missing} are absent from sparse {kind} table; "
+                "sidecar/source data is inconsistent"
             )
-        table = self._node_table_x_src if kind == "x_src" else self._node_table_x_dst
-        return table[per_event_node]
+        return features[positions]
 
     def _msg_lookup(self, flat_ids: torch.Tensor, N: int) -> torch.Tensor:
         """Derive msg from x_src[node] || x_dst[node] || (edge_type)."""
-        if self._msg_dim <= 0 or self._node_table_x_src is None:
+        if self._msg_dim <= 0 or not self.has_node_table():
             raise AttributeError(
                 "msg cannot be derived from compact index for this dataset"
             )
         self._telemetry.msg_lookup_count += N
-        src_nodes = self._src[flat_ids].long().clamp_min(0)
-        dst_nodes = self._dst[flat_ids].long().clamp_min(0)
-        x_src_per_event = self._node_table_x_src[src_nodes]
-        x_dst_per_event = self._node_table_x_dst[dst_nodes]
+        src_nodes = self._src[flat_ids].long()
+        dst_nodes = self._dst[flat_ids].long()
+        x_src_per_event = self._lookup_node_features("x_src", src_nodes)
+        x_dst_per_event = self._lookup_node_features("x_dst", dst_nodes)
         if self._msg_use_edge_type:
             indices = self._edge_type_index[flat_ids].long()
+
             edge_type_oh = self._build_edge_type_onehot(indices)
             return torch.cat([x_src_per_event, x_dst_per_event, edge_type_oh], dim=-1)
         return torch.cat([x_src_per_event, x_dst_per_event], dim=-1)
@@ -1109,7 +1389,8 @@ class BoundedFullData:
     edge_type_index, split) as global tensors during initialization. This
     eliminates per-batch full artifact reloads when looking up these fields.
 
-    Large fields (msg, x_src, x_dst) remain lazy-loaded from windows.
+    x_src/x_dst are served from sparse role-specific active-node tables, and
+    msg is reconstructed from those tables plus compact edge_type.
     """
 
     _ALIASES = {"event_index": "global_event_index", "event_split": "split"}
@@ -1574,6 +1855,7 @@ def _scan_lazy_collections(cfg, collections, telemetry, history_telemetry=None):
                 history_telemetry.metadata_source_load_count += 1
                 history_telemetry.metadata_source_load_bytes_estimate += int(size)
                 history_telemetry.total_source_artifact_load_count += 1
+                history_telemetry.cold_source_temporaldata_load_count += 1
                 history_telemetry.total_source_artifact_load_bytes_estimate += int(size)
             if num_events:
                 max_node = max(max_node, int(data.src.max()), int(data.dst.max()))
@@ -1644,27 +1926,45 @@ def load_all_datasets(cfg):
         return _eager_load_all_datasets(cfg, train_data, val_data, test_data)
 
     view_mode = cfg.dataset_view.mode
-    collections = tuple(data.with_view(view_mode) for data in (train_data, val_data, test_data))
-    # Pre-allocate the compact index so its telemetry can be charged for
-    # *both* the metadata scan phase and the compact-build phase.  The
-    # total_events value is provisional (it is re-aligned to the true
-    # cumulative event count once _scan_lazy_collections returns).
-    compact_index = _CompactIndex(
-        specs=tuple(spec for collection in collections for spec in collection._specs),
-        total_events=0,
+    collections = tuple(
+        data.with_view(view_mode) for data in (train_data, val_data, test_data)
     )
-    (train_data, val_data, test_data, all_specs, max_node,
-     field_metadata) = _scan_lazy_collections(
-        cfg, collections, telemetry, history_telemetry=compact_index._telemetry,
+    raw_specs = tuple(
+        spec for collection in collections for spec in collection._specs
     )
+    compact_index = _CompactIndex(specs=raw_specs, total_events=0)
 
-    # Build compact history index for efficient random access.  The
-    # compact_index was constructed earlier so the metadata-scan phase
-    # could charge its telemetry; reuse it here and realign its
-    # ``_total_events`` and backing tensor sizes to the cumulative
-    # event count produced by _scan_lazy_collections.
+    # The true warm path validates only path/stat/config metadata before
+    # restoring offsets and field metadata from the manifest. No source
+    # TemporalData is loaded unless this validation misses.
+    telemetry.observe("before sidecar load")
+    restored_metadata = compact_index.try_restore_metadata(cfg, view_mode)
+    allow_persistent = restored_metadata is not None
+    if restored_metadata is not None:
+        all_specs, max_node, field_metadata = restored_metadata
+        split_collections = []
+        cursor = 0
+        for collection in collections:
+            count = len(collection._specs)
+            split_collections.append(
+                collection.with_specs(all_specs[cursor:cursor + count])
+            )
+            cursor += count
+        train_data, val_data, test_data = split_collections
+    else:
+        telemetry.observe("before source metadata scan")
+        (
+            train_data, val_data, test_data, all_specs, max_node,
+            field_metadata,
+        ) = _scan_lazy_collections(
+            cfg, collections, telemetry,
+            history_telemetry=compact_index._telemetry,
+        )
+        telemetry.observe("after source metadata scan")
+
     total_events = sum(spec.num_events for spec in all_specs)
     compact_index._total_events = total_events
+    compact_index._specs = tuple(all_specs)
     for attr, dtype in (
         ("_src", torch.int64),
         ("_dst", torch.int64),
@@ -1675,9 +1975,15 @@ def load_all_datasets(cfg):
         ("_split", torch.int8),
     ):
         setattr(compact_index, attr, torch.empty(total_events, dtype=dtype))
-    compact_index._specs = tuple(all_specs)
+
     telemetry.observe("before compact index build")
-    compact_index.build(cfg, view_mode)
+    compact_index.build(
+        cfg,
+        view_mode,
+        field_metadata=field_metadata,
+        loader_telemetry=telemetry,
+        allow_persistent=allow_persistent,
+    )
     telemetry.observe("after compact index build")
 
     full_data = BoundedFullData(
@@ -1690,6 +1996,7 @@ def load_all_datasets(cfg):
         cache_windows=1,
         compact_index=compact_index,
     )
+    telemetry.observe("after BoundedFullData construction")
     telemetry.observe("after global metadata construction")
     telemetry.observe("before model construction")
     full_data.loader_telemetry = telemetry.as_dict()

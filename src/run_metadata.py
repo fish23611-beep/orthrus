@@ -270,6 +270,17 @@ def dump_runtime(
     for k in _ALL_TIMING_KEYS:
         timing.setdefault(k, 0.0)
 
+    # MagicMock/yacs proxy attributes must never leak into JSON telemetry.
+    # Only resolved primitive values are truthful runtime metadata.
+    is_smoke_raw = getattr(cfg, "_is_smoke", False)
+    is_smoke = is_smoke_raw if isinstance(is_smoke_raw, bool) else False
+    max_windows_raw = getattr(cfg, "_max_windows_per_split", None)
+    max_windows_per_split = (
+        max_windows_raw
+        if isinstance(max_windows_raw, int) and not isinstance(max_windows_raw, bool)
+        else None
+    )
+
     runtime: dict[str, Any] = {
         "dataset": str(getattr(cfg.dataset, "name", None) if hasattr(cfg, "dataset") else None),
         "model_variant": str(
@@ -296,8 +307,8 @@ def dump_runtime(
         "time_evaluation": timing.get("time_evaluation", 0.0),
         "time_tracing": timing.get("time_tracing", 0.0),
         # C8-B: Bounded smoke metadata
-        "is_smoke": bool(getattr(cfg, "_is_smoke", False)),
-        "max_windows_per_split": getattr(cfg, "_max_windows_per_split", None),
+        "is_smoke": is_smoke,
+        "max_windows_per_split": max_windows_per_split,
     }
 
     if error_message:
