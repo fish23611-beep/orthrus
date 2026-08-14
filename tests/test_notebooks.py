@@ -33,8 +33,8 @@ ENTRYPOINTS = (
     "src/experiments/export_tables.py",
 )
 MASTER_NOTEBOOK_NAME = "ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb"
-REQUIRED_REPOSITORY_REF = "fix/c8-full-data-io"
-REQUIRED_EXPECTED_COMMIT = "099604e139f6f4139af793658ee0bbfde931bd9e"
+REQUIRED_REPOSITORY_REF = "fix/c8-sparse-node-sidecar"
+REQUIRED_EXPECTED_COMMIT = "0d2498c7d9402f227c3688104044952a79949524"
 # The Master Notebook is allowed to invoke the idempotent submodule
 # update either via the local ``git()`` wrapper or via a direct
 # ``subprocess.run(["git", ..., "submodule", "update", "--init",
@@ -203,7 +203,7 @@ def test_master_notebook_uses_one_coherent_frozen_ref_mechanism():
     """Branch/tag checkout and strict commit verification stay coherent.
 
     The Master Notebook must:
-      * pin REPOSITORY_REF == "fix/c8-full-data-io"
+      * pin REPOSITORY_REF == "fix/c8-sparse-node-sidecar"
       * pin EXPECTED_COMMIT to a 40-character hex SHA
       * reject ``git rev-parse HEAD`` mismatches via ``actual_commit``
       * never use ``git describe --tags --exact-match`` (commit-only pin)
@@ -233,6 +233,10 @@ def test_master_notebook_uses_one_coherent_frozen_ref_mechanism():
     assert len(expected_commit) == 40, (
         f"EXPECTED_COMMIT must be a 40-character full SHA, got "
         f"{len(expected_commit)} chars: {expected_commit!r}"
+    )
+    assert expected_commit == REQUIRED_EXPECTED_COMMIT, (
+        f"EXPECTED_COMMIT {expected_commit} does not match the reviewed "
+        f"production+tests commit {REQUIRED_EXPECTED_COMMIT}"
     )
     int(expected_commit, 16)  # raises ValueError on non-hex
     assert re.fullmatch(r"[0-9a-f]{40}", expected_commit), (
