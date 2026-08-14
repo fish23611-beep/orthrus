@@ -35,7 +35,15 @@ ENTRYPOINTS = (
 MASTER_NOTEBOOK_NAME = "ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb"
 REQUIRED_REPOSITORY_REF = "fix/c8-full-data-io"
 REQUIRED_EXPECTED_COMMIT = "099604e139f6f4139af793658ee0bbfde931bd9e"
-REQUIRED_SUBMODULE_UPDATE = 'git("submodule", "update", "--init", "--recursive")'
+# The Master Notebook is allowed to invoke the idempotent submodule
+# update either via the local ``git()`` wrapper or via a direct
+# ``subprocess.run(["git", ..., "submodule", "update", "--init",
+# "--recursive"])`` call.  Both forms are accepted so a one-line
+# refactor in the notebook does not invalidate the static contract.
+_REQUIRED_SUBMODULE_FORMS = (
+    'git("submodule", "update", "--init", "--recursive")',
+    '"submodule", "update", "--init", "--recursive"',
+)
 
 
 def _head_full_sha() -> str | None:
@@ -210,7 +218,10 @@ def test_master_notebook_uses_one_coherent_frozen_ref_mechanism():
     assert "actual_commit" in source
     assert "Commit mismatch" in source
     assert "git describe --tags --exact-match" not in source
-    assert REQUIRED_SUBMODULE_UPDATE in source
+    assert any(form in source for form in _REQUIRED_SUBMODULE_FORMS), (
+        "Master Notebook must initialise the Ground Truth submodule "
+        "idempotently. Accepted forms: " + ", ".join(_REQUIRED_SUBMODULE_FORMS)
+    )
 
     # The notebook's EXPECTED_COMMIT must be a 40-character hex SHA.  A
     # 7-character short SHA fails the post-checkout equality test because
