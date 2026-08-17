@@ -9,14 +9,14 @@ if str(SRC_ROOT) not in sys.path: sys.path.insert(0, str(SRC_ROOT))
 from experiments.run_matrix import _config_id
 
 FIELDS = [
- "dataset","config","config_path","config_id","seed","status","artifact_dir","git_commit","model_variant","backbone","dataset_view","experiment","failure_type","failure_message","failure_path","collection_error",
+ "dataset","config","config_path","config_id","seed","status","artifact_dir","git_commit","model_variant","backbone","dataset_view","experiment","failure_type","failure_message","failure_path","collection_error","config_fallback_warning",
  "TP","FP","TN","FN","Precision","Recall","F1","MCC","AUPRC","AUROC","FPR","FP_per_million","Attack_Detection_Rate",
  "parameter_count","trainable_parameter_count","train_seconds_per_epoch_mean","train_seconds_per_epoch_std","num_trained_epochs","train_seconds_per_epoch_json","total_train_seconds","test_seconds","train_events_per_second","test_events_per_second","train_peak_gpu_memory_mb","test_peak_gpu_memory_mb","train_peak_cpu_memory_mb","test_peak_cpu_memory_mb","peak_gpu_memory_mb","peak_cpu_memory_mb",
 ]
 METRIC_MAP = {"tp":"TP","fp":"FP","tn":"TN","fn":"FN","precision":"Precision","recall":"Recall","f1":"F1","mcc":"MCC","auprc":"AUPRC","auroc":"AUROC","fpr":"FPR","fppermillion":"FP_per_million","attackdetectionrate":"Attack_Detection_Rate"}
 def norm(s: object) -> str: return "".join(c for c in str(s).lower() if c.isalnum())
 def nan() -> float: return float("nan")
-def empty_row() -> dict: return {key: nan() for key in FIELDS}
+def empty_row() -> dict: return {key: nan() if key not in ("collection_error","config_fallback_warning") else "" for key in FIELDS}
 def read_json(path: Path) -> tuple[dict|None,str|None]:
  try:
   with path.open(encoding="utf-8") as f: value=json.load(f)
@@ -70,7 +70,7 @@ def collect(artifact_root: Path, *, include_smoke: bool = False) -> list[dict]:
   if identity in seen:
    previous=seen[identity]; previous["status"]="incomplete"; previous["collection_error"]=(previous.get("collection_error","") + "; duplicate_identity").strip("; ")
    continue
-  row=empty_row(); row.update({"dataset":dataset,"config":config.stem,"config_path":str(config),"config_id":_config_id(config),"seed":seed,"status":status_name,"artifact_dir":"","git_commit":"","model_variant":"","backbone":"","dataset_view":"","experiment":config.stem,"failure_type":"","failure_message":"","failure_path":"","collection_error":""})
+  row=empty_row(); row.update({"dataset":dataset,"config":config.stem,"config_path":str(config),"config_id":_config_id(config),"seed":seed,"status":status_name,"artifact_dir":"","git_commit":"","model_variant":"","backbone":"","dataset_view":"","experiment":config.stem,"failure_type":"","failure_message":"","failure_path":"","collection_error":"","config_fallback_warning":""})
   scoped=Path(status.get("artifact_root", "")) if isinstance(status.get("artifact_root"),str) else None
   run_dir=find_run_dir(scoped,dataset,seed) if scoped else None
   if run_dir: row["artifact_dir"]=str(run_dir)
@@ -87,6 +87,22 @@ def collect(artifact_root: Path, *, include_smoke: bool = False) -> list[dict]:
     # Skip smoke runs when include_smoke is False (default)
     if not include_smoke and runtime and runtime.get("is_smoke", False):
      continue
+    # ------------------------------------------------------------------ #
+    # D fix: config fallback — try original config path if run_dir YAML is invalid
+    # ------------------------------------------------------------------ #
+    config_fallback_warning = ""
+    if cfg is None and cerr is not None and "invalid YAML" in cerr:
+     original_config_path = Path(status.get("config","")).expanduser().resolve()
+     if original_config_path.is_file():
+      orig_cfg, orig_cerr = read_yaml(original_config_path)
+      if isinstance(orig_cfg, dict):
+       cfg = orig_cfg
+       config_fallback_warning = f"config_resolved.yml fallback to original config (invalid YAML); original path: {str(original_config_path)}"
+      elif orig_cerr is not None:
+       config_fallback_warning = f"config_resolved.yml invalid YAML; original config also invalid ({orig_cerr})"
+     else:
+      config_fallback_warning = f"config_resolved.yml invalid YAML; original config path not a readable file: {str(original_config_path)}"
+     row["config_fallback_warning"] = config_fallback_warning
     errors=[e for e in (eerr if eerr not in (None,"missing") else None,cerr if cerr not in (None,"missing") else None) if e]
     if env: row["git_commit"]=env.get("git_commit","") or ""; row["model_variant"]=env.get("model","") or ""; row["experiment"]=env.get("experiment_name") or row["experiment"]
     if cfg:

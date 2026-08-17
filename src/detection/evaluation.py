@@ -1,7 +1,10 @@
 import os
+import sys
 import numpy as np
 from collections import defaultdict
 from pprint import pprint
+import json as _json
+import tempfile
 
 from . import node_evaluation
 from mstc.calibration_runner import (
@@ -13,6 +16,118 @@ from data_utils import *
 from provnet_utils import log
 from .evaluation_utils import *
 from wandb_control import wandb_log, wandb_is_active
+
+# Use sys.modules for lazy wandb import so that test patches on
+# "detection.evaluation.wandb" work correctly.  Importing wandb at the
+# module level with a plain "import wandb" statement would create a binding
+# that test patches cannot intercept.
+wandb = sys.modules.get("wandb")
+
+
+# --------------------------------------------------------------------------- #
+# Safe JSON serialisation helpers (used for canonical artifact persistence)
+# --------------------------------------------------------------------------- #
+
+def _is_serializable_json_leaf(value):
+    """Return True when value is a JSON primitive (or NaN/inf which JSON allows)."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return True
+    if isinstance(value, float) and (_json.is_nan(value) or _json.is_inf(value)):
+        return True
+    return False
+
+
+def _strip_non_serializable(stats):
+    """
+    Return a copy of *stats* with all non-JSON-serialisable objects removed.
+
+    W&B Image/Video/etc. objects raise TypeError on json.dump so we probe
+    with json.JSONEncoder().encode() which raises for non-serialisable values.
+    """
+    import json as _json
+
+    result = {}
+    encoder = _json.JSONEncoder()
+    for key, value in stats.items():
+        try:
+            encoder.encode(value)
+            result[key] = value
+        except TypeError:
+            # Non-JSON value (W&B media, lambda, etc.) — skip it
+            pass
+    return result
+
+
+def _persist_canonical_metrics(run_dir, best_stats, best_epoch_dir, method, cfg):
+    """
+    Atomically write the selected-epoch metrics to <run_dir>/node_scores/metrics.json.
+
+    The file represents the authoritative test-set metrics of the best-epoch
+    selected by *method* on the validation set.
+
+    Parameters
+    ----------
+    run_dir:
+        Resolved run directory path.
+    best_stats:
+        The evaluation_fn result dict for the selected best epoch.
+    best_epoch_dir:
+        The model_epoch directory name of the selected epoch.
+    method:
+        The model-selection method string (e.g. "min_val_mean_edge_loss").
+    cfg:
+        The resolved yacs CfgNode (used to extract val_mean_edge_loss if
+        not already present in best_stats).
+    """
+    if not isinstance(run_dir, (str, os.PathLike)) or not os.fspath(run_dir):
+        log(f"[evaluation] _persist_canonical_metrics: run_dir={run_dir!r} is not valid; skipping persistence.")
+        return
+
+    run_dir = os.fspath(run_dir)
+    node_scores_dir = os.path.join(run_dir, "node_scores")
+    os.makedirs(node_scores_dir, exist_ok=True)
+    metrics_path = os.path.join(node_scores_dir, "metrics.json")
+
+    # Build the canonical payload
+    payload = _strip_non_serializable(best_stats)
+
+    # Ensure required fields are present
+    payload.setdefault("selected_epoch", int(best_epoch_dir.split("_")[-1]))
+    payload.setdefault("model_selection_method", method)
+
+    # Fall back to val_mean_edge_loss from cfg if not already in stats
+    if "val_mean_edge_loss" not in payload:
+        val_path = os.path.join(
+            getattr(cfg.detection.gnn_testing, "_edge_losses_dir", ""),
+            "val", best_epoch_dir
+        )
+        try:
+            val_loss_list = []
+            if os.path.isdir(val_path):
+                for fname in sorted(os.listdir(val_path)):
+                    import pandas as _pd
+                    df = _pd.read_csv(os.path.join(val_path, fname))
+                    val_loss_list.extend(df["loss"].tolist())
+            if val_loss_list:
+                payload["val_mean_edge_loss"] = float(np.mean(val_loss_list))
+        except Exception:
+            pass
+
+    # Atomic write: temp file + rename
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=node_scores_dir, suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            _json.dump(payload, fh, indent=2, allow_nan=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, metrics_path)
+        log(f"[evaluation] Canonical metrics written to {metrics_path}")
+    except Exception as exc:
+        log(f"[evaluation] Failed to write canonical metrics: {exc}")
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def standard_evaluation(cfg, evaluation_fn):
@@ -128,6 +243,35 @@ def standard_evaluation(cfg, evaluation_fn):
 
     wandb_log(best_stats)
 
+    # Persist the canonical selected-epoch metrics to <run_dir>/node_scores/metrics.json
+    runtime_dir = getattr(cfg, "_run_dir", None)
+    if runtime_dir:
+        _persist_canonical_metrics(runtime_dir, best_stats, best_epoch_dir, method, cfg)
+
+    # For MSTC: copy the selected-epoch predictions to the canonical node_scores/ location
+    # so the paper artifact is at <run_dir>/node_scores/node_predictions.csv.
+    # Per-epoch files under evaluation_results/calibration/model_epoch_X/ are preserved.
+    if getattr(cfg.model, "variant", None) == "mstc":
+        _persist_mstc_predictions(runtime_dir, best_epoch_dir, cfg)
+
+
+def _persist_mstc_predictions(run_dir, best_epoch_dir, cfg):
+    """Copy the selected epoch's MSTC predictions to node_scores/node_predictions.csv."""
+    if not isinstance(run_dir, (str, os.PathLike)) or not os.fspath(run_dir):
+        return
+    run_dir = os.fspath(run_dir)
+    eval_results_dir = getattr(cfg.detection.evaluation, "_evaluation_results_dir", "")
+    if not eval_results_dir:
+        eval_results_dir = os.path.join(run_dir, "evaluation_results")
+    source = os.path.join(eval_results_dir, "calibration", best_epoch_dir, "node_predictions.csv")
+    dest_dir = os.path.join(run_dir, "node_scores")
+    dest = os.path.join(dest_dir, "node_predictions.csv")
+    if os.path.exists(source):
+        os.makedirs(dest_dir, exist_ok=True)
+        import shutil
+        shutil.copy2(source, dest)
+        log(f"[evaluation] MSTC predictions copied: {dest}")
+
 
 def mstc_evaluation_main(val_tw_path, test_tw_path, model_epoch_dir, cfg, **kwargs):
     """Inject legacy GT and metric providers into the lightweight C6 runner."""
@@ -152,6 +296,9 @@ def mstc_evaluation_main(val_tw_path, test_tw_path, model_epoch_dir, cfg, **kwar
         ground_truth_fn=get_ground_truth_nids,
         classifier_evaluation_fn=classifier_evaluation,
     )
+    # Return the flat stats dict so evaluation.py can access val_mean_edge_loss
+    # and other metrics at the top level (consistent with node_evaluation.main).
+    # The per-epoch predictions remain in evaluation_results/calibration/model_epoch_X/.
     return result["stats"]
 
 
