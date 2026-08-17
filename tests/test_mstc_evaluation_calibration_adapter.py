@@ -108,13 +108,6 @@ def _load_detection_evaluation_with_stubs():
     mstc_init.node_evaluation = node_evaluation_module
     sys.modules["mstc"] = mstc_init
 
-    # Wire up detection.mstc (for relative import from .mstc.calibration_runner)
-    detection_mstc = types.ModuleType("detection.mstc")
-    detection_mstc.__path__ = [str(SRC_ROOT / "mstc")]
-    detection_mstc.calibration_runner = calibration_runner_module
-    sys.modules["detection.mstc"] = detection_mstc
-    sys.modules["detection.mstc.calibration_runner"] = calibration_runner_module
-
     detection = types.ModuleType("detection")
     detection.__path__ = []
 
@@ -284,3 +277,83 @@ def test_calibration_module_produces_real_calibration_artifacts(tmp_path):
     assert summary["calibration_method"] == "hierarchical_relation"
     assert summary["event_counts"]["num_validation_events"] == 3
     assert summary["event_counts"]["num_test_events"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# Production-like import smoke test
+# --------------------------------------------------------------------------- #
+def test_evaluation_imports_from_top_level_mstc_package():
+    """Verify detection.evaluation imports from 'mstc.calibration_runner'
+    (top-level), NOT 'detection.mstc.calibration_runner' (relative).
+
+    This test loads the source directly with minimal stubs and ensures the
+    correct import path is used.  If the source used a relative import
+    'from .mstc.calibration_runner', this test would fail with
+    ModuleNotFoundError because 'detection.mstc' does not exist in production.
+    """
+    import importlib.util
+
+    # Stub ONLY non-target dependencies (those unrelated to mstc imports).
+    # This is intentionally LIGHTER than _load_detection_evaluation_with_stubs
+    # so any missing import will surface clearly.
+
+    def _stub_module(name):
+        mod = types.ModuleType(name)
+        sys.modules[name] = mod
+        return mod
+
+    # Core stubs
+    stub_module = _stub_module
+    detection = stub_module("detection")
+    detection.__path__ = []
+    stub_module("detection.node_evaluation").main = lambda *a, **k: {}
+    utils = stub_module("detection.evaluation_utils")
+    for attr in ("compute_tw_labels", "get_ground_truth_nids", "classifier_evaluation"):
+        setattr(utils, attr, lambda *a, **k: ({} if "gt" in attr else {}))
+    stub_module("data_utils")
+    provnet = stub_module("provnet_utils")
+    provnet.log = lambda *a, **k: None
+    wandb = stub_module("wandb")
+    wandb.log = lambda *a, **k: None
+    wandb.Image = lambda x: x
+    wandb_control = stub_module("wandb_control")
+    wandb_control.wandb_is_active = lambda: False
+    wandb_control.wandb_log = wandb.log
+    wandb_control.wandb_finish = lambda: None
+
+    # Load real mstc submodules
+    def _load_src_mod(name, path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    cal_mod = _load_src_mod("mstc.calibration_runner", SRC_ROOT / "mstc" / "calibration_runner.py")
+    eval_run_mod = _load_src_mod("mstc.evaluation_runner", SRC_ROOT / "mstc" / "evaluation_runner.py")
+    node_eval_mod = _load_src_mod("mstc.node_evaluation", SRC_ROOT / "mstc" / "node_evaluation.py")
+
+    # Wire mstc package
+    mstc_pkg = stub_module("mstc")
+    mstc_pkg.__path__ = [str(SRC_ROOT / "mstc")]
+    mstc_pkg.calibration_runner = cal_mod
+    mstc_pkg.evaluation_runner = eval_run_mod
+    mstc_pkg.node_evaluation = node_eval_mod
+
+    # NOTE: We deliberately do NOT create 'detection.mstc' here.
+    # If evaluation.py uses 'from .mstc.calibration_runner', this test will fail.
+
+    # Load detection.evaluation — if import path is wrong, ModuleNotFoundError surfaces
+    eval_path = SRC_ROOT / "detection" / "evaluation.py"
+    spec = importlib.util.spec_from_file_location("detection.evaluation", eval_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["detection.evaluation"] = module
+    spec.loader.exec_module(module)
+
+    # Verify the module-level aliases are bound to the real calibration_runner
+    assert hasattr(module, "_cal_load_csv")
+    assert hasattr(module, "_cal_load_csv_dir")
+    assert hasattr(module, "_cal_run")
+    assert module._cal_load_csv is cal_mod.load_event_records_from_csv
+    assert module._cal_load_csv_dir is cal_mod.load_event_records_from_csv_directory
+    assert module._cal_run is cal_mod.run_calibration

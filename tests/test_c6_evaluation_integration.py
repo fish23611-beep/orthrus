@@ -204,6 +204,32 @@ def test_epoch_outputs_are_isolated(tmp_path):
 
 
 def load_detection_evaluation_with_stubs(monkeypatch):
+    import importlib.util
+
+    def _load_src_mod(name, path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    calibration_runner_module = _load_src_mod(
+        "mstc.calibration_runner", SRC_ROOT / "mstc" / "calibration_runner.py"
+    )
+    evaluation_runner_module = _load_src_mod(
+        "mstc.evaluation_runner", SRC_ROOT / "mstc" / "evaluation_runner.py"
+    )
+    node_evaluation_module = _load_src_mod(
+        "mstc.node_evaluation", SRC_ROOT / "mstc" / "node_evaluation.py"
+    )
+
+    mstc_init = types.ModuleType("mstc")
+    mstc_init.__path__ = [str(SRC_ROOT / "mstc")]
+    mstc_init.calibration_runner = calibration_runner_module
+    mstc_init.evaluation_runner = evaluation_runner_module
+    mstc_init.node_evaluation = node_evaluation_module
+    sys.modules["mstc"] = mstc_init
+
     detection = types.ModuleType("detection")
     detection.__path__ = []
     legacy = types.ModuleType("detection.node_evaluation")
@@ -220,9 +246,13 @@ def load_detection_evaluation_with_stubs(monkeypatch):
     wandb = types.ModuleType("wandb")
     wandb.log = lambda *args: None
     wandb.Image = lambda path: path
+    wandb_control = types.ModuleType("wandb_control")
+    wandb_control.wandb_is_active = lambda: False
+    wandb_control.wandb_log = wandb.log
+    wandb_control.wandb_finish = lambda: None
     for name, module in {"detection": detection, "detection.node_evaluation": legacy,
                          "detection.evaluation_utils": utils, "data_utils": data_utils,
-                         "provnet_utils": provnet, "wandb": wandb}.items():
+                         "provnet_utils": provnet, "wandb": wandb, "wandb_control": wandb_control}.items():
         monkeypatch.setitem(sys.modules, name, module)
     detection.node_evaluation = legacy
     return load_file("detection.c6_b7_evaluation", SRC_ROOT / "detection" / "evaluation.py")

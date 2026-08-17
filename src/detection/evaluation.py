@@ -4,7 +4,7 @@ from collections import defaultdict
 from pprint import pprint
 
 from . import node_evaluation
-from .mstc.calibration_runner import (
+from mstc.calibration_runner import (
     load_event_records_from_csv as _cal_load_csv,
     load_event_records_from_csv_directory as _cal_load_csv_dir,
     run_calibration as _cal_run,
