@@ -4,6 +4,11 @@ from collections import defaultdict
 from pprint import pprint
 
 from . import node_evaluation
+from .mstc.calibration_runner import (
+    load_event_records_from_csv as _cal_load_csv,
+    load_event_records_from_csv_directory as _cal_load_csv_dir,
+    run_calibration as _cal_run,
+)
 from data_utils import *
 from provnet_utils import log
 from .evaluation_utils import *
@@ -126,20 +131,16 @@ def standard_evaluation(cfg, evaluation_fn):
 
 def mstc_evaluation_main(val_tw_path, test_tw_path, model_epoch_dir, cfg, **kwargs):
     """Inject legacy GT and metric providers into the lightweight C6 runner."""
-    from mstc.calibration_runner import (
-        load_event_records_from_csv,
-        load_event_records_from_csv_directory,
-        run_calibration,
-    )
     from mstc.evaluation_runner import mstc_evaluation_main as run_mstc_evaluation
     from mstc.node_evaluation import get_mstc_node_predictions_from_cfg
 
+    # _cal_load_csv, _cal_load_csv_dir, and _cal_run are module-level imports.
+    # They are accessible from the class body because module-level names are in
+    # the module's global namespace, which the class body's LEGB lookup can reach.
     class CalibrationModule:
-        load_event_records_from_csv = staticmethod(load_event_records_from_csv)
-        load_event_records_from_csv_directory = staticmethod(
-            load_event_records_from_csv_directory
-        )
-        run_calibration = staticmethod(run_calibration)
+        load_event_records_from_csv = staticmethod(_cal_load_csv)
+        load_event_records_from_csv_directory = staticmethod(_cal_load_csv_dir)
+        run_calibration = staticmethod(_cal_run)
 
     result = run_mstc_evaluation(
         val_tw_path,

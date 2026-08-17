@@ -1,3 +1,5 @@
+import gc
+import os
 from tqdm import tqdm
 
 from encoders import OrthrusEncoder
@@ -10,6 +12,66 @@ from factory import *
 import torch
 
 from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime, update_runtime_nested
+
+
+def _cleanup_checkpoint_cuda(model, device):
+    """
+    Explicitly break CUDA-holding references and reclaim GPU memory at a
+    checkpoint boundary.
+
+    The model hierarchy (Orthrus → encoder → neighbor_loader/graph_reindexer, or
+    MSTCOrthrus → encoder → neighbor_loader/graph_reindexer) contains CUDA
+    tensors that Python's reference counting alone cannot free because of
+    internal reference cycles.  After ``del model`` the object remains alive
+    until the next garbage-collection pass, causing allocated CUDA memory to
+    grow monotonically across checkpoint iterations.
+
+    This function explicitly nulls every known CUDA-carrying attribute so that
+    ``del model`` + ``gc.collect()`` + ``torch.cuda.synchronize()`` +
+    ``torch.cuda.empty_cache()`` can reclaim the memory deterministically.
+
+    No-op on CPU-only devices.
+    """
+    if device is None or device.type == "cpu":
+        return
+
+    # Null CUDA tensors inside the encoder (shared across Orthrus / MSTCOrthrus)
+    encoder = getattr(model, "encoder", None)
+    if encoder is not None:
+        # LastNeighborLoader / MultiScaleNeighborLoader: CUDA tensors in
+        # self.neighbors, self.e_id, self._assoc
+        nl = getattr(encoder, "neighbor_loader", None)
+        if nl is not None:
+            for attr in ("neighbors", "e_id", "_assoc"):
+                t = getattr(nl, attr, None)
+                if t is not None and t.is_cuda:
+                    setattr(nl, attr, torch.empty(0, device=t.device))
+
+        # GraphReindexer may hold per-batch CUDA reindexing tensors
+        reindexer = getattr(encoder, "graph_reindexer", None)
+        if reindexer is not None:
+            for attr_name in dir(reindexer):
+                if attr_name.startswith("_"):
+                    continue
+                try:
+                    attr = getattr(reindexer, attr_name)
+                except AttributeError:
+                    continue
+                if isinstance(attr, torch.Tensor) and attr.is_cuda:
+                    setattr(reindexer, attr_name, torch.empty(0, device=attr.device))
+
+    # Orthrus: last_h_storage and last_h_non_empty_nodes are CUDA tensors
+    for attr in ("last_h_storage", "last_h_non_empty_nodes"):
+        t = getattr(model, attr, None)
+        if t is not None and isinstance(t, torch.Tensor) and t.is_cuda:
+            setattr(model, attr, torch.empty(0, device=t.device))
+
+    # Force a synchronous GC pass so cyclic Python objects are deallocated
+    # before we call empty_cache.
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device=device)
+        torch.cuda.empty_cache()
 
 
 @torch.no_grad()
@@ -320,6 +382,26 @@ def main(cfg):
                 if isinstance(result, dict):
                     processed_events += int(result.get("processed_event_count", 0))
                 g.to("cpu")
+
+        # ------------------------------------------------------------------ #
+        # Checkpoint-boundary CUDA lifecycle cleanup:
+        #
+        #   Problem: del model is insufficient because Python reference cycles
+        #   (e.g. model ↔ encoder ↔ neighbor_loader ↔ graph_reindexer) keep
+        #   the old checkpoint's CUDA tensors alive until the next gc pass.
+        #   Over 6 checkpoints this accumulates several hundred MB of unreleased
+        #   CUDA memory, eventually triggering OOM on model_epoch_2 test.
+        #
+        #   Fix: explicitly break all known CUDA-holding references, invoke the
+        #   garbage collector to reclaim cyclic Python objects, and synchronise
+        #   the CUDA allocator so the freed memory is returned to the pool.
+        #
+        #   This does NOT change the replay protocol (reset → replay → val →
+        #   test), does NOT modify model parameters or hyperparameters, and does
+        #   NOT affect the val/test order or the no-reset-between-val-and-test
+        #   invariant.
+        # ------------------------------------------------------------------ #
+        _cleanup_checkpoint_cuda(model, device)
 
         del model
 
