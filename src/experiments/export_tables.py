@@ -18,9 +18,53 @@ def num(value):
  except (ValueError,TypeError): return float("nan")
 def read_csv(path):
  with path.open(encoding="utf-8",newline="") as f: return list(csv.DictReader(f))
-def aggregate(rows,mapping):
+
+# --------------------------------------------------------------------------- #
+# E fix: deterministic per-seed attempt resolution
+# --------------------------------------------------------------------------- #
+def _resolve_seed_attempts(rows):
+    """
+    Resolve ambiguous multiple-attempt seeds to a single authoritative record.
+
+    Rules (deterministic, paper-grade):
+      1. One row for a seed: use it.
+      2. Multiple rows, exactly one completed: use the completed row.
+      3. Multiple rows, none completed: count seed as failed once.
+      4. Multiple rows, multiple completed: FAIL FAST — raise ValueError.
+
+    all_runs.csv is preserved with ALL rows for audit; only the authoritative
+    subset contributes to paper table counts and metric statistics.
+    """
+    from collections import defaultdict
+    by_key = defaultdict(list)
+    for row in rows:
+        key = (row.get("dataset",""), row.get("config",""), int(row.get("seed", 0)))
+        by_key[key].append(row)
+
+    resolved = []
+    ambiguities = []
+    for key, group in by_key.items():
+        completed = [r for r in group if r.get("status") == "completed"]
+        if len(group) == 1:
+            resolved.append(group[0])
+        elif len(completed) == 1:
+            resolved.append(completed[0])
+        elif len(completed) == 0:
+            resolved.append(group[0])
+        else:
+            ambiguities.append(key)
+    if ambiguities:
+        raise ValueError(
+            f"Ambiguous completed attempts — multiple completed rows for the same "
+            f"(dataset, config, seed) identity: {ambiguities!r}. "
+            f"Manual resolution required before exporting paper tables."
+        )
+    return resolved
+
+def aggregate(rows, mapping):
  groups={}
- for row in rows:
+ authoritative = _resolve_seed_attempts(rows)
+ for row in authoritative:
   name=mapping.get(row.get("config",""))
   if name is not None: groups.setdefault((row.get("dataset",""),name),[]).append(row)
  output=[]
