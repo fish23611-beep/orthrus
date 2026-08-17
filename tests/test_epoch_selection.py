@@ -21,7 +21,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 
 
 torch_available = True
@@ -68,23 +68,29 @@ def test_default_selects_min_val_loss():
     cfg.detection.gnn_testing._edge_losses_dir = "/fake"
     cfg.detection.evaluation.node_evaluation._precision_recall_dir = "/fake/pr"
 
+    # Patch wandb_log to capture all logged calls
+    logged_calls = []
+    def mock_wandb_log(stats, **kwargs):
+        logged_calls.append(dict(stats))
+
     with patch("detection.evaluation.listdir_sorted", return_value=[
         "model_epoch_1", "model_epoch_2", "model_epoch_3"
     ]), \
          patch("detection.evaluation.compute_tw_labels", return_value={}), \
+         patch("detection.evaluation.wandb_log", side_effect=mock_wandb_log), \
          patch("detection.evaluation.wandb") as m_wandb, \
          patch("detection.evaluation.log"):
 
         from detection.evaluation import standard_evaluation
         standard_evaluation(cfg, evaluation_fn=mock_fn)
 
-    best_call = m_wandb.log.call_args_list[-1]
-    args_dict = best_call[0][0] if best_call[0] else {}
-    assert args_dict.get("val_mean_edge_loss") == 1.8, (
-        f"Expected val_mean_edge_loss=1.8 (epoch_3), got {args_dict}"
+    # The last wandb_log call should be the best epoch (epoch 3 with val_loss=1.8)
+    best_call = logged_calls[-1]
+    assert best_call.get("val_mean_edge_loss") == 1.8, (
+        f"Expected val_mean_edge_loss=1.8 (epoch_3), got {best_call}"
     )
-    assert args_dict.get("epoch") == 3, (
-        f"Expected epoch=3, got {args_dict.get('epoch')}"
+    assert best_call.get("epoch") == 3, (
+        f"Expected epoch=3, got {best_call.get('epoch')}"
     )
 
 
@@ -107,24 +113,28 @@ def test_val_better_test_worse_epoch_selected():
     cfg.detection.gnn_testing._edge_losses_dir = "/fake"
     cfg.detection.evaluation.node_evaluation._precision_recall_dir = "/fake/pr"
 
+    logged_calls = []
+    def mock_wandb_log(stats, **kwargs):
+        logged_calls.append(dict(stats))
+
     with patch("detection.evaluation.listdir_sorted", return_value=[
         "model_epoch_1", "model_epoch_2", "model_epoch_3"
     ]), \
          patch("detection.evaluation.compute_tw_labels", return_value={}), \
-         patch("detection.evaluation.wandb") as m_wandb, \
+         patch("detection.evaluation.wandb_log", side_effect=mock_wandb_log), \
+         patch("detection.evaluation.wandb"), \
          patch("detection.evaluation.log"):
 
         from detection.evaluation import standard_evaluation
         standard_evaluation(cfg, evaluation_fn=mock_fn)
 
-    best_call = m_wandb.log.call_args_list[-1]
-    args_dict = best_call[0][0] if best_call[0] else {}
-    assert args_dict.get("epoch") == 1, (
+    best_call = logged_calls[-1]
+    assert best_call.get("epoch") == 1, (
         f"Val-best epoch (epoch_1) must be selected even though it has worst "
-        f"test MCC; got epoch={args_dict.get('epoch')}"
+        f"test MCC; got epoch={best_call.get('epoch')}"
     )
-    assert args_dict.get("mcc") == 0.60, (
-        f"Expected mcc=0.60 (epoch_1 test MCC), got {args_dict.get('mcc')}"
+    assert best_call.get("mcc") == 0.60, (
+        f"Expected mcc=0.60 (epoch_1 test MCC), got {best_call.get('mcc')}"
     )
 
 
@@ -147,20 +157,24 @@ def test_last_epoch_selects_final():
     cfg.detection.gnn_testing._edge_losses_dir = "/fake"
     cfg.detection.evaluation.node_evaluation._precision_recall_dir = "/fake/pr"
 
+    logged_calls = []
+    def mock_wandb_log(stats, **kwargs):
+        logged_calls.append(dict(stats))
+
     with patch("detection.evaluation.listdir_sorted", return_value=[
         "model_epoch_1", "model_epoch_2", "model_epoch_3"
     ]), \
          patch("detection.evaluation.compute_tw_labels", return_value={}), \
-         patch("detection.evaluation.wandb") as m_wandb, \
+         patch("detection.evaluation.wandb_log", side_effect=mock_wandb_log), \
+         patch("detection.evaluation.wandb"), \
          patch("detection.evaluation.log"):
 
         from detection.evaluation import standard_evaluation
         standard_evaluation(cfg, evaluation_fn=mock_fn)
 
-    best_call = m_wandb.log.call_args_list[-1]
-    args_dict = best_call[0][0] if best_call[0] else {}
-    assert args_dict.get("epoch") == 3, (
-        f"Expected epoch=3 (last in list), got {args_dict.get('epoch')}"
+    best_call = logged_calls[-1]
+    assert best_call.get("epoch") == 3, (
+        f"Expected epoch=3 (last in list), got {best_call.get('epoch')}"
     )
 
 
