@@ -79,11 +79,16 @@ class TestCheckDetectionOnlyPrerequisites:
         assert missing == []
 
     def test_returns_missing_for_empty_graphs(self, tmp_path):
-        """Returns missing when graphs directory is empty."""
+        """Returns missing when graphs directory is empty for evaluate stage (needed for compute_tw_labels)."""
         graphs_dir = tmp_path / "graphs"
         graphs_dir.mkdir()
         # Empty - no files
-        
+
+        edge_scores_dir = tmp_path / "edge_scores"
+        edge_scores_dir.mkdir()
+        test_dir = edge_scores_dir / "test"
+        test_dir.mkdir()
+
         cfg = SimpleNamespace(
             graph_construction=SimpleNamespace(
                 build_graphs=SimpleNamespace(_graphs_dir=str(graphs_dir))
@@ -96,13 +101,22 @@ class TestCheckDetectionOnlyPrerequisites:
             ),
             detection=SimpleNamespace(
                 gnn_training=SimpleNamespace(_trained_models_dir=str(tmp_path / "checkpoints")),
-                gnn_testing=SimpleNamespace(_edge_losses_dir=str(tmp_path / "scores"))
+                gnn_testing=SimpleNamespace(_edge_losses_dir=str(edge_scores_dir))
             ),
         )
-        
-        missing = orthrus._check_detection_only_prerequisites(["train"], cfg)
-        
-        assert any("Graphs directory" in m for m in missing)
+
+        # C8 fix: graphs are only needed for evaluate stage (compute_tw_labels loads test graph boundaries)
+        # train-only does not require graphs
+        missing_train = orthrus._check_detection_only_prerequisites(["train"], cfg)
+        assert not any("Graphs directory" in m for m in missing_train), (
+            "Graphs should NOT be required for train stage (only for evaluate)"
+        )
+
+        # evaluate does require graphs
+        missing_evaluate = orthrus._check_detection_only_prerequisites(["evaluate"], cfg)
+        assert any("Graphs directory" in m for m in missing_evaluate), (
+            "Graphs SHOULD be required for evaluate stage (compute_tw_labels)"
+        )
 
     def test_explicit_checkpoint_and_test_stage_satisfy_downstream_prerequisites(self, tmp_path):
         """An explicit inference checkpoint plus test supplies evaluate inputs."""

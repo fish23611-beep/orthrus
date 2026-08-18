@@ -855,13 +855,18 @@ def get_yml_cfg(args):
      max_windows = getattr(cfg, "_max_windows_per_split", None)
      cfg._is_smoke = max_windows is not None and max_windows > 0
 
-     # Handle --artifact-root explicitly (non-dotted CLI arg, not processed by overwrite_cfg_with_args)
+     # Handle --artifact-root explicitly (non-dotted CLI arg, not processed by overwrite_cfg_with_args).
+     # Priority: CLI > env var > default. C8: must update cfg._artifact_dir so that
+     # set_task_paths() uses the resolved shared root for preprocessing paths
+     # (graph_construction, Word2Vec, edge_embeddings, metadata), not the default ./artifacts.
      artifact_root_raw = getattr(args, "artifact_root", None)
      if artifact_root_raw is not None:
          from artifact_paths import resolve_artifact_root
          cfg._artifact_root_raw = artifact_root_raw
+         cfg._artifact_dir = str(resolve_artifact_root(artifact_root_raw))
 
-     # C2: Apply environment variable overrides (after CLI but before final paths)
+     # C2: Apply environment variable overrides (after CLI but before final paths).
+     # Only applies when CLI is absent.
      env_artifact = os.environ.get(ORTHRUS_ARTIFACT_ROOT_ENV)
      if artifact_root_raw is None and env_artifact:
          cfg._artifact_dir = str(env_artifact)

@@ -86,39 +86,51 @@ def _check_detection_only_prerequisites(stages, cfg) -> list[str]:
     """
     Check that required artifacts exist for detection_only mode.
 
+    Prerequisite rules (per-stage):
+    - "preprocess" (always skipped in detection_only)
+    - "train": Word2Vec models, edge embeddings, checkpoints (training output)
+    - "test": checkpoints (inference input), edge embeddings (feature source for test inference)
+    - "evaluate": edge_scores/test/ (test output), graphs (compute_tw_labels source),
+                  metadata cache (compute_tw_labels data source)
+
     Returns list of missing artifacts. Empty list means all OK.
     """
     missing = []
 
-    # Check for preprocess artifacts (required even in detection_only)
-    graph_path = cfg.graph_construction.build_graphs._graphs_dir
-    if not os.path.isdir(graph_path):
-        missing.append(f"Graphs directory: {graph_path}")
-    elif not os.listdir(graph_path):
-        missing.append(f"Graphs directory is empty: {graph_path}")
+    # Graphs are required for evaluate (compute_tw_labels loads test graph boundaries)
+    if "evaluate" in stages:
+        graph_path = cfg.graph_construction.build_graphs._graphs_dir
+        if not os.path.isdir(graph_path):
+            missing.append(f"Graphs directory: {graph_path}")
+        elif not os.listdir(graph_path):
+            missing.append(f"Graphs directory is empty: {graph_path}")
 
-    w2v_path = cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir
-    if not os.path.isdir(w2v_path):
-        missing.append(f"Word2Vec models: {w2v_path}")
+    # Word2Vec is only needed for training (used as node features in gnn_training)
+    if "train" in stages:
+        w2v_path = cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir
+        if not os.path.isdir(w2v_path):
+            missing.append(f"Word2Vec models: {w2v_path}")
 
-    edge_embeds = cfg.edge_featurization.embed_edges._edge_embeds_dir
-    if not os.path.isdir(edge_embeds):
-        missing.append(f"Edge embeddings: {edge_embeds}")
+    # Edge embeddings are only needed for training (input to gnn_training)
+    if "train" in stages:
+        edge_embeds = cfg.edge_featurization.embed_edges._edge_embeds_dir
+        if not os.path.isdir(edge_embeds):
+            missing.append(f"Edge embeddings: {edge_embeds}")
 
-    # Train produces checkpoints; an explicit inference checkpoint replaces the
-    # default run checkpoint directory for test/evaluate-only invocations.
+    # Checkpoints are only needed for test inference (not for evaluate-only which
+    # consumes pre-produced edge_scores from the scoped run directory)
     inference_checkpoint = getattr(cfg, "_inference_checkpoint", None)
     has_inference_checkpoint = (
         isinstance(inference_checkpoint, str) and bool(inference_checkpoint)
     )
-    if "train" not in stages and ("test" in stages or "evaluate" in stages) and not has_inference_checkpoint:
+    if "test" in stages and "train" not in stages and not has_inference_checkpoint:
         checkpoint_dir = cfg.detection.gnn_training._trained_models_dir
         if not os.path.isdir(checkpoint_dir):
             missing.append(f"Checkpoints: {checkpoint_dir}")
         elif not os.listdir(checkpoint_dir):
             missing.append(f"Checkpoints directory empty: {checkpoint_dir}")
 
-    # Test produces the edge scores consumed by evaluate in the same pipeline.
+    # Edge scores (test split) are required for evaluate when test is not running
     if "evaluate" in stages and "test" not in stages:
         edge_scores_dir = cfg.detection.gnn_testing._edge_losses_dir
         if not os.path.isdir(edge_scores_dir):

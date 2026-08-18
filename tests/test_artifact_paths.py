@@ -420,6 +420,8 @@ def test_default_artifacts_resolved_under_cwd(tmp_path, monkeypatch):
 
     monkeypatch.chdir(tmp_path)
     cfg = _make_cfg(dataset="THEIA_E3", model="orthrus", seed=0)
+    # C8: explicitly set _is_smoke to avoid MagicMock truthiness affecting path
+    cfg._is_smoke = False
 
     run_dir = resolve_artifact_paths(cfg, ["train"])
 
