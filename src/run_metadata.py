@@ -63,21 +63,51 @@ def _cfg_to_dict(cfg, seen: set | None = None) -> dict[str, Any]:
         return None   # cycle guard
     seen.add(obj_id)
 
-    # yacs / CfgNode proxy objects
-    if hasattr(cfg, "is_copy") or hasattr(cfg, "is_frozen"):
-        d = cfg.__dict__.copy()
+    # yacs / CfgNode objects store config values as dict items (not __dict__ attrs).
+    # CfgNode is a dict subclass, so we iterate via dict.items() to get
+    # the actual config key-value pairs.
+    # CfgNode has is_frozen() as a bound method; calling it returns a bool.
+    # MagicMock also has is_frozen (as a MagicMock instance, not callable as expected).
+    # SimpleNamespace/other objects may have neither.
+    def _is_yacs(obj) -> bool:
+        frozen = getattr(obj, "is_frozen", None)
+        if frozen is not None:
+            if callable(frozen):
+                try:
+                    return isinstance(frozen(), bool)
+                except Exception:
+                    return False
+            return isinstance(frozen, bool)
+        return False
+
+    if _is_yacs(cfg):
         result = {}
-        for k, v in d.items():
+        for k, v in cfg.items():
             if k.startswith("_"):
                 continue
-            result[k] = _cfg_to_dict(v, seen)
+            try:
+                result[k] = _cfg_to_dict(v, seen)
+            except Exception:
+                continue
         return result
 
     if isinstance(cfg, dict):
         return {k: _cfg_to_dict(v, seen) for k, v in cfg.items()}
 
     if isinstance(cfg, (list, tuple)):
-        return [_cfg_to_dict(item, seen) for item in cfg]
+        # Use a fresh seen set for sibling items to avoid false cycle
+        # detection (e.g., [8, 8, 8] would skip the 2nd/3rd int if we
+        # reused the parent's seen set, since all three 8s share the same id).
+        return [_cfg_to_dict(item, set()) for item in cfg]
+
+    # Objects with __dict__ but not yacs proxies
+    if hasattr(cfg, "__dict__") and not isinstance(cfg, type):
+        result = {}
+        for k, v in vars(cfg).items():
+            if k.startswith("_"):
+                continue
+            result[k] = _cfg_to_dict(v, seen)
+        return result
 
     # Primitives / serialisable leaf nodes
     return cfg
@@ -188,7 +218,30 @@ def dump_config(cfg, run_dir: Path | str | None) -> None:
     # Redact database password
     cfg_dict = _redact_database_password(cfg_dict)
 
-    # Write as YAML
+    # B8 guard: When cfg is a real yacs CfgNode (is_frozen() returns bool),
+    # _cfg_to_dict must not silently return {}.  Raising ValueError makes the
+    # failure visible rather than producing a silent 0-byte file.
+    # When cfg is MagicMock/SimpleNamespace, {} is acceptable (no real config).
+    def _is_real_yacs(obj) -> bool:
+        frozen = getattr(obj, "is_frozen", None)
+        if frozen is not None:
+            if callable(frozen):
+                try:
+                    return isinstance(frozen(), bool)
+                except Exception:
+                    return False
+            return isinstance(frozen, bool)
+        return False
+
+    is_real_cfg = _is_real_yacs(cfg)
+    if is_real_cfg and (cfg_dict is None or cfg_dict == {}):
+        raise ValueError(
+            f"cfg serialised to empty dict; aborting to avoid 0-byte "
+            f"config_resolved.yml in {run_dir}.  Check that the CfgNode "
+            f"is a valid yacs CfgNode."
+        )
+
+    # Write as YAML — raises ValueError if data is {} for real CfgNode
     _write_yaml(run_dir / "config_resolved.yml", cfg_dict)
 
 
@@ -379,9 +432,27 @@ def _write_yaml(path: Path | str, data: dict) -> None:
     Format: top-level keys are output as ``key:`` with nested dicts indented
     by two spaces.  Lists use ``-`` prefix.  This is sufficient for config
     readability; full YAML spec is not required here.
+
+    Raises
+    ------
+    ValueError:
+        If data is empty (None or {}) after stripping private keys.
+        A 0-byte or empty YAML file is not acceptable for experiment
+        reproducibility — callers must receive a clear failure rather than
+        a silent empty artifact.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # B8: detect silent empty serialization
+    if data is None or data == {}:
+        raise ValueError(
+            "dump_config: cfg resolved to empty dict (None or {{}}). "
+            "This indicates a serialization failure. Check that the CfgNode "
+            "is a valid yacs CfgNode and that _cfg_to_dict handles all its "
+            "attribute types. Will not write a 0-byte config_resolved.yml."
+        )
+
     with open(path, "w", encoding="utf-8") as fh:
         _dump_yaml_node(fh, data, indent=0)
 
