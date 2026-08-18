@@ -67,3 +67,43 @@ def compute_attack_detection_rate(
     predicted = set(predicted_positive_nodes)
     detected = sum(bool(set(nodes) & predicted) for nodes in attack_to_nodes.values())
     return detected / len(attack_to_nodes)
+
+
+def compute_inspected_nodes_per_attack(
+    num_predicted_positive_nodes: int,
+    num_attacks: int,
+) -> float:
+    """
+    Average number of detection-positive nodes an analyst must inspect per attack.
+
+    Operational definition (C8 paper artifact contract):
+        inspected_nodes_per_attack = (TP + FP) / num_attacks
+                                   = num_predicted_positive_nodes / num_attacks
+
+    This metric quantifies the analyst inspection burden: how many detection-alerting
+    nodes must be investigated to cover all predicted detections, divided by the
+    number of distinct attack scenarios in the dataset.
+
+    Parameters
+    ----------
+    num_predicted_positive_nodes:
+        Number of nodes with y_hat=1 (true positives + false positives).
+        Equivalent to count of detection alerts.
+    num_attacks:
+        Number of ground-truth attack scenarios (len(attack_to_nodes)).
+
+    Returns
+    -------
+    float
+        Average inspected nodes per attack, or NaN when num_attacks==0.
+
+    Examples
+    --------
+    >>> compute_inspected_nodes_per_attack(9, 3)   # 9 alerts / 3 attacks
+    3.0
+    >>> compute_inspected_nodes_per_attack(0, 0)  # no attacks → NaN
+    nan
+    >>> compute_inspected_nodes_per_attack(5, 0)  # zero attacks → NaN
+    nan
+    """
+    return _safe_divide(num_predicted_positive_nodes, num_attacks)

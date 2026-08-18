@@ -180,6 +180,41 @@ def test_mstc_metrics_attack_detection_rate_empty():
     assert math.isnan(rate)
 
 
+def test_mstc_metrics_inspected_nodes_per_attack_basic():
+    """inspected_nodes_per_attack = (TP+FP) / num_attacks."""
+    from mstc.metrics import compute_inspected_nodes_per_attack
+
+    # 9 positive predictions, 3 attacks → 3.0
+    result = compute_inspected_nodes_per_attack(9, 3)
+    assert result == 3.0
+
+    # 0 positive predictions, 2 attacks → 0.0
+    result = compute_inspected_nodes_per_attack(0, 2)
+    assert result == 0.0
+
+    # 5 positive predictions, 1 attack → 5.0
+    result = compute_inspected_nodes_per_attack(5, 1)
+    assert result == 5.0
+
+
+def test_mstc_metrics_inspected_nodes_per_attack_zero_attacks():
+    """Zero attacks must return NaN."""
+    from mstc.metrics import compute_inspected_nodes_per_attack
+
+    assert math.isnan(compute_inspected_nodes_per_attack(0, 0))
+    assert math.isnan(compute_inspected_nodes_per_attack(5, 0))
+    assert math.isnan(compute_inspected_nodes_per_attack(0, 0))
+
+
+def test_mstc_metrics_inspected_nodes_per_attack_fractional():
+    """Non-integer division must be computed correctly."""
+    from mstc.metrics import compute_inspected_nodes_per_attack
+
+    # 10 alerts / 3 attacks = 3.333...
+    result = compute_inspected_nodes_per_attack(10, 3)
+    assert abs(result - 10 / 3) < 1e-9
+
+
 # --------------------------------------------------------------------------- #
 # Integration test: mstc_evaluation_runner emits canonical metrics
 # --------------------------------------------------------------------------- #

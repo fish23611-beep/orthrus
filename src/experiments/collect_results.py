@@ -13,7 +13,7 @@ FIELDS = [
  "TP","FP","TN","FN","Precision","Recall","F1","MCC","AUPRC","AUROC","FPR","FP_per_million","Attack_Detection_Rate",
  "parameter_count","trainable_parameter_count","train_seconds_per_epoch_mean","train_seconds_per_epoch_std","num_trained_epochs","train_seconds_per_epoch_json","total_train_seconds","test_seconds","train_events_per_second","test_events_per_second","train_peak_gpu_memory_mb","test_peak_gpu_memory_mb","train_peak_cpu_memory_mb","test_peak_cpu_memory_mb","peak_gpu_memory_mb","peak_cpu_memory_mb",
 ]
-METRIC_MAP = {"tp":"TP","fp":"FP","tn":"TN","fn":"FN","precision":"Precision","recall":"Recall","f1":"F1","mcc":"MCC","auprc":"AUPRC","auroc":"AUROC","fpr":"FPR","fppermillion":"FP_per_million","attackdetectionrate":"Attack_Detection_Rate"}
+METRIC_MAP = {"tp":"TP","fp":"FP","tn":"TN","fn":"FN","precision":"Precision","recall":"Recall","f1":"F1","mcc":"MCC","auprc":"AUPRC","auroc":"AUROC","fpr":"FPR","fppermillion":"FP_per_million","attackdetectionrate":"Attack_Detection_Rate","inspectednodesperattack":"Inspected_Nodes_per_Attack"}
 def norm(s: object) -> str: return "".join(c for c in str(s).lower() if c.isalnum())
 def nan() -> float: return float("nan")
 def empty_row() -> dict: return {key: nan() if key not in ("collection_error","config_fallback_warning") else "" for key in FIELDS}
