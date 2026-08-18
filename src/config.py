@@ -569,6 +569,11 @@ def get_runtime_required_args(return_unknown_args=False, args=None):
                          help="Root directory for all artifacts. "
                               "Takes precedence over the ORTHRUS_ARTIFACT_ROOT environment variable. "
                               "Default: ./artifacts (or ORTHRUS_ARTIFACT_ROOT if set).")
+     parser.add_argument('--shared-artifact-root', type=str, default=None,
+                         dest='shared_artifact_root', metavar='PATH',
+                         help="Shared preprocessing artifact root (graph_construction, Word2Vec, "
+                              "edge_embeddings, metadata). When absent, falls back to --artifact-root. "
+                              "For matrix runs, run_matrix passes the top-level artifact root here.")
 
      # All args in the cfg can be also set in the arg parser from CLI
      parser = add_cfg_args_to_parser(CONFIG_ARGS, parser)
@@ -855,21 +860,55 @@ def get_yml_cfg(args):
      max_windows = getattr(cfg, "_max_windows_per_split", None)
      cfg._is_smoke = max_windows is not None and max_windows > 0
 
-     # Handle --artifact-root explicitly (non-dotted CLI arg, not processed by overwrite_cfg_with_args).
-     # Priority: CLI > env var > default. C8: must update cfg._artifact_dir so that
-     # set_task_paths() uses the resolved shared root for preprocessing paths
-     # (graph_construction, Word2Vec, edge_embeddings, metadata), not the default ./artifacts.
-     artifact_root_raw = getattr(args, "artifact_root", None)
-     if artifact_root_raw is not None:
-         from artifact_paths import resolve_artifact_root
-         cfg._artifact_root_raw = artifact_root_raw
-         cfg._artifact_dir = str(resolve_artifact_root(artifact_root_raw))
+     # C8 dual artifact root: separate shared preprocessing root from scoped run root.
+     #
+     # --shared-artifact-root: top-level shared root for preprocessing artifacts
+     #   (graph_construction, Word2Vec, edge_embeddings, metadata).
+     #   When provided by run_matrix, this is the original --artifact-root passed
+     #   to run_matrix (e.g. /mnt/workspace/mstc_pids/artifacts).
+     #
+     # --artifact-root: scoped run root for experiment isolation
+     #   (checkpoints, edge_scores, node_scores, runtime.json).
+     #   For matrix runs, this is the scoped root (e.g. matrix_artifacts/<config-id>).
+     #
+     # Priority for _artifact_dir (preprocessing):
+     #   1. --shared-artifact-root (if provided)
+     #   2. --artifact-root (legacy fallback)
+     #   3. ORTHRUS_ARTIFACT_ROOT env var
+     #   4. ./artifacts default
+     #
+     # Priority for _scoped_artifact_root (run artifacts):
+     #   1. --artifact-root (always used when provided)
+     #   2. ORTHRUS_ARTIFACT_ROOT env var
+     #   3. ./artifacts default
+     #
+     # _scoped_artifact_root is stored for reference but run-level paths are
+     # derived by resolve_artifact_paths() from the cli_artifact_root parameter.
 
-     # C2: Apply environment variable overrides (after CLI but before final paths).
-     # Only applies when CLI is absent.
-     env_artifact = os.environ.get(ORTHRUS_ARTIFACT_ROOT_ENV)
-     if artifact_root_raw is None and env_artifact:
-         cfg._artifact_dir = str(env_artifact)
+     artifact_root_raw = getattr(args, "artifact_root", None)
+     shared_root_raw = getattr(args, "shared_artifact_root", None)
+
+     from artifact_paths import resolve_artifact_root
+
+     # _scoped_artifact_root: always from --artifact-root (for run_dir derivation)
+     if artifact_root_raw is not None:
+         cfg._scoped_artifact_root = str(resolve_artifact_root(artifact_root_raw))
+         cfg._artifact_root_raw = artifact_root_raw
+     else:
+         cfg._scoped_artifact_root = None
+
+     # _artifact_dir: shared preprocessing root (for preprocessing paths)
+     if shared_root_raw is not None:
+         # Explicit shared root from run_matrix
+         cfg._artifact_dir = str(resolve_artifact_root(shared_root_raw))
+     elif artifact_root_raw is not None:
+         # Legacy: fall back to --artifact-root when no explicit shared root
+         cfg._artifact_dir = str(resolve_artifact_root(artifact_root_raw))
+     else:
+         # C2: Apply environment variable overrides (after CLI but before final paths).
+         env_artifact = os.environ.get(ORTHRUS_ARTIFACT_ROOT_ENV)
+         if env_artifact:
+             cfg._artifact_dir = str(env_artifact)
 
      env_data_root = os.environ.get(ORTHRUS_DATA_ROOT_ENV)
      if env_data_root:

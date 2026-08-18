@@ -35,7 +35,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0, help="Random seed (default: 0).")
     parser.add_argument(
         "--artifact-root", default=None, metavar="PATH",
-        help="Artifact root; overrides ORTHRUS_ARTIFACT_ROOT when supplied.",
+        help="Scoped experiment artifact root (isolates run artifacts: checkpoints, "
+             "edge_scores, node_scores). For matrix runs, this is set by run_matrix "
+             "to matrix_artifacts/<config-id>.",
+    )
+    parser.add_argument(
+        "--shared-artifact-root", default=None, metavar="PATH",
+        help="Shared preprocessing artifact root (graph_construction, Word2Vec, "
+             "edge_embeddings, metadata). When absent, falls back to --artifact-root. "
+             "For matrix runs, run_matrix passes the top-level artifact root here "
+             "while using --artifact-root for scoped run isolation.",
     )
     parser.add_argument(
         "--stages", default="all",
@@ -86,6 +95,7 @@ def build_pipeline_args(namespace: argparse.Namespace) -> SimpleNamespace:
         config=config,
         seed=namespace.seed,
         artifact_root=namespace.artifact_root,
+        shared_artifact_root=getattr(namespace, "shared_artifact_root", None),
         stages=namespace.stages,
         checkpoint=checkpoint,
         cpu=namespace.cpu,

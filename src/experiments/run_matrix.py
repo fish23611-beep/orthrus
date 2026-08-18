@@ -174,13 +174,16 @@ class MatrixSummary:
         }
 
 
-def _run_argv(dataset: str, config: Path, seed: int, artifact_root: Path, stages: str | None) -> list[str]:
+def _run_argv(dataset: str, config: Path, seed: int, artifact_root: Path,
+              shared_artifact_root: Path | None, stages: str | None) -> list[str]:
     argv = [
         "--dataset", dataset,
         "--config", str(config),
         "--seed", str(seed),
         "--artifact-root", str(artifact_root),
     ]
+    if shared_artifact_root is not None:
+        argv.extend(["--shared-artifact-root", str(shared_artifact_root)])
     if stages is not None:
         argv.extend(["--stages", stages])
     return argv
@@ -303,7 +306,9 @@ def run_matrix(datasets: Sequence[str], configs: Sequence[Path], seeds: Sequence
                     dataset, config, seed, "running", scoped_root=scoped_root, **status_extra,
                 ))
                 try:
-                    result = invoke(_run_argv(dataset, config, seed, scoped_root, stages))
+                    result = invoke(_run_argv(
+                        dataset, config, seed, scoped_root, artifact_root, stages
+                    ))
                     returncode = getattr(result, "returncode", 0)
                     if returncode:
                         raise ChildRunError(returncode)

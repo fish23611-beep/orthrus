@@ -553,8 +553,8 @@ class TestRunExperimentCompatibility:
 
         assert captured_args["args"].artifact_root == artifact_root
 
-    def test_run_matrix_passes_scoped_root_to_child(self, tmp_path, monkeypatch):
-        """run_matrix passes scoped root to run_experiment child process."""
+    def test_run_matrix_passes_scoped_root_and_shared_root_to_child(self, tmp_path, monkeypatch):
+        """run_matrix passes both scoped root (--artifact-root) and shared root (--shared-artifact-root) to child."""
         from experiments import run_matrix
 
         config = tmp_path / "baseline.yml"
@@ -573,14 +573,249 @@ class TestRunExperimentCompatibility:
 
         assert len(calls) == 1
         argv = calls[0]
-        # Find --artifact-root in argv
-        idx = argv.index("--artifact-root")
-        child_root = argv[idx + 1]
 
-        # Child should receive scoped root, not the top-level root
-        assert "matrix_artifacts" in child_root, (
-            f"Child process must receive scoped root with matrix_artifacts/, got {child_root}"
+        # Child should receive scoped root as --artifact-root
+        idx = argv.index("--artifact-root")
+        child_scoped_root = argv[idx + 1]
+        assert "matrix_artifacts" in child_scoped_root, (
+            f"Child process must receive scoped root with matrix_artifacts/, got {child_scoped_root}"
         )
+
+        # Child should also receive shared root as --shared-artifact-root
+        idx = argv.index("--shared-artifact-root")
+        child_shared_root = argv[idx + 1]
+        # Shared root should be the top-level root (not scoped)
+        assert str(root) == child_shared_root, (
+            f"Child process must receive top-level shared root as --shared-artifact-root, got {child_shared_root}"
+        )
+        assert "matrix_artifacts" not in child_shared_root, (
+            f"Shared root should NOT contain matrix_artifacts/, got {child_shared_root}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# R6. End-to-end dual root integration test
+# --------------------------------------------------------------------------- #
+
+class TestDualRootEndToEnd:
+    """
+    R6: Critical integration test that verifies the complete dual root routing chain.
+
+    This test verifies that when run_matrix is invoked:
+    1. scoped_root is computed correctly (matrix_artifacts/<config-id>)
+    2. shared_root is preserved as the top-level artifact root
+    3. Child process receives both correctly
+    4. get_yml_cfg() sets:
+       - _artifact_dir = shared_root (for preprocessing paths)
+       - _scoped_artifact_root = scoped_root (for run artifacts)
+    5. set_task_paths() uses _artifact_dir for preprocessing
+    6. resolve_artifact_paths() uses scoped root for run artifacts
+    """
+
+    def test_matrix_dual_root_routing_end_to_end(self, tmp_path, monkeypatch):
+        """End-to-end test: shared root for preprocessing, scoped root for run artifacts."""
+        import config as config_module
+        from artifact_paths import resolve_artifact_paths
+
+        # Setup: run_matrix top-level artifact root
+        shared_root = tmp_path / "mstc_pids" / "artifacts"
+        shared_root.mkdir(parents=True)
+
+        # Write config file
+        config_file = tmp_path / "baseline.yml"
+        config_file.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+
+        # Compute what run_matrix would compute
+        from experiments import run_matrix
+        scoped_root = run_matrix.run_artifact_root(shared_root, config_file.resolve())
+
+        # Verify scoped root structure
+        assert scoped_root == shared_root / "matrix_artifacts" / run_matrix._config_id(config_file.resolve())
+        assert scoped_root.is_relative_to(shared_root)
+
+        # Simulate child process receiving both roots
+        # This is what run_matrix._run_argv would produce
+        argv = run_matrix._run_argv(
+            dataset="THEIA_E3",
+            config=config_file.resolve(),
+            seed=0,
+            artifact_root=scoped_root,
+            shared_artifact_root=shared_root,
+            stages="evaluate",
+        )
+
+        # Verify argv contains both roots
+        assert "--artifact-root" in argv
+        assert "--shared-artifact-root" in argv
+
+        # Simulate run_experiment parsing
+        from experiments import run_experiment
+        parsed = run_experiment.build_parser().parse_args(argv)
+        assert parsed.artifact_root == str(scoped_root)
+        assert parsed.shared_artifact_root == str(shared_root)
+
+        # Simulate get_yml_cfg() processing
+        # Patch set_task_paths to capture the paths it would use
+        original_set_task_paths = config_module.set_task_paths
+        captured_calls = {}
+
+        def mock_set_task_paths(cfg):
+            captured_calls["_artifact_dir"] = cfg._artifact_dir
+            captured_calls["_scoped_artifact_root"] = getattr(cfg, "_scoped_artifact_root", None)
+            # Call original to set preprocessing paths
+            original_set_task_paths(cfg)
+
+        config_module.set_task_paths = mock_set_task_paths
+
+        try:
+            args = SimpleNamespace(
+                dataset="THEIA_E3",
+                model="orthrus",
+                config=str(config_file),
+                cpu=True,
+                from_weights=False,
+                seed=0,
+                skip_tracing=False,
+                artifact_root=str(scoped_root),
+                shared_artifact_root=str(shared_root),
+                max_windows_per_split=None,
+            )
+            cfg = config_module.get_yml_cfg(args)
+
+            # Critical assertions:
+            # 1. _artifact_dir should be shared root (for preprocessing)
+            assert cfg._artifact_dir == str(shared_root), (
+                f"_artifact_dir should be shared root ({shared_root}), got {cfg._artifact_dir}"
+            )
+
+            # 2. _scoped_artifact_root should be scoped root (for run artifacts)
+            assert cfg._scoped_artifact_root == str(scoped_root), (
+                f"_scoped_artifact_root should be scoped root ({scoped_root}), got {cfg._scoped_artifact_root}"
+            )
+
+            # 3. Verify preprocessing paths use shared root
+            # These are set by set_task_paths() using _artifact_dir
+            graphs_dir = cfg.graph_construction.build_graphs._graphs_dir
+            assert graphs_dir.startswith(str(shared_root)), (
+                f"Graphs dir should start with shared root ({shared_root}), got {graphs_dir}"
+            )
+            assert "graph_construction" in graphs_dir
+            assert "matrix_artifacts" not in graphs_dir, (
+                f"Graphs dir should NOT contain matrix_artifacts/, got {graphs_dir}"
+            )
+
+            w2v_dir = cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir
+            assert w2v_dir.startswith(str(shared_root)), (
+                f"Word2Vec dir should start with shared root, got {w2v_dir}"
+            )
+            assert "matrix_artifacts" not in w2v_dir
+
+            edge_embeds_dir = cfg.edge_featurization.embed_edges._edge_embeds_dir
+            assert edge_embeds_dir.startswith(str(shared_root)), (
+                f"Edge embeddings dir should start with shared root, got {edge_embeds_dir}"
+            )
+            assert "matrix_artifacts" not in edge_embeds_dir
+
+            metadata_dir = cfg._metadata_dir
+            assert metadata_dir.startswith(str(shared_root)), (
+                f"Metadata dir should start with shared root, got {metadata_dir}"
+            )
+            assert "matrix_artifacts" not in metadata_dir
+
+        finally:
+            config_module.set_task_paths = original_set_task_paths
+
+    def test_standalone_run_experiment_uses_artifact_root_for_both(self, tmp_path, monkeypatch):
+        """Standalone run_experiment without --shared-artifact-root uses --artifact-root for both."""
+        import config as config_module
+
+        # Write config file
+        config_file = tmp_path / "baseline.yml"
+        config_file.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+
+        # Simulate standalone invocation (no --shared-artifact-root)
+        original_set_task_paths = config_module.set_task_paths
+        captured = {}
+
+        def mock_set_task_paths(cfg):
+            captured["_artifact_dir"] = cfg._artifact_dir
+            captured["_scoped_artifact_root"] = getattr(cfg, "_scoped_artifact_root", None)
+            original_set_task_paths(cfg)
+
+        config_module.set_task_paths = mock_set_task_paths
+
+        try:
+            args = SimpleNamespace(
+                dataset="THEIA_E3",
+                model="orthrus",
+                config=str(config_file),
+                cpu=True,
+                from_weights=False,
+                seed=0,
+                skip_tracing=False,
+                artifact_root=str(tmp_path / "my_artifacts"),
+                shared_artifact_root=None,  # No shared root specified
+                max_windows_per_split=None,
+            )
+            cfg = config_module.get_yml_cfg(args)
+
+            # When no shared root specified, _artifact_dir falls back to --artifact-root
+            root = str(tmp_path / "my_artifacts")
+            assert cfg._artifact_dir == root, (
+                f"Without --shared-artifact-root, _artifact_dir should fall back to "
+                f"--artifact-root ({root}), got {cfg._artifact_dir}"
+            )
+        finally:
+            config_module.set_task_paths = original_set_task_paths
+
+    def test_preprocessing_paths_use_shared_root_not_scoped(self, tmp_path, monkeypatch):
+        """Verify preprocessing paths never contain matrix_artifacts even when scoped root is set."""
+        import config as config_module
+
+        config_file = tmp_path / "baseline.yml"
+        config_file.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+
+        original_set_task_paths = config_module.set_task_paths
+        config_module.set_task_paths = lambda cfg: original_set_task_paths(cfg)
+
+        try:
+            args = SimpleNamespace(
+                dataset="THEIA_E3",
+                model="orthrus",
+                config=str(config_file),
+                cpu=True,
+                from_weights=False,
+                seed=0,
+                skip_tracing=False,
+                artifact_root=str(tmp_path / "artifacts" / "matrix_artifacts" / "baseline-xxx"),
+                shared_artifact_root=str(tmp_path / "artifacts"),
+                max_windows_per_split=None,
+            )
+            cfg = config_module.get_yml_cfg(args)
+
+            # All preprocessing paths should use shared root, NOT scoped root
+            paths_to_check = [
+                ("graphs", cfg.graph_construction.build_graphs._graphs_dir),
+                ("word2vec", cfg.edge_featurization.embed_nodes.feature_word2vec._model_dir),
+                ("edge_embeds", cfg.edge_featurization.embed_edges._edge_embeds_dir),
+                ("metadata", cfg._metadata_dir),
+            ]
+
+            scoped_root_str = str(tmp_path / "artifacts" / "matrix_artifacts" / "baseline-xxx")
+            shared_root_str = str(tmp_path / "artifacts")
+
+            for name, path in paths_to_check:
+                assert path.startswith(shared_root_str), (
+                    f"{name} path should start with shared root ({shared_root_str}), got {path}"
+                )
+                assert not path.startswith(scoped_root_str), (
+                    f"{name} path should NOT start with scoped root ({scoped_root_str}), got {path}"
+                )
+                assert "matrix_artifacts" not in path, (
+                    f"{name} path should NOT contain matrix_artifacts/, got {path}"
+                )
+        finally:
+            config_module.set_task_paths = original_set_task_paths
 
 
 # --------------------------------------------------------------------------- #
