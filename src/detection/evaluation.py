@@ -16,6 +16,7 @@ from data_utils import *
 from provnet_utils import log
 from .evaluation_utils import *
 from wandb_control import wandb_log, wandb_is_active
+from labelling import get_GP_of_each_attack
 
 # Use sys.modules for lazy wandb import so that test patches on
 # "detection.evaluation.wandb" work correctly.  Importing wandb at the
@@ -295,6 +296,7 @@ def mstc_evaluation_main(val_tw_path, test_tw_path, model_epoch_dir, cfg, **kwar
         node_prediction_fn=get_mstc_node_predictions_from_cfg,
         ground_truth_fn=get_ground_truth_nids,
         classifier_evaluation_fn=classifier_evaluation,
+        attack_to_nodes_fn=get_GP_of_each_attack,
     )
     # Return the flat stats dict so evaluation.py can access val_mean_edge_loss
     # and other metrics at the top level (consistent with node_evaluation.main).
