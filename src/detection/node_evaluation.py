@@ -10,6 +10,7 @@ from config import *
 from .evaluation_utils import *
 from mstc.metrics import (
     compute_attack_detection_rate, compute_classification_metrics, compute_fp_per_million,
+    compute_inspected_nodes_per_attack,
 )
 from labelling import get_GP_of_each_attack
 
@@ -133,9 +134,16 @@ def main(val_tw_path, test_tw_path, model_epoch_dir, cfg, tw_to_malicious_nodes,
         int(c8_metrics["fp"]), int(c8_metrics["tn"]) + int(c8_metrics["fp"]),
     )
     attack_to_nodes = get_GP_of_each_attack(cfg)
+    num_attacks = len(attack_to_nodes)
+    num_predicted_positive = sum(1 for y in y_preds if y == 1)
     stats["attack_detection_rate"] = compute_attack_detection_rate(
         attack_to_nodes, (node for node, prediction in zip(nodes, y_preds) if prediction),
     )
+    stats["inspected_nodes_per_attack"] = compute_inspected_nodes_per_attack(
+        num_predicted_positive, num_attacks
+    )
+    stats["num_predicted_positive_nodes"] = num_predicted_positive
+    stats["num_ground_truth_attacks"] = num_attacks
 
     fp_in_malicious_tw_ratio = analyze_false_positives(y_truth, y_preds, pred_scores, max_val_loss_tw, nodes, tw_to_malicious_nodes)
     stats["fp_in_malicious_tw_ratio"] = fp_in_malicious_tw_ratio
@@ -168,4 +176,4 @@ def main(val_tw_path, test_tw_path, model_epoch_dir, cfg, tw_to_malicious_nodes,
         with open(metrics_path, "w", encoding="utf-8") as handle:
             json.dump(stats, handle, indent=2, allow_nan=True)
 
-    return stats
+    return stats, results

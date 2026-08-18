@@ -12,6 +12,7 @@ from mstc.metrics import (
     compute_attack_detection_rate,
     compute_classification_metrics,
     compute_fp_per_million,
+    compute_inspected_nodes_per_attack,
 )
 
 
@@ -105,8 +106,17 @@ def mstc_evaluation_main(
             canonical["attack_detection_rate"] = compute_attack_detection_rate(
                 attack_to_nodes, predicted_positive
             )
+            num_attacks = len(attack_to_nodes)
+            canonical["num_ground_truth_attacks"] = num_attacks
+            canonical["num_predicted_positive_nodes"] = len(predicted_positive)
+            canonical["inspected_nodes_per_attack"] = compute_inspected_nodes_per_attack(
+                len(predicted_positive), num_attacks
+            )
         else:
             canonical["attack_detection_rate"] = float("nan")
+            canonical["num_ground_truth_attacks"] = 0
+            canonical["num_predicted_positive_nodes"] = 0
+            canonical["inspected_nodes_per_attack"] = float("nan")
 
         stats.update(canonical)
 

@@ -2,6 +2,7 @@ import os
 import sys
 import numpy as np
 from collections import defaultdict
+from pathlib import Path
 from pprint import pprint
 import json as _json
 import tempfile
@@ -187,7 +188,7 @@ def standard_evaluation(cfg, evaluation_fn):
     )
 
     # Collect per-epoch stats so we can pick the best one
-    epoch_results = []   # list of (model_epoch_dir, stats)
+    epoch_results = []   # list of (model_epoch_dir, stats, optional results_dict)
 
     for model_epoch_dir in listdir_sorted(test_losses_dir):
         log(f"\nEvaluation of model {model_epoch_dir}...")
@@ -195,10 +196,17 @@ def standard_evaluation(cfg, evaluation_fn):
         test_tw_path = os.path.join(test_losses_dir, model_epoch_dir)
         val_tw_path  = os.path.join(val_losses_dir,  model_epoch_dir)
 
-        stats = evaluation_fn(
+        result = evaluation_fn(
             val_tw_path, test_tw_path, model_epoch_dir, cfg,
             tw_to_malicious_nodes=tw_to_malicious_nodes
         )
+
+        # Baseline evaluation_fn returns (stats, results_dict)
+        if isinstance(result, tuple):
+            stats, node_results = result
+        else:
+            stats = result
+            node_results = None
 
         # Annotate epoch number for convenience
         stats["epoch"] = int(model_epoch_dir.split("_")[-1])
@@ -228,7 +236,7 @@ def standard_evaluation(cfg, evaluation_fn):
         # Log every epoch so the full history is visible in W&B
         wandb_log(stats)
 
-        epoch_results.append((model_epoch_dir, stats))
+        epoch_results.append((model_epoch_dir, stats, node_results))
 
     # ------------------------------------------------------------------ #
     # Select the best epoch
@@ -254,7 +262,7 @@ def standard_evaluation(cfg, evaluation_fn):
         # MUST NOT silently skip such epochs or fall back to test metrics.
         import math
         invalid = []
-        for epoch_dir, stats in epoch_results:
+        for epoch_dir, stats, _ in epoch_results:
             v = stats.get("val_mean_edge_loss", None)
             if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
                 invalid.append((epoch_dir, v))
@@ -280,14 +288,20 @@ def standard_evaluation(cfg, evaluation_fn):
 
     # Persist the canonical selected-epoch metrics to <run_dir>/node_scores/metrics.json
     runtime_dir = getattr(cfg, "_run_dir", None)
+    variant = getattr(cfg.model, "variant", None)
+
     if runtime_dir:
         _persist_canonical_metrics(runtime_dir, best_stats, best_epoch_dir, method, cfg)
 
-    # For MSTC: copy the selected-epoch predictions to the canonical node_scores/ location
-    # so the paper artifact is at <run_dir>/node_scores/node_predictions.csv.
-    # Per-epoch files under evaluation_results/calibration/model_epoch_X/ are preserved.
-    if getattr(cfg.model, "variant", None) == "mstc":
-        _persist_mstc_predictions(runtime_dir, best_epoch_dir, cfg)
+    # Persist selected-epoch artifacts: node_predictions.csv and event_predictions.csv
+    if runtime_dir:
+        if variant == "mstc":
+            # MSTC: copy node_predictions and event_predictions from calibration output
+            _persist_mstc_predictions(runtime_dir, best_epoch_dir, cfg)
+            _persist_event_predictions(runtime_dir, best_epoch_dir, cfg, variant)
+        elif variant == "orthrus_baseline":
+            _persist_baseline_node_predictions(runtime_dir, best_epoch_dir, cfg)
+            _persist_event_predictions(runtime_dir, best_epoch_dir, cfg, variant)
 
 
 def _persist_mstc_predictions(run_dir, best_epoch_dir, cfg):
@@ -302,6 +316,163 @@ def _persist_mstc_predictions(run_dir, best_epoch_dir, cfg):
     dest_dir = os.path.join(run_dir, "node_scores")
     dest = os.path.join(dest_dir, "node_predictions.csv")
     if os.path.exists(source):
+        os.makedirs(dest_dir, exist_ok=True)
+        import shutil
+        shutil.copy2(source, dest)
+        log(f"[evaluation] MSTC predictions copied: {dest}")
+
+
+def _persist_baseline_node_predictions(run_dir, best_epoch_dir, cfg):
+    """
+    Persist Baseline (orthrus_baseline) node predictions for the selected epoch
+    to <run_dir>/node_scores/node_predictions.csv.
+
+    Reads the result dict from the per-epoch .pth file and writes a canonical CSV
+    with columns: node_id, score, y_hat, y_true.
+    """
+    if not _is_real_path(run_dir):
+        return
+    run_dir = os.fspath(run_dir)
+    out_dir = getattr(cfg.detection.evaluation.node_evaluation, "_precision_recall_dir", "")
+    if not out_dir:
+        out_dir = os.path.join(run_dir, "evaluation_results", "node_evaluation")
+    result_file = os.path.join(out_dir, f"result_{best_epoch_dir}.pth")
+    if not os.path.exists(result_file):
+        log(f"[evaluation] Baseline result file not found: {result_file}; skipping node_predictions persistence.")
+        return
+
+    try:
+        import torch as _torch
+        result = _torch.load(result_file, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        log(f"[evaluation] Failed to load Baseline result file {result_file}: {exc}; skipping node_predictions persistence.")
+        return
+
+    dest_dir = os.path.join(run_dir, "node_scores")
+    dest = os.path.join(dest_dir, "node_predictions.csv")
+    os.makedirs(dest_dir, exist_ok=True)
+
+    try:
+        import csv as _csv
+        with open(dest, "w", newline="", encoding="utf-8") as handle:
+            writer = _csv.DictWriter(handle, fieldnames=["node_id", "score", "y_hat", "y_true"],
+                                     extrasaction="ignore")
+            writer.writeheader()
+            for node_id, fields in sorted(result.items(), key=lambda kv: str(kv[0])):
+                writer.writerow({
+                    "node_id": node_id,
+                    "score": fields.get("score"),
+                    "y_hat": fields.get("y_hat"),
+                    "y_true": fields.get("y_true"),
+                })
+        log(f"[evaluation] Baseline node_predictions written: {dest}")
+    except Exception as exc:
+        log(f"[evaluation] Failed to write Baseline node_predictions.csv: {exc}")
+
+
+def _persist_event_predictions(run_dir, best_epoch_dir, cfg, variant):
+    """
+    Persist event-level predictions for the selected epoch to
+    <run_dir>/node_scores/event_predictions.csv.
+
+    For Baseline (orthrus_baseline):
+        Concatenate all .csv files from edge_scores/test/<best_epoch_dir>/,
+        sorted stably by event_index, ensuring no duplicates.
+
+    For MSTC:
+        Use calibration/<best_epoch_dir>/test_calibrated.csv directly.
+
+    The canonical event schema includes all raw fields present in the source files
+    (see §9.4 of the task specification).  MSTC files additionally contain
+    calibration-specific fields (score_calibrated, calibration_level, etc.).
+
+    Fields NOT currently exposed by the model architecture:
+        - source_time_gap / destination_time_gap (not in raw test CSV)
+        - source_time_bucket / destination_time_bucket (not in raw test CSV)
+        - short_gate_weight / medium_gate_weight / long_gate_weight
+          (encoder internal state; not persisted per-event)
+
+    These are documented in the final report as case-analysis extension fields
+    that would require additional model output plumbing.
+    """
+    if not _is_real_path(run_dir):
+        return
+    run_dir = os.fspath(run_dir)
+    dest_dir = os.path.join(run_dir, "node_scores")
+    dest = os.path.join(dest_dir, "event_predictions.csv")
+    os.makedirs(dest_dir, exist_ok=True)
+
+    if variant == "mstc":
+        eval_results_dir = getattr(cfg.detection.evaluation, "_evaluation_results_dir", "")
+        if not eval_results_dir:
+            eval_results_dir = os.path.join(run_dir, "evaluation_results")
+        source = os.path.join(eval_results_dir, "calibration", best_epoch_dir, "test_calibrated.csv")
+        if not os.path.exists(source):
+            log(f"[evaluation] MSTC test_calibrated.csv not found: {source}; skipping event_predictions.")
+            return
+        try:
+            import shutil as _shutil
+            _shutil.copy2(source, dest)
+            log(f"[evaluation] MSTC event_predictions copied: {dest}")
+        except Exception as exc:
+            log(f"[evaluation] Failed to copy MSTC event_predictions: {exc}")
+        return
+
+    # Baseline: concatenate selected-epoch test edge-score CSVs
+    edge_scores_dir = os.path.join(cfg.detection.gnn_testing._edge_losses_dir, "test", best_epoch_dir)
+    if not os.path.isdir(edge_scores_dir):
+        log(f"[evaluation] Baseline edge_scores dir not found: {edge_scores_dir}; skipping event_predictions.")
+        return
+
+    import csv as _csv
+
+    all_records = []
+    csv_files = sorted(Path(edge_scores_dir).glob("*.csv"))
+    if not csv_files:
+        log(f"[evaluation] No CSV files in {edge_scores_dir}; skipping event_predictions.")
+        return
+
+    seen_event_indices = set()
+    duplicate_events = []
+
+    for csv_path in csv_files:
+        try:
+            records = _cal_load_csv(str(csv_path))
+        except Exception as exc:
+            log(f"[evaluation] Failed to load {csv_path}: {exc}; skipping file.")
+            continue
+        for record in records:
+            if "event_index" in record:
+                try:
+                    eid = int(record["event_index"])
+                    if eid in seen_event_indices:
+                        duplicate_events.append(eid)
+                    else:
+                        seen_event_indices.add(eid)
+                except (ValueError, TypeError):
+                    pass
+        all_records.extend(records)
+
+    # Sort stably by event_index
+    if all_records and "event_index" in all_records[0]:
+        all_records.sort(key=lambda r: int(r["event_index"]))
+
+    if duplicate_events:
+        log(f"[evaluation] Warning: {len(duplicate_events)} duplicate event_indices found in Baseline event CSVs; "
+            f"first 10: {duplicate_events[:10]}")
+
+    try:
+        with open(dest, "w", newline="", encoding="utf-8") as handle:
+            if all_records:
+                fieldnames = list(all_records[0].keys())
+                writer = _csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for record in all_records:
+                    row = {k: (str(v) if v is not None else "") for k, v in record.items()}
+                    writer.writerow(row)
+        log(f"[evaluation] Baseline event_predictions written: {dest} ({len(all_records)} events)")
+    except Exception as exc:
+        log(f"[evaluation] Failed to write Baseline event_predictions.csv: {exc}")
         os.makedirs(dest_dir, exist_ok=True)
         import shutil
         shutil.copy2(source, dest)

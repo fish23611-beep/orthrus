@@ -775,3 +775,484 @@ def test_load_evaluation_cleanup_preserves_detection_namespace():
             assert "detection.evaluation" in sys.modules, (
                 "detection.evaluation attribute exists but sys.modules entry is missing"
             )
+
+
+# --------------------------------------------------------------------------- #
+# H.1: Baseline node_predictions.csv written from selected-epoch result .pth
+# --------------------------------------------------------------------------- #
+
+def test_baseline_node_predictions_from_selected_epoch_pth(monkeypatch, tmp_path):
+    """
+    Baseline selected-epoch result .pth must be converted to canonical CSV
+    at <run_dir>/node_scores/node_predictions.csv.
+    """
+    module, _ = _load_evaluation(monkeypatch)
+    module.listdir_sorted = lambda path: ["model_epoch_1", "model_epoch_2"]
+
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    (run_dir / "node_scores").mkdir()
+
+    eval_results = tmp_path / "eval_results"
+    pr_dir = eval_results / "node_evaluation"
+    pr_dir.mkdir(parents=True)
+
+    # Write per-epoch result .pth files (simulating node_evaluation output)
+    import torch
+    for epoch in ("model_epoch_1", "model_epoch_2"):
+        result = {
+            "node_A": {"score": 0.9, "y_hat": 1, "y_true": 1, "tw_with_max_loss": 0},
+            "node_B": {"score": 0.2, "y_hat": 0, "y_true": 0, "tw_with_max_loss": 1},
+        }
+        torch.save(result, pr_dir / f"result_{epoch}.pth")
+
+    # Epoch 1 has lower val loss → selected
+    stats = {
+        "model_epoch_1": {"val_mean_edge_loss": 0.5, "mcc": 0.95},
+        "model_epoch_2": {"val_mean_edge_loss": 1.0, "mcc": 0.60},
+    }
+
+    cfg = _cfg(variant="orthrus_baseline", run_dir=str(run_dir))
+    cfg.detection.evaluation.node_evaluation._precision_recall_dir = str(pr_dir)
+    module.standard_evaluation(cfg, _stats_fn(stats))
+
+    node_csv = run_dir / "node_scores" / "node_predictions.csv"
+    assert node_csv.exists(), "Baseline node_predictions.csv must be written"
+
+    content = node_csv.read_text(encoding="utf-8")
+    assert "node_id,score,y_hat,y_true" in content
+    assert "node_A,0.9,1,1" in content
+    assert "node_B,0.2,0,0" in content
+
+
+# --------------------------------------------------------------------------- #
+# H.2: Baseline node CSV confusion matrix matches metrics.json
+# --------------------------------------------------------------------------- #
+
+def test_baseline_node_csv_recomputed_matches_metrics(monkeypatch, tmp_path):
+    """
+    Recomputing TP/FP/TN/FN from node_predictions.csv must match metrics.json.
+    """
+    import csv
+    module, _ = _load_evaluation(monkeypatch)
+    module.listdir_sorted = lambda path: ["model_epoch_1"]
+
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    (run_dir / "node_scores").mkdir()
+
+    pr_dir = tmp_path / "pr"
+    pr_dir.mkdir()
+    import torch
+    result = {
+        "node_1": {"score": 0.9, "y_hat": 1, "y_true": 1},
+        "node_2": {"score": 0.8, "y_hat": 1, "y_true": 0},
+        "node_3": {"score": 0.3, "y_hat": 0, "y_true": 0},
+        "node_4": {"score": 0.2, "y_hat": 0, "y_true": 1},
+    }
+    torch.save(result, pr_dir / "result_model_epoch_1.pth")
+
+    stats = {
+        "model_epoch_1": {"val_mean_edge_loss": 1.0, "tp": 1, "fp": 1, "tn": 1, "fn": 1},
+    }
+
+    cfg = _cfg(variant="orthrus_baseline", run_dir=str(run_dir))
+    cfg.detection.evaluation.node_evaluation._precision_recall_dir = str(pr_dir)
+    module.standard_evaluation(cfg, _stats_fn(stats))
+
+    node_csv = run_dir / "node_scores" / "node_predictions.csv"
+    rows = list(csv.DictReader(node_csv.read_text(encoding="utf-8").splitlines()))
+
+    tp = sum(1 for r in rows if r["y_true"] == "1" and r["y_hat"] == "1")
+    fp = sum(1 for r in rows if r["y_true"] == "0" and r["y_hat"] == "1")
+    tn = sum(1 for r in rows if r["y_true"] == "0" and r["y_hat"] == "0")
+    fn = sum(1 for r in rows if r["y_true"] == "1" and r["y_hat"] == "0")
+
+    assert tp == 1, f"TP must be 1, got {tp}"
+    assert fp == 1, f"FP must be 1, got {fp}"
+    assert tn == 1, f"TN must be 1, got {tn}"
+    assert fn == 1, f"FN must be 1, got {fn}"
+
+    metrics_file = run_dir / "node_scores" / "metrics.json"
+    import json as _json
+    metrics = _json.loads(metrics_file.read_text())
+    assert metrics["tp"] == tp
+    assert metrics["fp"] == fp
+    assert metrics["tn"] == tn
+    assert metrics["fn"] == fn
+
+
+# --------------------------------------------------------------------------- #
+# H.3: Baseline event_predictions.csv only from selected epoch
+# --------------------------------------------------------------------------- #
+
+def test_baseline_event_predictions_only_selected_epoch(monkeypatch, tmp_path):
+    """
+    event_predictions.csv must contain events only from the selected epoch,
+    not from all epochs.
+    """
+    module, _ = _load_evaluation(monkeypatch)
+    module.listdir_sorted = lambda path: ["model_epoch_1", "model_epoch_2"]
+
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    (run_dir / "node_scores").mkdir()
+
+    edge_dir = tmp_path / "edge_scores"
+    edge_dir.mkdir(parents=True)
+    for epoch in ("model_epoch_1", "model_epoch_2"):
+        epoch_dir = edge_dir / "test" / epoch
+        epoch_dir.mkdir(parents=True)
+        (epoch_dir / "tw0.csv").write_text(
+            f"event_index,score_raw\n{epoch.replace('model_epoch_', '') + '00'},1.0\n",
+            encoding="utf-8"
+        )
+
+    stats = {
+        "model_epoch_1": {"val_mean_edge_loss": 0.5, "mcc": 0.95},
+        "model_epoch_2": {"val_mean_edge_loss": 1.0, "mcc": 0.60},
+    }
+
+    cfg = _cfg(variant="orthrus_baseline", run_dir=str(run_dir))
+    # _edge_losses_dir is the root of edge_scores; the code appends "test/<epoch>"
+    cfg.detection.gnn_testing._edge_losses_dir = str(edge_dir)
+    module.standard_evaluation(cfg, _stats_fn(stats))
+
+    event_csv = run_dir / "node_scores" / "event_predictions.csv"
+    assert event_csv.exists(), "Baseline event_predictions.csv must be written"
+
+    content = event_csv.read_text(encoding="utf-8")
+    lines = content.strip().split("\n")
+    # Header + exactly 1 data row (from epoch 1, which has lower val loss)
+    assert len(lines) == 2, f"Expected 2 lines (header + 1 data row), got {len(lines)}: {lines}"
+    # The selected epoch event should NOT be from model_epoch_2 (epoch 2 has higher val loss)
+    assert "200" not in content, "event from non-selected epoch 2 must not appear"
+
+
+# --------------------------------------------------------------------------- #
+# H.4: Baseline event_predictions has unique and sorted event_index
+# --------------------------------------------------------------------------- #
+
+def test_baseline_event_predictions_deterministic_unique(monkeypatch, tmp_path):
+    """
+    Baseline event_predictions.csv must have unique event_index values,
+    sorted in ascending order.
+    """
+    module, _ = _load_evaluation(monkeypatch)
+    module.listdir_sorted = lambda path: ["model_epoch_1"]
+
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    (run_dir / "node_scores").mkdir()
+
+    edge_dir = tmp_path / "edge_scores"
+    edge_dir.mkdir(parents=True)
+    epoch_dir = edge_dir / "test" / "model_epoch_1"
+    epoch_dir.mkdir(parents=True)
+    # Two files with overlapping sorted event indices
+    (epoch_dir / "tw0.csv").write_text(
+        "event_index,score_raw\n100,0.5\n200,0.6\n",
+        encoding="utf-8"
+    )
+    (epoch_dir / "tw1.csv").write_text(
+        "event_index,score_raw\n150,0.7\n250,0.8\n",
+        encoding="utf-8"
+    )
+
+    cfg = _cfg(variant="orthrus_baseline", run_dir=str(run_dir))
+    cfg.detection.gnn_testing._edge_losses_dir = str(edge_dir)
+    module.standard_evaluation(cfg, _stats_fn({"model_epoch_1": {"val_mean_edge_loss": 1.0, "mcc": 0.5}}))
+
+    event_csv = run_dir / "node_scores" / "event_predictions.csv"
+    content = event_csv.read_text(encoding="utf-8")
+    lines = content.strip().split("\n")
+
+    event_indices = [int(line.split(",")[0]) for line in lines[1:]]
+    assert event_indices == sorted(event_indices), f"event_index must be sorted: {event_indices}"
+    assert len(event_indices) == len(set(event_indices)), f"event_index must be unique: {event_indices}"
+
+
+# --------------------------------------------------------------------------- #
+# H.5: MSTC event_predictions uses selected-epoch test_calibrated.csv
+# --------------------------------------------------------------------------- #
+
+def test_mstc_event_predictions_from_calibrated_csv(monkeypatch, tmp_path):
+    """
+    MSTC event_predictions.csv must be copied from the selected epoch's
+    calibration/test_calibrated.csv, preserving all calibration fields.
+    """
+    module, _ = _load_evaluation(monkeypatch)
+    module.listdir_sorted = lambda path: ["model_epoch_1", "model_epoch_2"]
+
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    (run_dir / "node_scores").mkdir()
+
+    eval_results = tmp_path / "eval_results" / "calibration"
+    for epoch in ("model_epoch_1", "model_epoch_2"):
+        epoch_dir = eval_results / epoch
+        epoch_dir.mkdir(parents=True)
+        (epoch_dir / "test_calibrated.csv").write_text(
+            "event_index,score_raw,score_calibrated,calibration_level\n"
+            "100,0.8,0.3,triplet\n"
+            "200,0.9,0.4,type_pair\n",
+            encoding="utf-8"
+        )
+        # Also write node_predictions.csv for MSTC
+        (epoch_dir / "node_predictions.csv").write_text(
+            "node_id,score,y_hat,y_true\n0,0.9,1,1\n1,0.1,0,0\n",
+            encoding="utf-8"
+        )
+
+    stats = {
+        "model_epoch_1": {"val_mean_edge_loss": 0.5, "mcc": 0.95},
+        "model_epoch_2": {"val_mean_edge_loss": 1.0, "mcc": 0.60},
+    }
+
+    cfg = _cfg(variant="mstc", run_dir=str(run_dir))
+    cfg.detection.evaluation._evaluation_results_dir = str(eval_results.parent)
+    module.standard_evaluation(cfg, _stats_fn(stats))
+
+    event_csv = run_dir / "node_scores" / "event_predictions.csv"
+    assert event_csv.exists(), "MSTC event_predictions.csv must be written"
+
+    content = event_csv.read_text(encoding="utf-8")
+    assert "score_calibrated" in content, "calibration fields must be preserved"
+    assert "calibration_level" in content
+    # Selected epoch is model_epoch_1 (lower val loss)
+    assert "triplet" in content
+
+
+# --------------------------------------------------------------------------- #
+# H.6: MSTC event_predictions has calibration fields
+# --------------------------------------------------------------------------- #
+
+def test_mstc_event_predictions_has_calibration_fields(monkeypatch, tmp_path):
+    """
+    MSTC event_predictions.csv must contain score_raw, score_calibrated,
+    and calibration_level fields.
+    """
+    module, _ = _load_evaluation(monkeypatch)
+    module.listdir_sorted = lambda path: ["model_epoch_1"]
+
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    (run_dir / "node_scores").mkdir()
+
+    eval_results = tmp_path / "eval_results" / "calibration"
+    epoch_dir = eval_results / "model_epoch_1"
+    epoch_dir.mkdir(parents=True)
+    (epoch_dir / "test_calibrated.csv").write_text(
+        "event_index,score_raw,score_calibrated,calibration_level\n"
+        "1,0.8,0.2,triplet\n",
+        encoding="utf-8"
+    )
+    (epoch_dir / "node_predictions.csv").write_text(
+        "node_id,score,y_hat,y_true\n0,0.5,0,0\n",
+        encoding="utf-8"
+    )
+
+    cfg = _cfg(variant="mstc", run_dir=str(run_dir))
+    cfg.detection.evaluation._evaluation_results_dir = str(eval_results.parent)
+    module.standard_evaluation(cfg, _stats_fn({"model_epoch_1": {"val_mean_edge_loss": 1.0, "mcc": 0.5}}))
+
+    event_csv = run_dir / "node_scores" / "event_predictions.csv"
+    content = event_csv.read_text(encoding="utf-8")
+    for field in ("score_raw", "score_calibrated", "calibration_level"):
+        assert field in content, f"MSTC event_predictions must contain {field}"
+
+
+# --------------------------------------------------------------------------- #
+# H.7: Only selected epoch events used for Baseline
+# --------------------------------------------------------------------------- #
+
+def test_non_selected_epoch_events_not_included(monkeypatch, tmp_path):
+    """
+    Events from non-selected epochs must not appear in Baseline event_predictions.csv.
+    """
+    module, _ = _load_evaluation(monkeypatch)
+    module.listdir_sorted = lambda path: ["model_epoch_1", "model_epoch_2"]
+
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    (run_dir / "node_scores").mkdir()
+
+    edge_dir = tmp_path / "edge_scores"
+    edge_dir.mkdir(parents=True)
+    # Selected epoch 1 has event_index=999
+    (edge_dir / "test" / "model_epoch_1").mkdir(parents=True)
+    (edge_dir / "test" / "model_epoch_1" / "tw0.csv").write_text(
+        "event_index,score_raw\n999,1.0\n",
+        encoding="utf-8"
+    )
+    # Non-selected epoch 2 has event_index=888
+    (edge_dir / "test" / "model_epoch_2").mkdir(parents=True)
+    (edge_dir / "test" / "model_epoch_2" / "tw0.csv").write_text(
+        "event_index,score_raw\n888,0.9\n",
+        encoding="utf-8"
+    )
+
+    stats = {
+        "model_epoch_1": {"val_mean_edge_loss": 0.5, "mcc": 0.95},
+        "model_epoch_2": {"val_mean_edge_loss": 1.0, "mcc": 0.60},
+    }
+
+    cfg = _cfg(variant="orthrus_baseline", run_dir=str(run_dir))
+    cfg.detection.gnn_testing._edge_losses_dir = str(edge_dir)
+    module.standard_evaluation(cfg, _stats_fn(stats))
+
+    event_csv = run_dir / "node_scores" / "event_predictions.csv"
+    content = event_csv.read_text(encoding="utf-8")
+    assert "999" in content, "selected epoch events must be present"
+    assert "888" not in content, "non-selected epoch events must not be present"
+
+
+# --------------------------------------------------------------------------- #
+# H.8: inspected_nodes_per_attack in metrics.json (Baseline)
+# --------------------------------------------------------------------------- #
+
+def test_baseline_metrics_includes_inspected_nodes_per_attack(monkeypatch, tmp_path):
+    """
+    Baseline metrics.json must contain inspected_nodes_per_attack from the
+    selected epoch.
+    """
+    module, _ = _load_evaluation(monkeypatch)
+    module.listdir_sorted = lambda path: ["model_epoch_1"]
+
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    (run_dir / "node_scores").mkdir()
+
+    cfg = _cfg(variant="orthrus_baseline", run_dir=str(run_dir))
+
+    pr_dir = tmp_path / "pr"
+    pr_dir.mkdir()
+    import torch
+    result = {
+        "n1": {"score": 0.9, "y_hat": 1, "y_true": 1},
+        "n2": {"score": 0.8, "y_hat": 1, "y_true": 1},
+        "n3": {"score": 0.3, "y_hat": 0, "y_true": 1},
+        "n4": {"score": 0.2, "y_hat": 0, "y_true": 1},
+        "b1": {"score": 0.1, "y_hat": 0, "y_true": 0},
+    }
+    torch.save(result, pr_dir / "result_model_epoch_1.pth")
+    cfg.detection.evaluation.node_evaluation._precision_recall_dir = str(pr_dir)
+
+    # _stats_fn returns only the provided fields. Since node_evaluation.main is mocked,
+    # we embed inspected_nodes_per_attack directly in the stats dict so it gets
+    # persisted to metrics.json through _persist_canonical_metrics.
+    stats_with_inspected = {
+        "model_epoch_1": {
+            "val_mean_edge_loss": 1.0, "mcc": 0.5,
+            "inspected_nodes_per_attack": 1.0,  # 2 positives / 2 attacks
+            "num_predicted_positive_nodes": 2,
+            "num_ground_truth_attacks": 2,
+            "tp": 2, "fp": 0, "tn": 1, "fn": 2,
+        }
+    }
+    module.standard_evaluation(cfg, _stats_fn(stats_with_inspected))
+
+    import json as _json
+    metrics_file = run_dir / "node_scores" / "metrics.json"
+    metrics = _json.loads(metrics_file.read_text())
+
+    assert "inspected_nodes_per_attack" in metrics, "inspected_nodes_per_attack must be in metrics"
+    assert metrics["inspected_nodes_per_attack"] == 1.0
+
+
+# --------------------------------------------------------------------------- #
+# H.9: Zero attacks → NaN for inspected_nodes_per_attack
+# --------------------------------------------------------------------------- #
+
+def test_inspected_nodes_per_attack_zero_attacks_nan(monkeypatch, tmp_path):
+    """
+    When attack_to_nodes is empty, inspected_nodes_per_attack must be NaN.
+    """
+    from mstc.metrics import compute_inspected_nodes_per_attack
+    import math
+
+    assert math.isnan(compute_inspected_nodes_per_attack(5, 0))
+    assert math.isnan(compute_inspected_nodes_per_attack(0, 0))
+
+
+# --------------------------------------------------------------------------- #
+# H.10: _persist_event_predictions no-op on invalid run_dir (MagicMock guard)
+# --------------------------------------------------------------------------- #
+
+def test_persist_event_predictions_rejects_magicmock(monkeypatch, tmp_path):
+    """
+    _persist_event_predictions must be a no-op for MagicMock run_dir,
+    preventing filesystem pollution.
+    """
+    module, _ = _load_evaluation(monkeypatch)
+
+    module._persist_event_predictions(MagicMock(), "model_epoch_1", _cfg(), "orthrus_baseline")
+
+    # Verify NO MagicMock/ directory was created anywhere
+    import glob
+    magic_dirs = glob.glob("/home/MagicMock") + glob.glob(str(tmp_path) + "/MagicMock")
+    assert len(magic_dirs) == 0, f"MagicMock/ directory should not exist: {magic_dirs}"
+
+
+# --------------------------------------------------------------------------- #
+# H.11: _persist_baseline_node_predictions no-op on invalid run_dir
+# --------------------------------------------------------------------------- #
+
+def test_persist_baseline_node_predictions_rejects_magicmock(monkeypatch, tmp_path):
+    """
+    _persist_baseline_node_predictions must be a no-op for MagicMock run_dir.
+    """
+    module, _ = _load_evaluation(monkeypatch)
+
+    module._persist_baseline_node_predictions(MagicMock(), "model_epoch_1", _cfg())
+
+    import glob
+    magic_dirs = glob.glob("/home/MagicMock") + glob.glob(str(tmp_path) + "/MagicMock")
+    assert len(magic_dirs) == 0
+
+
+# --------------------------------------------------------------------------- #
+# H.12: selected epoch still only determined by val_mean_edge_loss
+# --------------------------------------------------------------------------- #
+
+def test_selected_epoch_determined_by_val_loss_not_test_metrics(monkeypatch, tmp_path):
+    """
+    The selected epoch must be determined by min(val_mean_edge_loss),
+    NOT by test metrics (tp/fp/tn/fn/etc.).
+    """
+    module, _ = _load_evaluation(monkeypatch)
+    module.listdir_sorted = lambda path: ["model_epoch_1", "model_epoch_2", "model_epoch_3"]
+
+    run_dir = tmp_path / "run_dir"
+    run_dir.mkdir()
+    (run_dir / "node_scores").mkdir()
+
+    pr_dir = tmp_path / "pr"
+    pr_dir.mkdir()
+    import torch
+    for i in range(1, 4):
+        torch.save({}, pr_dir / f"result_model_epoch_{i}.pth")
+
+    # Epoch 2 has BEST test metrics (highest MCC) but WORST val loss
+    # Epoch 3 has BEST val loss but WORST test metrics
+    stats = {
+        "model_epoch_1": {"val_mean_edge_loss": 2.0, "mcc": 0.50, "tp": 5},
+        "model_epoch_2": {"val_mean_edge_loss": 1.5, "mcc": 0.99, "tp": 100},  # best test, bad val
+        "model_epoch_3": {"val_mean_edge_loss": 1.0, "mcc": 0.10, "tp": 2},   # best val
+    }
+
+    cfg = _cfg(variant="orthrus_baseline", run_dir=str(run_dir))
+    cfg.detection.evaluation.node_evaluation._precision_recall_dir = str(pr_dir)
+    module.standard_evaluation(cfg, _stats_fn(stats))
+
+    import json as _json
+    metrics_file = run_dir / "node_scores" / "metrics.json"
+    metrics = _json.loads(metrics_file.read_text())
+
+    # Selected must be epoch 3 (best val), NOT epoch 2 (best test MCC)
+    assert metrics.get("selected_epoch") == 3, (
+        f"Selected epoch must be 3 (best val loss), not {metrics.get('selected_epoch')}"
+    )
+    assert metrics.get("mcc") == 0.10, (
+        f"MCC must be from epoch 3 (0.10), got {metrics.get('mcc')}"
+    )
