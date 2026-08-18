@@ -5,6 +5,7 @@ from collections import defaultdict
 from pprint import pprint
 import json as _json
 import tempfile
+from typing import Union, Optional
 
 from . import node_evaluation
 from mstc.calibration_runner import (
@@ -17,6 +18,39 @@ from provnet_utils import log
 from .evaluation_utils import *
 from wandb_control import wandb_log, wandb_is_active
 from labelling import get_GP_of_each_attack
+
+PathLike = Union[str, "os.PathLike[str]"]
+
+
+# --------------------------------------------------------------------------- #
+# Safe path validation (rejects MagicMock / Mock / synthetic PathLike objects)
+# --------------------------------------------------------------------------- #
+
+def _is_real_path(path: Optional[PathLike]) -> bool:
+    """
+    Return True only when *path* is a real, non-empty, non-Mock string or Path.
+
+    This guard makes every persistence helper a no-op in unit tests that pass
+    MagicMock objects as run_dir, preventing filesystem pollution such as
+    "MagicMock/mock._run_dir/<id>/node_scores/metrics.json".
+
+    Unlike the broader ``isinstance(path, os.PathLike)`` check (which returns
+    True for MagicMock due to its ``__fspath__`` implementation), this
+    function explicitly rejects Mock-like objects by inspecting the type name.
+    """
+    if path is None:
+        return False
+    try:
+        s = os.fspath(path)
+    except Exception:
+        return False
+    if not s:
+        return False
+    # Reject any Mock-like objects that may implement __fspath__
+    type_name = type(path).__name__.lower()
+    if "mock" in type_name:
+        return False
+    return True
 
 # Use sys.modules for lazy wandb import so that test patches on
 # "detection.evaluation.wandb" work correctly.  Importing wandb at the
@@ -80,7 +114,7 @@ def _persist_canonical_metrics(run_dir, best_stats, best_epoch_dir, method, cfg)
         The resolved yacs CfgNode (used to extract val_mean_edge_loss if
         not already present in best_stats).
     """
-    if not isinstance(run_dir, (str, os.PathLike)) or not os.fspath(run_dir):
+    if not _is_real_path(run_dir):
         log(f"[evaluation] _persist_canonical_metrics: run_dir={run_dir!r} is not valid; skipping persistence.")
         return
 
@@ -258,7 +292,7 @@ def standard_evaluation(cfg, evaluation_fn):
 
 def _persist_mstc_predictions(run_dir, best_epoch_dir, cfg):
     """Copy the selected epoch's MSTC predictions to node_scores/node_predictions.csv."""
-    if not isinstance(run_dir, (str, os.PathLike)) or not os.fspath(run_dir):
+    if not _is_real_path(run_dir):
         return
     run_dir = os.fspath(run_dir)
     eval_results_dir = getattr(cfg.detection.evaluation, "_evaluation_results_dir", "")

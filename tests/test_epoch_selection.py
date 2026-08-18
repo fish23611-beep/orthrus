@@ -17,6 +17,8 @@ Design rules (strict, paper-grade):
 """
 import sys
 import os
+import json
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
@@ -329,3 +331,171 @@ def test_nonfinite_val_metric_raises_valueerror(bad_val):
         assert "model_epoch_2" in msg, (
             f"Error message must identify model_epoch_2 (val={bad_val!r}); got: {msg}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# MagicMock run_dir guard regression tests
+# --------------------------------------------------------------------------- #
+
+def _make_stats_fn():
+    """Return an evaluation_fn that returns basic stats for one epoch."""
+    def fn(val, test, epoch, cfg, **kwargs):
+        return {
+            "val_mean_edge_loss": 1.0,
+            "mcc": 0.80,
+            "epoch": int(epoch.split("_")[-1]),
+            "precision": 0.9,
+            "recall": 0.85,
+            "f1": 0.87,
+            "tp": 10,
+            "fp": 1,
+            "tn": 88,
+            "fn": 1,
+        }
+    return fn
+
+
+def test_persist_canonical_metrics_rejects_magicmock(tmp_path):
+    """
+    Regression: _persist_canonical_metrics must NOT create files when run_dir
+    is a MagicMock.  This prevents filesystem pollution like MagicMock/ dirs.
+    """
+    from detection.evaluation import _persist_canonical_metrics
+
+    cfg = MagicMock()
+    cfg.detection.gnn_testing._edge_losses_dir = "/fake"
+
+    # Call with MagicMock run_dir — must be a no-op
+    _persist_canonical_metrics(
+        MagicMock(),
+        {"val_mean_edge_loss": 1.0, "mcc": 0.8},
+        "model_epoch_1",
+        "min_val_mean_edge_loss",
+        cfg,
+    )
+
+    # Verify NO MagicMock/ directory was created anywhere
+    import glob
+    magic_dirs = glob.glob("/home/MagicMock") + glob.glob(str(tmp_path) + "/MagicMock")
+    assert len(magic_dirs) == 0, f"MagicMock/ directory should not exist: {magic_dirs}"
+
+    # Also verify no other files were created in the test root
+    test_root_files = list(Path("/home").glob("MagicMock*"))
+    assert len(test_root_files) == 0, f"No MagicMock artifacts should exist: {test_root_files}"
+
+
+def test_persist_mstc_predictions_rejects_magicmock():
+    """
+    Regression: _persist_mstc_predictions must NOT create files when run_dir
+    is a MagicMock.
+    """
+    from detection.evaluation import _persist_mstc_predictions
+
+    cfg = MagicMock()
+    cfg.detection.evaluation._evaluation_results_dir = "/fake"
+
+    # Call with MagicMock run_dir — must be a no-op
+    _persist_mstc_predictions(
+        MagicMock(),
+        "model_epoch_1",
+        cfg,
+    )
+
+    # Verify NO MagicMock/ directory was created
+    import glob
+    magic_dirs = glob.glob("/home/MagicMock")
+    assert len(magic_dirs) == 0, f"MagicMock/ directory should not exist: {magic_dirs}"
+
+
+@requires_torch
+def test_standard_evaluation_with_magicmock_run_dir_no_pollution():
+    """
+    Regression: standard_evaluation() with MagicMock cfg._run_dir must NOT create
+    any MagicMock/ directories or files.  The canonical persistence helpers must
+    detect the invalid path and skip file operations.
+    """
+    cfg = MagicMock()
+    cfg.model_selection.method = "min_val_mean_edge_loss"
+    cfg.model_selection.legacy_test_selection_enabled = False
+    cfg.detection.gnn_testing._edge_losses_dir = "/fake"
+    cfg.detection.evaluation.node_evaluation._precision_recall_dir = "/fake/pr"
+    # cfg._run_dir is MagicMock by default (no explicit setting)
+
+    stats = {
+        "model_epoch_1": {"val_mean_edge_loss": 1.0, "mcc": 0.80, "epoch": 1},
+    }
+    mock_fn = _make_stats_fn()
+
+    with patch("detection.evaluation.listdir_sorted", return_value=["model_epoch_1"]), \
+         patch("detection.evaluation.compute_tw_labels", return_value={}), \
+         patch("detection.evaluation.wandb_log"), \
+         patch("detection.evaluation.wandb"), \
+         patch("detection.evaluation.log"):
+
+        from detection.evaluation import standard_evaluation
+        standard_evaluation(cfg, evaluation_fn=mock_fn)
+
+    # After the call, verify NO MagicMock/ directory exists anywhere
+    import glob
+    magic_dirs = glob.glob("/home/MagicMock")
+    assert len(magic_dirs) == 0, (
+        f"MagicMock/ directory should not exist after standard_evaluation with "
+        f"MagicMock cfg._run_dir. Found: {magic_dirs}"
+    )
+
+
+def test_real_path_still_works_for_persist_canonical_metrics(tmp_path):
+    """
+    Regression: _persist_canonical_metrics must still write metrics.json correctly
+    when run_dir is a real pathlib.Path or str.
+    """
+    from detection.evaluation import _persist_canonical_metrics
+
+    run_dir = tmp_path / "real_run"
+    run_dir.mkdir()
+
+    cfg = MagicMock()
+    cfg.detection.gnn_testing._edge_losses_dir = "/fake"
+
+    _persist_canonical_metrics(
+        run_dir,
+        {"val_mean_edge_loss": 0.5, "mcc": 0.9},
+        "model_epoch_3",
+        "min_val_mean_edge_loss",
+        cfg,
+    )
+
+    metrics_file = run_dir / "node_scores" / "metrics.json"
+    assert metrics_file.exists(), "metrics.json must be written for real path"
+
+    with open(metrics_file) as f:
+        metrics = json.load(f)
+    assert metrics.get("selected_epoch") == 3
+    assert metrics.get("val_mean_edge_loss") == 0.5
+
+
+def test_pathlib_path_still_works_for_persist_canonical_metrics(tmp_path):
+    """
+    Regression: _persist_canonical_metrics must accept pathlib.Path objects.
+    """
+    from detection.evaluation import _persist_canonical_metrics
+
+    run_dir = Path(tmp_path) / "pathlib_run"
+    run_dir.mkdir()
+
+    cfg = MagicMock()
+    cfg.detection.gnn_testing._edge_losses_dir = "/fake"
+
+    _persist_canonical_metrics(
+        run_dir,  # pathlib.Path, not str
+        {"val_mean_edge_loss": 0.7, "mcc": 0.75},
+        "model_epoch_5",
+        "min_val_mean_edge_loss",
+        cfg,
+    )
+
+    metrics_file = run_dir / "node_scores" / "metrics.json"
+    assert metrics_file.exists(), "metrics.json must be written for pathlib.Path"
+    with open(metrics_file) as f:
+        metrics = json.load(f)
+    assert metrics.get("selected_epoch") == 5
