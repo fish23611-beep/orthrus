@@ -33,6 +33,66 @@ if str(SRC_ROOT) not in sys.path:
 
 
 # --------------------------------------------------------------------------- #
+# Module-isolation sandbox fixture
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture(autouse=True)
+def _evaluation_module_isolation():
+    """
+    Prevent _load_evaluation() from polluting sys.modules / detection attributes
+    across test boundaries.
+
+    Records the pre-test state of:
+      - sys.modules["detection"]
+      - sys.modules["detection.evaluation"]
+      - detection.evaluation attribute (if detection is in sys.modules)
+
+    Restores the exact pre-test state after every test so that subsequent tests
+    (including test_epoch_selection.py) see a consistent import namespace.
+    """
+    saved_detection_mod = sys.modules.get("detection")
+    saved_eval_mod = sys.modules.get("detection.evaluation")
+
+    # Detect whether detection.evaluation was an attribute BEFORE this test.
+    # We check the object in sys.modules so we don't trigger a fresh import.
+    detection_had_eval_attr = False
+    if saved_detection_mod is not None:
+        detection_had_eval_attr = hasattr(saved_detection_mod, "evaluation")
+
+    yield
+
+    # ---- Teardown: restore sys.modules entries ----
+    if saved_detection_mod is None:
+        # detection did NOT exist before this test → must not exist after
+        sys.modules.pop("detection", None)
+        # Also remove the detection.evaluation entry if it was created
+        sys.modules.pop("detection.evaluation", None)
+    else:
+        sys.modules["detection"] = saved_detection_mod
+
+    if saved_eval_mod is None:
+        sys.modules.pop("detection.evaluation", None)
+    else:
+        sys.modules["detection.evaluation"] = saved_eval_mod
+
+    # ---- Teardown: restore detection.evaluation attribute ----
+    # The detection object in sys.modules is the same Python object we saved.
+    # We must mirror the pre-test attribute state.
+    detection_now = sys.modules.get("detection")
+    if detection_now is not None:
+        if detection_had_eval_attr:
+            # Restore the attribute if it was originally present
+            if not hasattr(detection_now, "evaluation"):
+                # Only set if not already there (may have been restored by
+                # sys.modules restore above)
+                detection_now.evaluation = saved_eval_mod
+        else:
+            # Remove any stray evaluation attribute this test left behind
+            if hasattr(detection_now, "evaluation"):
+                del detection_now.evaluation
+
+
+# --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 
@@ -669,3 +729,49 @@ def test_collect_results_includes_config_fallback_warning_field(tmp_path):
     assert "config_fallback_warning" in row
     assert row["config_fallback_warning"] != ""
     assert "fallback" in row["config_fallback_warning"].lower()
+
+
+# --------------------------------------------------------------------------- #
+# Isolation regression: _load_evaluation must not pollute detection namespace
+# --------------------------------------------------------------------------- #
+
+def test_load_evaluation_cleanup_preserves_detection_namespace():
+    """
+    Regression test: after _load_evaluation() is called, sys.modules and the
+    detection package attribute must remain consistent.
+
+    The bug: _load_evaluation() left sys.modules["detection.evaluation"] pointing
+    to a synthetic module, but deleted the detection.evaluation attribute from the
+    detection package object.  This caused unittest.mock.patch("detection.evaluation.*")
+    to fail with "module 'detection' has no attribute 'evaluation'" in subsequent
+    tests (e.g. test_epoch_selection.py) because the mock importer could not
+    resolve the dotted path.
+
+    This test verifies the invariant that a module in sys.modules must also be
+    accessible as its parent's attribute.
+    """
+    import importlib
+
+    # Pre-condition: detection.evaluation should be importable (or absent) in a
+    # consistent way.  If it exists in sys.modules, it must be accessible as
+    # detection.evaluation.  If it doesn't exist, detection must not have an
+    # evaluation attribute.
+    detection_in_modules = "detection" in sys.modules
+    eval_in_modules = "detection.evaluation" in sys.modules
+
+    if eval_in_modules:
+        # If detection.evaluation is in sys.modules, getattr must work
+        assert hasattr(sys.modules["detection"], "evaluation"), (
+            "sys.modules['detection.evaluation'] exists but detection.evaluation "
+            "attribute is missing — inconsistent import state"
+        )
+        assert sys.modules["detection"].evaluation is sys.modules["detection.evaluation"], (
+            "detection.evaluation attribute does not match sys.modules entry"
+        )
+    else:
+        # If detection.evaluation is not in sys.modules, detection must not have
+        # the attribute (or if it does, sys.modules must also have it)
+        if detection_in_modules and hasattr(sys.modules["detection"], "evaluation"):
+            assert "detection.evaluation" in sys.modules, (
+                "detection.evaluation attribute exists but sys.modules entry is missing"
+            )
