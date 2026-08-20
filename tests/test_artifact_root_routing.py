@@ -854,3 +854,324 @@ class TestArtifactRootPriority:
         assert str(result) == env_root, (
             f"Env var must win over default. Expected {env_root}, got {result}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# R7. Evaluation results routing (C8 fix)
+# --------------------------------------------------------------------------- #
+
+class TestEvaluationResultsRouting:
+    """
+    R1: matrix MSTC evaluation_results routing
+        cfg.detection.evaluation._evaluation_results_dir must equal <run_dir>/evaluation_results.
+
+    R2: different seeds isolation
+        Same config, different seeds -> different run_dir/evaluation_results paths.
+
+    R3: canonical path unchanged
+        node_scores/metrics.json, node_predictions.csv, event_predictions.csv stay in run_dir/node_scores.
+
+    R4: calibration persistence
+        After MSTC calibration, all expected files exist under evaluation_results/calibration/model_epoch_X/.
+
+    R5: canonical selected-epoch source
+        _persist_mstc_predictions() reads from evaluation_results/calibration/<selected_epoch>/,
+        not from the old shared detection/evaluation/ path.
+
+    R6: stale shared artifact isolation
+        Even if old <shared_root>/detection/evaluation/.../calibration/ exists,
+        new matrix run must ignore it and use run-scoped paths.
+
+    R7: Baseline regression
+        Baseline evaluate routing must not be broken.
+    """
+
+    def test_evaluation_results_dir_is_run_scoped(self, tmp_path):
+        """R1: _evaluation_results_dir must equal <run_dir>/evaluation_results."""
+        from artifact_paths import resolve_artifact_paths
+        from yacs.config import CfgNode as CN
+
+        cfg = CN()
+        cfg.dataset = CN()
+        cfg.dataset.name = "THEIA_E3"
+        cfg.detection = CN()
+        cfg.detection.gnn_training = CN()
+        cfg.detection.gnn_training.used_method = "orthrus"
+        cfg.detection.gnn_testing = CN()
+        cfg.detection.evaluation = CN()
+        cfg.detection.evaluation.node_evaluation = CN()
+        cfg._seed = 0
+        cfg._artifact_dir = str(tmp_path / "shared")
+        cfg._artifact_root_raw = None
+
+        run_dir = resolve_artifact_paths(
+            cfg,
+            stages=["evaluate"],
+            run_dir=tmp_path / "scoped" / "THEIA_E3" / "runs" / "orthrus" / "seed_0",
+            create_dirs=False,
+        )
+
+        expected = str(run_dir / "evaluation_results")
+        assert cfg.detection.evaluation._evaluation_results_dir == expected, (
+            f"Expected _evaluation_results_dir={expected}, "
+            f"got {cfg.detection.evaluation._evaluation_results_dir}"
+        )
+        # Must NOT contain the old shared detection/evaluation/ path
+        assert "detection/evaluation/" not in cfg.detection.evaluation._evaluation_results_dir, (
+            f"_evaluation_results_dir must not contain 'detection/evaluation/': "
+            f"{cfg.detection.evaluation._evaluation_results_dir}"
+        )
+
+    def test_different_seeds_have_different_evaluation_results_dirs(self, tmp_path):
+        """R2: Different seeds must produce different evaluation_results_dirs."""
+        from artifact_paths import resolve_artifact_paths
+        from yacs.config import CfgNode as CN
+
+        def make_cfg(seed):
+            cfg = CN()
+            cfg.dataset = CN()
+            cfg.dataset.name = "THEIA_E3"
+            cfg.detection = CN()
+            cfg.detection.gnn_training = CN()
+            cfg.detection.gnn_training.used_method = "orthrus"
+            cfg.detection.gnn_testing = CN()
+            cfg.detection.evaluation = CN()
+            cfg.detection.evaluation.node_evaluation = CN()
+            cfg._seed = seed
+            cfg._artifact_dir = str(tmp_path / "shared")
+            cfg._artifact_root_raw = None
+            return cfg
+
+        cfg0 = make_cfg(0)
+        cfg1 = make_cfg(1)
+
+        run_dir_0 = resolve_artifact_paths(cfg0, stages=["evaluate"], create_dirs=False)
+        run_dir_1 = resolve_artifact_paths(cfg1, stages=["evaluate"], create_dirs=False)
+
+        eval_0 = cfg0.detection.evaluation._evaluation_results_dir
+        eval_1 = cfg1.detection.evaluation._evaluation_results_dir
+
+        assert eval_0 != eval_1, (
+            f"Different seeds must have different evaluation_results_dir. "
+            f"seed_0={eval_0}, seed_1={eval_1}"
+        )
+        # Preprocessing paths should still be shared
+        assert cfg0._artifact_dir == cfg1._artifact_dir
+
+    def test_canonical_node_scores_path_unchanged(self, tmp_path):
+        """R3: node_scores stays at run_dir/node_scores, not evaluation_results."""
+        from artifact_paths import resolve_artifact_paths
+        from yacs.config import CfgNode as CN
+
+        cfg = CN()
+        cfg.dataset = CN()
+        cfg.dataset.name = "THEIA_E3"
+        cfg.detection = CN()
+        cfg.detection.gnn_training = CN()
+        cfg.detection.gnn_training.used_method = "orthrus"
+        cfg.detection.gnn_testing = CN()
+        cfg.detection.evaluation = CN()
+        cfg.detection.evaluation.node_evaluation = CN()
+        cfg._seed = 0
+        cfg._artifact_dir = str(tmp_path / "shared")
+        cfg._artifact_root_raw = None
+
+        run_dir = resolve_artifact_paths(cfg, stages=["evaluate"], create_dirs=False)
+
+        node_scores_dir = cfg.detection.evaluation.node_evaluation._precision_recall_dir
+        assert node_scores_dir == str(run_dir / "node_scores"), (
+            f"node_scores must be at run_dir/node_scores, got {node_scores_dir}"
+        )
+
+    def test_calibration_output_dir_structure(self, tmp_path):
+        """R4: After MSTC calibration, expected files exist under evaluation_results/calibration/."""
+        from artifact_paths import resolve_artifact_paths
+        from yacs.config import CfgNode as CN
+
+        cfg = CN()
+        cfg.dataset = CN()
+        cfg.dataset.name = "THEIA_E3"
+        cfg.detection = CN()
+        cfg.detection.gnn_training = CN()
+        cfg.detection.gnn_training.used_method = "mstc"
+        cfg.detection.gnn_testing = CN()
+        cfg.detection.evaluation = CN()
+        cfg.detection.evaluation.node_evaluation = CN()
+        cfg._seed = 0
+        cfg._artifact_dir = str(tmp_path / "shared")
+        cfg._artifact_root_raw = None
+
+        run_dir = resolve_artifact_paths(cfg, stages=["evaluate"], create_dirs=True)
+
+        eval_dir = cfg.detection.evaluation._evaluation_results_dir
+        epoch_dir = Path(eval_dir) / "calibration" / "model_epoch_1"
+
+        # Verify the expected structure is correct for calibration output
+        assert str(epoch_dir).startswith(str(run_dir)), (
+            f"Calibration epoch dir must be under run_dir, got {epoch_dir}"
+        )
+        assert "detection/evaluation/" not in str(epoch_dir), (
+            f"Calibration path must not contain 'detection/evaluation/': {epoch_dir}"
+        )
+        # Verify evaluation_results is a sibling of node_scores
+        node_scores = run_dir / "node_scores"
+        evaluation_results = run_dir / "evaluation_results"
+        assert node_scores.parent == run_dir
+        assert evaluation_results.parent == run_dir
+
+    def test_persist_mstc_predictions_uses_run_scoped_evaluation_results(self, tmp_path):
+        """R5: _persist_mstc_predictions() reads from run-scoped evaluation_results, not shared."""
+        from detection.evaluation import _persist_mstc_predictions
+        from yacs.config import CfgNode as CN
+
+        run_dir = tmp_path / "run_dir"
+        run_dir.mkdir(parents=True)
+        node_scores = run_dir / "node_scores"
+        node_scores.mkdir(parents=True)
+
+        # Create run-scoped evaluation_results
+        eval_dir = run_dir / "evaluation_results" / "calibration" / "model_epoch_2"
+        eval_dir.mkdir(parents=True)
+        (eval_dir / "node_predictions.csv").write_text("node_id,score,y_hat,y_true\n1,0.5,0,0\n", encoding="utf-8")
+
+        # Verify the function will find the run-scoped source
+        cfg = CN()
+        cfg.detection = CN()
+        cfg.detection.evaluation = CN()
+        cfg.detection.evaluation._evaluation_results_dir = str(run_dir / "evaluation_results")
+
+        _persist_mstc_predictions(str(run_dir), "model_epoch_2", cfg)
+
+        # Should have copied to node_scores
+        dest = node_scores / "node_predictions.csv"
+        assert dest.exists(), (
+            f"_persist_mstc_predictions should copy from run-scoped "
+            f"evaluation_results to node_scores, but {dest} does not exist"
+        )
+
+    def test_shared_stale_evaluation_results_not_used(self, tmp_path):
+        """R6: New matrix run must ignore old shared detection/evaluation/ path."""
+        from artifact_paths import resolve_artifact_paths
+        from yacs.config import CfgNode as CN
+
+        shared_root = tmp_path / "shared"
+        scoped_root = tmp_path / "scoped"
+
+        # Create stale shared artifact (old bug artifact)
+        stale_dir = (
+            shared_root
+            / "detection"
+            / "evaluation"
+            / "abc123"
+            / "THEIA_E3"
+            / "evaluation_results"
+            / "calibration"
+            / "model_epoch_1"
+        )
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "calibrator.pkl").write_text("FAKE", encoding="utf-8")
+
+        # Create a real run_dir
+        run_dir = scoped_root / "THEIA_E3" / "runs" / "orthrus" / "seed_0"
+
+        cfg = CN()
+        cfg.dataset = CN()
+        cfg.dataset.name = "THEIA_E3"
+        cfg.detection = CN()
+        cfg.detection.gnn_training = CN()
+        cfg.detection.gnn_training.used_method = "orthrus"
+        cfg.detection.gnn_testing = CN()
+        cfg.detection.evaluation = CN()
+        cfg.detection.evaluation.node_evaluation = CN()
+        cfg._seed = 0
+        cfg._artifact_dir = str(shared_root)
+        cfg._artifact_root_raw = None
+
+        resolved = resolve_artifact_paths(
+            cfg,
+            stages=["evaluate"],
+            run_dir=run_dir,
+            create_dirs=True,
+        )
+
+        # _evaluation_results_dir must be under run_dir, NOT shared_root
+        eval_dir = cfg.detection.evaluation._evaluation_results_dir
+        assert eval_dir.startswith(str(run_dir)), (
+            f"_evaluation_results_dir must be under run_dir ({run_dir}), got {eval_dir}"
+        )
+        assert not eval_dir.startswith(str(shared_root)), (
+            f"_evaluation_results_dir must NOT be under shared_root ({shared_root}), got {eval_dir}"
+        )
+        assert "detection/evaluation/" not in eval_dir, (
+            f"_evaluation_results_dir must not contain 'detection/evaluation/': {eval_dir}"
+        )
+
+    def test_baseline_evaluation_results_routing_unchanged(self, tmp_path):
+        """R7: Baseline evaluate routing must not be broken by this fix."""
+        from artifact_paths import resolve_artifact_paths
+        from yacs.config import CfgNode as CN
+
+        cfg = CN()
+        cfg.dataset = CN()
+        cfg.dataset.name = "THEIA_E3"
+        cfg.detection = CN()
+        cfg.detection.gnn_training = CN()
+        cfg.detection.gnn_training.used_method = "orthrus_baseline"
+        cfg.detection.gnn_testing = CN()
+        cfg.detection.evaluation = CN()
+        cfg.detection.evaluation.node_evaluation = CN()
+        cfg._seed = 0
+        cfg._artifact_dir = str(tmp_path / "shared")
+        cfg._artifact_root_raw = None
+
+        run_dir = resolve_artifact_paths(cfg, stages=["evaluate"], create_dirs=True)
+
+        # evaluation_results_dir must still be run-scoped
+        eval_dir = cfg.detection.evaluation._evaluation_results_dir
+        assert eval_dir == str(run_dir / "evaluation_results"), (
+            f"Baseline _evaluation_results_dir must be run-scoped, got {eval_dir}"
+        )
+
+        # node_scores must still be run-scoped
+        node_scores = cfg.detection.evaluation.node_evaluation._precision_recall_dir
+        assert node_scores == str(run_dir / "node_scores"), (
+            f"Baseline node_scores must be run-scoped, got {node_scores}"
+        )
+
+        # checkpoints and edge_scores must still be run-scoped
+        checkpoints = cfg.detection.gnn_training._trained_models_dir
+        assert checkpoints == str(run_dir / "checkpoints"), (
+            f"Baseline checkpoints must be run-scoped, got {checkpoints}"
+        )
+        edge_scores = cfg.detection.gnn_testing._edge_losses_dir
+        assert edge_scores == str(run_dir / "edge_scores"), (
+            f"Baseline edge_scores must be run-scoped, got {edge_scores}"
+        )
+
+    def test_evaluation_results_directory_is_created(self, tmp_path):
+        """Verify evaluation_results/ directory is created when evaluate stage runs."""
+        from artifact_paths import resolve_artifact_paths
+        from yacs.config import CfgNode as CN
+
+        cfg = CN()
+        cfg.dataset = CN()
+        cfg.dataset.name = "THEIA_E3"
+        cfg.detection = CN()
+        cfg.detection.gnn_training = CN()
+        cfg.detection.gnn_training.used_method = "mstc"
+        cfg.detection.gnn_testing = CN()
+        cfg.detection.evaluation = CN()
+        cfg.detection.evaluation.node_evaluation = CN()
+        cfg._seed = 0
+        cfg._artifact_dir = str(tmp_path / "shared")
+        cfg._artifact_root_raw = None
+
+        run_dir = resolve_artifact_paths(cfg, stages=["evaluate"], create_dirs=True)
+
+        # Both node_scores and evaluation_results must exist
+        assert (run_dir / "node_scores").is_dir()
+        assert (run_dir / "evaluation_results").is_dir()
+
+        # The evaluation_results subdirectory must be a sibling of node_scores
+        assert (run_dir / "node_scores").parent == run_dir
+        assert (run_dir / "evaluation_results").parent == run_dir

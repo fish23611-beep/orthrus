@@ -21,7 +21,11 @@ Design goals
               runtime.json
               checkpoints/          ← train stage
               edge_scores/         ← test stage
-              node_scores/         ← evaluate stage
+              node_scores/          ← evaluate stage (canonical: metrics.json,
+                                       node_predictions.csv, event_predictions.csv)
+              evaluation_results/   ← evaluate stage (calibration: calibrator.pkl,
+                                       calibration_summary.json, *_calibrated.csv,
+                                       per-epoch node_predictions.csv)
 
   Sub-directories are created lazily — only when the respective stages run.
 
@@ -34,7 +38,7 @@ Path resolution vs directory creation
   touching the filesystem; raises ``ValueError`` for invalid/missing fields.
 - ``create_stage_directories(run_dir, stages)`` → creates directories; call it
   separately when you actually need the dirs.
-- ``resolve_artifact_paths(cfg, stages, ...)` → ``Path`` — the full orchestrator:
+- ``resolve_artifact_paths(cfg, stages, ...)`` → ``Path`` — the full orchestrator:
   resolves root, derives run_dir, maps cfg fields, and (by default) creates stage dirs.
   Pass ``create_dirs=False`` to skip directory creation (useful in tests or when
   you only need the paths).
@@ -50,6 +54,11 @@ populated so existing modules continue to work:
   cfg.detection.gnn_training._trained_models_dir  = run_dir / "checkpoints"
   cfg.detection.gnn_testing._edge_losses_dir      = run_dir / "edge_scores"
   cfg.detection.evaluation.node_evaluation._precision_recall_dir = run_dir / "node_scores"
+  cfg.detection.evaluation._evaluation_results_dir = run_dir / "evaluation_results"
+
+C8 Note: ``_evaluation_results_dir`` is now scoped to the run directory to ensure
+calibration artifacts are isolated per seed/experiment run, rather than shared under
+the task-hash path in the shared artifact root.
 """
 
 from __future__ import annotations
@@ -295,7 +304,7 @@ def extract_cfg_fields(cfg) -> ArtifactCfgFields:
 _STAGE_DIRS: dict[str, list[Path]] = {
     "train":     [Path("checkpoints")],
     "test":      [Path("edge_scores")],
-    "evaluate":  [Path("node_scores")],
+    "evaluate":  [Path("node_scores"), Path("evaluation_results")],
 }
 
 
@@ -398,6 +407,17 @@ def resolve_artifact_paths(
     cfg.detection.gnn_training._trained_models_dir = str(run_dir / "checkpoints")
     cfg.detection.gnn_testing._edge_losses_dir     = str(run_dir / "edge_scores")
     cfg.detection.evaluation.node_evaluation._precision_recall_dir = str(run_dir / "node_scores")
+
+    # C8: Scope evaluation_results to run_dir for seed/run isolation.
+    # Previously, set_task_paths() set this to:
+    #   <shared_root>/detection/evaluation/<task_hash>/<dataset>/evaluation_results/
+    # which caused calibration artifacts to leak into the shared preprocessing root.
+    # Now we remap it to the scoped run directory:
+    #   <run_dir>/evaluation_results/
+    # This ensures calibrator.pkl, calibration_summary.json, *_calibrated.csv, and
+    # node_predictions.csv are all isolated per seed/run and do not conflict with
+    # other seeds or baseline runs.
+    cfg.detection.evaluation._evaluation_results_dir = str(run_dir / "evaluation_results")
 
     # 4. Lazy directory creation
     if create_dirs:
