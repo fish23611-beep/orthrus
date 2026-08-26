@@ -218,24 +218,24 @@ class TimeGapStatistics:
         self, g: TemporalData, last_seen_per_node: Dict[int, int]
     ) -> tuple:
         """
-        Computes time-gap targets for every event in ``g`` using the
-        provided historical state.
+        Computes event-level time-gap targets for every event in ``g``.
 
-        Causal requirement: all targets are computed using the
-        ``last_seen_per_node`` snapshot that existed *before* processing
-        the current batch.  ``last_seen_per_node`` is updated *after*
-        all targets have been computed, using the maximum timestamp seen
-        per node in the current batch.
+        Each event's target is based on **pre-batch state only**: the
+        ``last_seen_per_node`` snapshot passed in is not mutated during target
+        computation, so no event in the batch can influence another event's
+        target.
+
+        The returned ``updated_last_seen`` is the post-batch state, computed
+        as ``max(pre_batch_value, max(batch_times_of_node))`` per node.
 
         Parameters
         ----------
         g
-            TemporalData window for the current batch.  Must have ``t``,
-            ``src``, ``dst``, and ``global_event_index`` attributes.
+            TemporalData for the current batch. Timestamps must be
+            non-decreasing.
         last_seen_per_node
             Dict mapping node IDs to their last-seen timestamps in
-            nanoseconds.  Values of ``-1`` (or absence) indicate
-            no prior history.
+            nanoseconds. Values of ``-1`` (or absence) indicate no history.
 
         Returns
         -------
@@ -243,64 +243,58 @@ class TimeGapStatistics:
             ``(src_target, dst_target, updated_last_seen)`` where each
             target is a ``torch.long`` tensor of shape ``[E]``.
         """
-        last_seen = dict(last_seen_per_node)
+        event_count = len(g)
 
-        E = len(g)
-        src_target = torch.full((E,), NO_HISTORY, dtype=torch.long)
-        dst_target = torch.full((E,), NO_HISTORY, dtype=torch.long)
+        if not (g.t[1:] >= g.t[:-1]).all():
+            raise ValueError("Timestamps within a batch must be non-decreasing.")
 
-        # All targets observe the pre-batch snapshot.  For a node that occurs
-        # more than once, use its earliest current-batch timestamp so no event
-        # can observe another event from the same batch.
-        reference_time: Dict[int, int] = {}
-        for i in range(E):
-            t_i_ns = int(g.t[i].item())
-            for node_id in (int(g.src[i].item()), int(g.dst[i].item())):
-                reference_time[node_id] = min(reference_time.get(node_id, t_i_ns), t_i_ns)
+        # Single pass: compute each event's src/dst target using the immutable
+        # pre-batch snapshot for the node.  No intra-batch state propagation
+        # is permitted.
+        src_target = torch.full((event_count,), NO_HISTORY, dtype=torch.long)
+        dst_target = torch.full((event_count,), NO_HISTORY, dtype=torch.long)
+        batch_max: Dict[int, int] = {}
 
-        for i in range(E):
+        for i in range(event_count):
             src_i = int(g.src[i].item())
             dst_i = int(g.dst[i].item())
-            src_reference_ns = reference_time[src_i]
-            dst_reference_ns = reference_time[dst_i]
+            t_i_ns = int(g.t[i].item())
 
-            last_src = last_seen.get(src_i)
+            last_src = last_seen_per_node.get(src_i)
             if last_src is not None and last_src != -1:
-                delta_ns = src_reference_ns - last_src
+                delta_ns = t_i_ns - last_src
                 if delta_ns < 0:
                     raise ValueError(
                         f"Negative time delta detected: "
-                        f"current t={src_reference_ns}, last_seen[{src_i}]={last_src}."
+                        f"current t={t_i_ns}, last_seen[{src_i}]={last_src}."
                     )
-                delta_seconds = delta_ns / 1_000_000_000.0
-                src_target[i] = self._bucket(math.log1p(delta_seconds))
+                src_target[i] = self._bucket(
+                    math.log1p(delta_ns / 1_000_000_000.0)
+                )
 
-            last_dst = last_seen.get(dst_i)
+            last_dst = last_seen_per_node.get(dst_i)
             if last_dst is not None and last_dst != -1:
-                delta_ns = dst_reference_ns - last_dst
+                delta_ns = t_i_ns - last_dst
                 if delta_ns < 0:
                     raise ValueError(
                         f"Negative time delta detected: "
-                        f"current t={dst_reference_ns}, last_seen[{dst_i}]={last_dst}."
+                        f"current t={t_i_ns}, last_seen[{dst_i}]={last_dst}."
                     )
-                delta_seconds = delta_ns / 1_000_000_000.0
-                dst_target[i] = self._bucket(math.log1p(delta_seconds))
+                dst_target[i] = self._bucket(
+                    math.log1p(delta_ns / 1_000_000_000.0)
+                )
 
-        for i in range(E):
-            src_i = int(g.src[i].item())
-            dst_i = int(g.dst[i].item())
-            t_i_ns = int(g.t[i].item())
+            for node in (src_i, dst_i):
+                prev = batch_max.get(node)
+                batch_max[node] = t_i_ns if prev is None else max(prev, t_i_ns)
 
-            prev_src = last_seen.get(src_i, -1)
-            prev_dst = last_seen.get(dst_i, -1)
+        # Post-batch state: max(pre_batch, max(batch_times_of_node)).
+        updated_last_seen = dict(last_seen_per_node)
+        for node, mx in batch_max.items():
+            prev = updated_last_seen.get(node)
+            updated_last_seen[node] = mx if (prev is None or prev == -1) else max(prev, mx)
 
-            current_src = t_i_ns if prev_src == -1 else max(prev_src, t_i_ns)
-            current_dst = t_i_ns if prev_dst == -1 else max(prev_dst, t_i_ns)
-
-            last_seen[src_i] = current_src
-            last_seen[dst_i] = current_dst
-
-        return src_target, dst_target, last_seen
+        return src_target, dst_target, updated_last_seen
 
     # ------------------------------------------------------------------
     # bucket helpers

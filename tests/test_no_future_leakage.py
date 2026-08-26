@@ -36,20 +36,44 @@ def _graph(src, dst, t):
     )
 
 
-def test_targets_use_pre_batch_snapshot_and_earliest_batch_reference():
+def test_time_targets_use_earlier_same_batch_events_but_not_future_events():
+    """Within-batch event i cannot use state set by event j>i.
+
+    Design: boundaries at log1p(25) so that:
+      gap=10s -> VERY_SHORT (correct:  pre_batch_last_seen=0s, gap=10s)
+      gap=20s -> SHORT      (BUG:       intra-batch pollution, gap=20s would give SHORT)
+      gap=30s -> LONG       (correct:   pre_batch_last_seen=0s, gap=30s)
+
+    Event 1's gap with the BUG would be 20s (uses event 0's timestamp as base).
+    Event 1's gap CORRECT would be 30s (uses pre-batch last_seen=0 as base).
+    These land in different buckets, so the test is unambiguous.
+    """
     stats = _fit_stats()
-    stats.time_bucket_boundaries = [math.log1p(15.0)] * 4
-    batch = _graph([0, 0], [1, 2], [10_000_000_000, 20_000_000_000])
+    stats.time_bucket_boundaries = [math.log1p(25.0)] * 4
+    batch = _graph([0, 0], [1, 2], [10_000_000_000, 30_000_000_000])
     before = {0: 0, 1: 0, 2: -1}
 
     src_target, dst_target, after = stats.transform_batch(batch, before)
 
-    assert before == {0: 0, 1: 0, 2: -1}
-    assert src_target.tolist() == [1, 1]
-    assert dst_target[1] == NO_HISTORY
-    assert after[0] == 20_000_000_000
+    # Event 0: gap = 10s - 0s = 10s -> log1p(10) < log1p(25) -> VERY_SHORT = 1
+    assert src_target[0].item() == 1, (
+        f"event 0: expected VERY_SHORT=1 (gap=10s), got {src_target[0].item()}"
+    )
+    # Event 1: CORRECT gap = 30s - 0s = 30s -> log1p(30) > log1p(25) -> LONG = 5
+    #           BUGGED gap = 30s - 10s = 20s -> log1p(20) < log1p(25) -> SHORT = 2
+    assert src_target[1].item() == 5, (
+        f"event 1: expected LONG=5 (gap=30s, base=pre_batch 0s), got {src_target[1].item()}. "
+        "If you see SHORT=2, the target was computed against intra-batch state (10s) instead of pre-batch state (0s)."
+    )
+
+    # dst: node 1 has no history -> NO_HISTORY
+    assert dst_target[0].item() == 1  # gap=10s-0s=10s -> VERY_SHORT
+    assert dst_target[1].item() == NO_HISTORY  # node 2: no history
+
+    # post-batch state: max(pre_batch, batch_times)
+    assert after[0] == 30_000_000_000
     assert after[1] == 10_000_000_000
-    assert after[2] == 20_000_000_000
+    assert after[2] == 30_000_000_000
 
 
 def test_batch_updates_only_affect_later_batches_and_first_occurrence_is_no_history():

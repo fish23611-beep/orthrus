@@ -231,6 +231,50 @@ def _is_detection_only_mode(cfg) -> bool:
     )
 
 
+def _run_scoped_metadata_dir(cfg):
+    """Resolve the run-scoped metadata directory for time statistics.
+
+    Mirrors the logic in orthrus_gnn_training._run_scoped_metadata_dir.
+    Priority:
+    1. cfg._run_dir/metadata/  (canonical: run-isolated)
+    2. cfg._metadata_dir       (legacy fallback: shared preprocessing path)
+    """
+    run_dir = getattr(cfg, "_run_dir", None)
+    if isinstance(run_dir, (str, os.PathLike)) and os.fspath(run_dir):
+        return os.path.join(os.fspath(run_dir), "metadata")
+    metadata_dir = getattr(cfg, "_metadata_dir", None)
+    if metadata_dir:
+        return metadata_dir
+    return None
+
+
+def _load_or_fit_time_gap_statistics(cfg, train_data):
+    """Load persisted statistics, or fit train-only in full-pipeline fallback."""
+    metadata_dir = _run_scoped_metadata_dir(cfg)
+    time_stats_path = (
+        os.path.join(metadata_dir, "time_statistics.json")
+        if metadata_dir
+        else None
+    )
+
+    if time_stats_path and os.path.exists(time_stats_path):
+        statistics = TimeGapStatistics.load(time_stats_path)
+        log(f"Loaded time_statistics.json from {time_stats_path}")
+        return statistics
+
+    if _is_detection_only_mode(cfg):
+        raise FileNotFoundError(
+            "detection_only mode: time_statistics.json not found at "
+            f"{time_stats_path}. Training must save the artifact first."
+        )
+
+    log(
+        f"time_statistics.json not found at {time_stats_path}; fitting from "
+        "train_data only (full_pipeline backward-compatible fallback)"
+    )
+    return fit_time_gap_statistics(train_data)
+
+
 def _get_metadata_cache(cfg):
     """Get or create MetadataCache instance from cfg."""
     if not hasattr(cfg, "_metadata_dir") or not cfg._metadata_dir:
@@ -297,6 +341,10 @@ def main(cfg):
 
     train_data, val_data, test_data, full_data, max_node_num = load_all_datasets(cfg)
 
+    time_gap_statistics = None
+    if requires_time_gap_statistics(cfg):
+        time_gap_statistics = _load_or_fit_time_gap_statistics(cfg, train_data)
+
     # For each model trained at a given epoch, we test. C8-B may inject one
     # explicit inference checkpoint (a checkpoint directory or checkpoint file).
     gnn_models_dir = cfg.detection.gnn_training._trained_models_dir
@@ -324,16 +372,6 @@ def main(cfg):
 
     for trained_model, model_path in all_trained_models:
         log(f"Evaluation with model {trained_model}...")
-        time_gap_statistics = None
-        model_variant = getattr(getattr(cfg, "model", None), "variant", None)
-        time_gap_cfg = getattr(
-            getattr(getattr(cfg, "detection", None), "gnn_training", None),
-            "decoder",
-            None,
-        )
-        time_gap_enabled = getattr(getattr(time_gap_cfg, "time_gap", None), "enabled", False) if time_gap_cfg is not None else False
-        if model_variant == "mstc" and time_gap_enabled:
-            time_gap_statistics = fit_time_gap_statistics(train_data)
         model = build_model(
             data_sample=test_data[0], device=device, cfg=cfg, max_node_num=max_node_num,
             time_gap_statistics=time_gap_statistics,

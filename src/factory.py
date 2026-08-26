@@ -24,6 +24,7 @@ def build_model(data_sample, device, cfg, max_node_num, time_gap_statistics=None
     encoder = encoder_factory(
         cfg, msg_dim=msg_dim, in_dim=in_dim, edge_dim=edge_dim,
         graph_reindexer=graph_reindexer, device=device, max_node_num=max_node_num,
+        time_gap_statistics=time_gap_statistics,
     )
     decoders = decoder_factory(cfg, in_dim=in_dim, device=device, max_node_num=max_node_num)
     return model_factory(
@@ -116,7 +117,7 @@ def _resolve_backbone(cfg):
     )
 
 
-def encoder_factory(cfg, msg_dim, in_dim, edge_dim, graph_reindexer, device, max_node_num):
+def encoder_factory(cfg, msg_dim, in_dim, edge_dim, graph_reindexer, device, max_node_num, time_gap_statistics=None):
     node_hid_dim = cfg.detection.gnn_training.node_hid_dim
     node_out_dim = cfg.detection.gnn_training.node_out_dim
     temporal_dim = cfg.detection.gnn_training.encoder.temporal_dim
@@ -189,7 +190,16 @@ def encoder_factory(cfg, msg_dim, in_dim, edge_dim, graph_reindexer, device, max
         if not multiscale_enabled:
             raise ValueError("context.mode=multiscale requires multiscale.enabled=True")
         ms_cfg = context_mode.multiscale
-        tau_short_ns, tau_medium_ns, tau_max_ns = log_seconds_boundaries_to_ns(ms_cfg.scale_quantiles)
+
+        if not getattr(time_gap_statistics, "scale_boundaries", None):
+            raise ValueError(
+                "context.mode=multiscale requires fitted TimeGapStatistics "
+                "from the training split"
+            )
+        tau_short_ns, tau_medium_ns, tau_max_ns = log_seconds_boundaries_to_ns(
+            time_gap_statistics.scale_boundaries
+        )
+
         history_store = HistoryStore(
             num_nodes=max_node_num,
             candidate_capacity=int(ms_cfg.candidate_capacity),
@@ -263,8 +273,27 @@ def time_gap_decoder_factory(cfg):
     )
 
 
+def requires_time_gap_statistics(cfg) -> bool:
+    """Return whether the configured MSTC model consumes training time statistics."""
+    if getattr(getattr(cfg, "model", None), "variant", None) != "mstc":
+        return False
+
+    training_cfg = getattr(getattr(cfg, "detection", None), "gnn_training", None)
+    decoder_cfg = getattr(training_cfg, "decoder", None)
+    time_gap_cfg = getattr(decoder_cfg, "time_gap", None)
+    time_gap_enabled = bool(getattr(time_gap_cfg, "enabled", False))
+
+    encoder_cfg = getattr(training_cfg, "encoder", None)
+    context_cfg = getattr(encoder_cfg, "context", None)
+    multiscale_enabled = (
+        getattr(context_cfg, "mode", None) == "multiscale"
+        and bool(getattr(getattr(context_cfg, "multiscale", None), "enabled", False))
+    )
+    return time_gap_enabled or multiscale_enabled
+
+
 def fit_time_gap_statistics(train_data):
-    """Fit C4 bucket boundaries once from chronological training data only."""
+    """Fit C4 boundaries once from chronological training data only."""
     return TimeGapStatistics().fit(train_data)
 
 def batch_loader_factory(cfg, data, graph_reindexer):

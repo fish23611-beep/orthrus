@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from torch_geometric.data import TemporalData
 
 
 # Heavy imports (torch_geometric wiring) are deferred to test bodies so that
@@ -38,6 +39,7 @@ _HELPERS = {
     "MultiScaleNeighborLoader": None,
     "HistoryStore": None,
     "encoder_factory": None,
+    "TimeGapStatistics": None,
 }
 
 
@@ -45,10 +47,11 @@ def _encoders():
     if _HELPERS["GraphSAGEBackbone"] is None:
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
         from encoders import GraphSAGEBackbone, GraphTransformer, SemanticMLPBackbone, SemanticMLPEncoder
+        from factory import encoder_factory
         from mstc.history_store import HistoryStore
         from mstc.multiscale_encoder import MultiScaleOrthrusEncoder
         from mstc.multiscale_sampler import MultiScaleNeighborLoader
-        from factory import encoder_factory
+        from mstc.time_gap import TimeGapStatistics
         _HELPERS.update(
             GraphSAGEBackbone=GraphSAGEBackbone,
             GraphTransformer=GraphTransformer,
@@ -58,6 +61,7 @@ def _encoders():
             MultiScaleNeighborLoader=MultiScaleNeighborLoader,
             HistoryStore=HistoryStore,
             encoder_factory=encoder_factory,
+            TimeGapStatistics=TimeGapStatistics,
         )
     return _HELPERS
 
@@ -78,6 +82,42 @@ def _build_small_graph(num_nodes: int = 6, num_edges: int = 10):
     src, dst = src[keep], dst[keep]
     edge_index = torch.stack([src, dst], dim=0).long()
     return x, edge_index
+
+
+def _fit_time_gap_statistics():
+    """Return a minimal, fitted TimeGapStatistics for multiscale mode tests.
+
+    Trains on three synthetic TemporalData windows with strictly increasing
+    timestamps, yielding legal scale_boundaries without any val/test leakage.
+    """
+    h = _encoders()
+    TimeGapStatistics = h["TimeGapStatistics"]
+
+    # Three small training windows; timestamps are strictly increasing within
+    # each window and across windows. Node pairs are chosen so that at least
+    # one finite interval exists in every window.
+    train_data_list = [
+        TemporalData(
+            src=torch.tensor([0, 1, 2]),
+            dst=torch.tensor([1, 2, 3]),
+            t=torch.tensor([1000, 2000, 3000]),
+            global_event_index=torch.tensor([0, 1, 2]),
+        ),
+        TemporalData(
+            src=torch.tensor([0, 1, 2]),
+            dst=torch.tensor([1, 2, 3]),
+            t=torch.tensor([4000, 5000, 6000]),
+            global_event_index=torch.tensor([3, 4, 5]),
+        ),
+        TemporalData(
+            src=torch.tensor([0, 1, 2]),
+            dst=torch.tensor([1, 2, 3]),
+            t=torch.tensor([7000, 8000, 9000]),
+            global_event_index=torch.tensor([6, 7, 8]),
+        ),
+    ]
+    stats = TimeGapStatistics()
+    return stats.fit(train_data_list)
 
 
 def _make_fake_cfg(*, mode="recent", multiscale_enabled=False, backbone="graph_transformer",
@@ -267,9 +307,11 @@ def test_multiscale_graphsage_uses_single_shared_instance():
     h = _encoders()
     cfg = _make_fake_cfg(mode="multiscale", multiscale_enabled=True, backbone="graphsage")
     graph_reindexer = FakeGraphReindexer(num_nodes=20, device="cpu")
+    time_gap_statistics = _fit_time_gap_statistics()
     encoder = h["encoder_factory"](
         cfg, msg_dim=64, in_dim=64, edge_dim=10,
         graph_reindexer=graph_reindexer, device="cpu", max_node_num=20,
+        time_gap_statistics=time_gap_statistics,
     )
 
     assert isinstance(encoder, h["MultiScaleOrthrusEncoder"])
@@ -298,9 +340,11 @@ def test_multiscale_graph_transformer_still_uses_single_shared_instance():
     h = _encoders()
     cfg = _make_fake_cfg(mode="multiscale", multiscale_enabled=True, backbone="graph_transformer")
     graph_reindexer = FakeGraphReindexer(num_nodes=20, device="cpu")
+    time_gap_statistics = _fit_time_gap_statistics()
     encoder = h["encoder_factory"](
         cfg, msg_dim=64, in_dim=64, edge_dim=10,
         graph_reindexer=graph_reindexer, device="cpu", max_node_num=20,
+        time_gap_statistics=time_gap_statistics,
     )
     assert isinstance(encoder, h["MultiScaleOrthrusEncoder"])
     assert isinstance(encoder.shared_graph_encoder, h["GraphTransformer"])

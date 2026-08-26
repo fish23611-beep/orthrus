@@ -9,6 +9,7 @@ Tests cover:
 5. causal ordering
 6. backward compatibility with recent/orthrus_baseline
 """
+import math
 import os
 import sys
 import torch
@@ -121,6 +122,12 @@ def _make_fake_cfg(mode="recent", multiscale_enabled=False, **multiscale_kwargs)
     return cfg
 
 
+def _time_statistics():
+    return SimpleNamespace(
+        scale_boundaries=[math.log1p(2.0), math.log1p(5.0), math.log1p(9.0)]
+    )
+
+
 def _make_full_data(num_events=20, device="cpu", max_node=10):
     """Create a minimal full_data object with all required fields."""
     msg_dim = 64
@@ -192,11 +199,15 @@ def test_encoder_factory_multiscale_mode_returns_multiscale_encoder():
     encoder = encoder_factory(
         cfg, msg_dim=64, in_dim=64, edge_dim=10,
         graph_reindexer=graph_reindexer, device=device, max_node_num=20,
+        time_gap_statistics=_time_statistics(),
     )
     # Check capability: multiscale encoder SHOULD require global_event_index
     assert getattr(encoder, "requires_global_event_index", False), (
         f"Multiscale encoder should require global_event_index, but got requires_global_event_index={getattr(encoder, 'requires_global_event_index', False)}"
     )
+    assert encoder.neighbor_loader.tau_short_ns == 2_000_000_000
+    assert encoder.neighbor_loader.tau_medium_ns == 5_000_000_000
+    assert encoder.neighbor_loader.tau_max_ns == 9_000_000_000
 
 
 # =============================================================================
@@ -212,6 +223,7 @@ def test_multiscale_encoder_shares_single_graph_transformer():
     encoder = encoder_factory(
         cfg, msg_dim=64, in_dim=64, edge_dim=10,
         graph_reindexer=graph_reindexer, device=device, max_node_num=20,
+        time_gap_statistics=_time_statistics(),
     )
     assert hasattr(encoder, "shared_graph_encoder"), (
         "MultiScaleOrthrusEncoder should have shared_graph_encoder attribute"
@@ -809,6 +821,7 @@ def test_encoder_factory_multiscale_equal_fusion():
     encoder = encoder_factory(
         cfg, msg_dim=64, in_dim=64, edge_dim=10,
         graph_reindexer=graph_reindexer, device=device, max_node_num=20,
+        time_gap_statistics=_time_statistics(),
     )
     assert getattr(encoder, "fusion", None) == "equal", (
         f"Expected fusion='equal', got {getattr(encoder, 'fusion', None)!r}"

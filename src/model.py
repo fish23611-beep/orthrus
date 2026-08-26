@@ -121,8 +121,8 @@ class MSTCOrthrus(nn.Module):
         x = (batch.x_src, batch.x_dst)
         batch_size = edge_index.size(1)
 
-        # Targets are derived from the state snapshot before this batch.  The
-        # returned state is committed only after both task outputs are computed.
+        # Targets are derived from the immutable state snapshot before this batch.
+        # The returned post-batch state is committed only after both task outputs are computed.
         updated_last_seen = None
         src_target = dst_target = None
         if self.time_task_enabled:

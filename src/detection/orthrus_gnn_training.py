@@ -58,6 +58,44 @@ def _event_count(data):
     return 0
 
 
+def _run_scoped_metadata_dir(cfg):
+    """Resolve the run-scoped metadata directory for time statistics.
+
+    Priority:
+    1. cfg._run_dir/metadata/  (canonical: run-isolated)
+    2. cfg._metadata_dir       (legacy fallback: shared preprocessing path)
+
+    The run-scoped path is preferred because TimeGapStatistics are fitted from
+    the current training split (which varies with dataset_view mode), so different
+    experiments with different train_data views must not share one artifact.
+    """
+    run_dir = getattr(cfg, "_run_dir", None)
+    if isinstance(run_dir, (str, os.PathLike)) and os.fspath(run_dir):
+        return os.path.join(os.fspath(run_dir), "metadata")
+    # Legacy fallback: use shared preprocessing metadata dir
+    metadata_dir = getattr(cfg, "_metadata_dir", None)
+    if metadata_dir:
+        return metadata_dir
+    return None
+
+
+def _fit_and_save_time_gap_statistics(train_data, cfg):
+    """Fit from train data only and persist to the run-scoped metadata directory."""
+    metadata_dir = _run_scoped_metadata_dir(cfg)
+    if not metadata_dir:
+        raise ValueError(
+            "TimeGapStatistics requires either cfg._run_dir or cfg._metadata_dir "
+            "so training can save metadata/time_statistics.json."
+        )
+
+    statistics = fit_time_gap_statistics(train_data)
+    time_stats_path = os.path.join(metadata_dir, "time_statistics.json")
+    os.makedirs(metadata_dir, exist_ok=True)
+    statistics.save(time_stats_path)
+    log(f"Saved time_statistics.json to {time_stats_path}")
+    return statistics
+
+
 def main(cfg):
     gnn_models_dir = cfg.detection.gnn_training._trained_models_dir
     os.makedirs(gnn_models_dir, exist_ok=True)
@@ -75,15 +113,9 @@ def main(cfg):
         update_runtime_nested(runtime_dir, "dataset_loader", "training", full_data.loader_telemetry)
 
     time_gap_statistics = None
-    model_variant = getattr(getattr(cfg, "model", None), "variant", None)
-    time_gap_cfg = getattr(
-        getattr(getattr(cfg, "detection", None), "gnn_training", None),
-        "decoder",
-        None,
-    )
-    time_gap_enabled = getattr(getattr(time_gap_cfg, "time_gap", None), "enabled", False) if time_gap_cfg is not None else False
-    if model_variant == "mstc" and time_gap_enabled:
-        time_gap_statistics = fit_time_gap_statistics(train_data)
+    if requires_time_gap_statistics(cfg):
+        time_gap_statistics = _fit_and_save_time_gap_statistics(train_data, cfg)
+
     model = build_model(
         data_sample=train_data[0], device=device, cfg=cfg, max_node_num=max_node_num,
         time_gap_statistics=time_gap_statistics,
