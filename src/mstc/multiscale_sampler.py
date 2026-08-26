@@ -4,6 +4,13 @@ MultiScaleNeighborLoader: temporal multi-scale neighbor sampling.
 Groups historical neighbors into short / medium / long scales based on
 their time distance from the current reference timestamp.
 
+Final semantic contract:
+- short:  0 < delta <= tau_short_ns
+- medium: tau_short_ns < delta <= tau_medium_ns
+- long:   delta > tau_medium_ns (NO upper bound)
+
+Q99 (tau_extreme) is for diagnostics only, not a hard cutoff for long scale.
+
 Separates query (read-only, before current batch) from insert
 (post-encode, after current batch) to maintain causal ordering.
 """
@@ -11,7 +18,7 @@ Separates query (read-only, before current batch) from insert
 from __future__ import annotations
 
 import math
-from typing import Dict, Literal, Sequence
+from typing import Dict, Literal, Optional, Sequence
 
 import torch
 from torch import Tensor
@@ -20,24 +27,25 @@ from .history_store import HistoryStore
 
 
 # ------------------------------------------------------------------
-# Boundary conversion utility
+# Boundary conversion utility (for legacy compatibility)
 # ------------------------------------------------------------------
-def log_seconds_boundaries_to_ns(
+def seconds_boundaries_to_ns(
     boundaries: Sequence[float],
-) -> tuple[int, int, int]:
+) -> tuple[int, int, Optional[int]]:
     """
-    Convert three log1p(seconds) boundaries to nanoseconds.
+    Convert three seconds boundaries to nanoseconds.
 
     Parameters
     ----------
     boundaries
-        Exactly three values in log1p(seconds) space, e.g.
-        from TimeGapStatistics.scale_boundaries.
+        Three values in seconds space, e.g.
+        from TimeGapStatistics.scale_boundaries_seconds.
 
     Returns
     -------
-    tuple[int, int, int]
-        (tau_short_ns, tau_medium_ns, tau_max_ns) as integers in nanoseconds.
+    tuple[int, int, Optional[int]]
+        (tau_short_ns, tau_medium_ns, tau_extreme_ns) as integers in nanoseconds.
+        tau_extreme_ns is Q99 for diagnostics only.
 
     Raises
     ------
@@ -62,11 +70,11 @@ def log_seconds_boundaries_to_ns(
             f"boundaries must be non-decreasing, got [{b0}, {b1}, {b2}]"
         )
 
-    tau_short_ns = round(math.expm1(b0) * 1_000_000_000)
-    tau_medium_ns = round(math.expm1(b1) * 1_000_000_000)
-    tau_max_ns = round(math.expm1(b2) * 1_000_000_000)
+    tau_short_ns = round(b0 * 1_000_000_000)
+    tau_medium_ns = round(b1 * 1_000_000_000)
+    tau_extreme_ns = round(b2 * 1_000_000_000)  # Q99 for diagnostics
 
-    return tau_short_ns, tau_medium_ns, tau_max_ns
+    return tau_short_ns, tau_medium_ns, tau_extreme_ns
 
 
 # ------------------------------------------------------------------
@@ -78,11 +86,14 @@ class MultiScaleNeighborLoader:
 
     Queries historical neighbors and groups them into three temporal scales:
 
-    - short:  0 < delta <= tau_short
-    - medium: tau_short < delta <= tau_medium
-    - long:   tau_medium < delta <= tau_max
+    - short:  0 < delta <= tau_short_ns
+    - medium: tau_short_ns < delta <= tau_medium_ns
+    - long:   delta > tau_medium_ns  (NO upper bound)
 
     where delta = reference_time_ns - historical_timestamp_ns.
+
+    Q99 (tau_extreme_ns) is stored for diagnostics but NOT used as a hard
+    cutoff for the long scale.
 
     This class maintains causal ordering: query reads history BEFORE the
     current batch is inserted. The caller must explicitly call insert()
@@ -97,9 +108,6 @@ class MultiScaleNeighborLoader:
     tau_medium_ns
         Upper bound (inclusive) for the medium scale in nanoseconds.
         Must satisfy tau_short_ns <= tau_medium_ns.
-    tau_max_ns
-        Upper bound (inclusive) for the long scale in nanoseconds.
-        Must satisfy tau_medium_ns <= tau_max_ns.
     short_budget
         Maximum number of neighbors to return per node for the short scale.
         Default: 8.
@@ -116,7 +124,6 @@ class MultiScaleNeighborLoader:
         history_store: HistoryStore,
         tau_short_ns: int,
         tau_medium_ns: int,
-        tau_max_ns: int,
         short_budget: int = 8,
         medium_budget: int = 8,
         long_budget: int = 8,
@@ -129,11 +136,6 @@ class MultiScaleNeighborLoader:
             raise ValueError(
                 f"tau_medium_ns ({tau_medium_ns}) must be >= "
                 f"tau_short_ns ({tau_short_ns})"
-            )
-        if tau_max_ns < tau_medium_ns:
-            raise ValueError(
-                f"tau_max_ns ({tau_max_ns}) must be >= "
-                f"tau_medium_ns ({tau_medium_ns})"
             )
         if short_budget < 0:
             raise ValueError(
@@ -151,7 +153,6 @@ class MultiScaleNeighborLoader:
         self.history_store = history_store
         self.tau_short_ns = int(tau_short_ns)
         self.tau_medium_ns = int(tau_medium_ns)
-        self.tau_max_ns = int(tau_max_ns)
         self.short_budget = int(short_budget)
         self.medium_budget = int(medium_budget)
         self.long_budget = int(long_budget)
@@ -248,10 +249,10 @@ class MultiScaleNeighborLoader:
             "dst_query_index": dst_query_index.to(device),
         }
 
-        for scale_name, tau_low, tau_high, budget in [
-            ("short", 0, self.tau_short_ns, self.short_budget),
-            ("medium", self.tau_short_ns, self.tau_medium_ns, self.medium_budget),
-            ("long", self.tau_medium_ns, self.tau_max_ns, self.long_budget),
+        for scale_name, tau_low, tau_high, budget, has_upper in [
+            ("short", 0, self.tau_short_ns, self.short_budget, True),
+            ("medium", self.tau_short_ns, self.tau_medium_ns, self.medium_budget, True),
+            ("long", self.tau_medium_ns, None, self.long_budget, False),  # No upper bound
         ]:
             neighbor_ids = history["neighbor_id"]
             event_ids = history["event_id"]
@@ -282,11 +283,15 @@ class MultiScaleNeighborLoader:
 
             for q_idx in range(Q):
                 delta = ref_cpu[q_idx] - ts_cpu[q_idx]
-                in_range = (delta > 0) & (delta <= tau_high)
-                if scale_name == "medium":
+                # Short: 0 < delta <= tau_short
+                # Medium: tau_short < delta <= tau_medium
+                # Long: delta > tau_medium (no upper bound)
+                if scale_name == "short":
+                    in_range = (delta > 0) & (delta <= tau_high)
+                elif scale_name == "medium":
                     in_range = (delta > tau_low) & (delta <= tau_high)
-                elif scale_name == "long":
-                    in_range = (delta > tau_low) & (delta <= tau_high)
+                else:  # long
+                    in_range = delta > tau_low
 
                 valid_ts = ts_cpu[q_idx][in_range]
                 valid_ev = ev_cpu[q_idx][in_range]

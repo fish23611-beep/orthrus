@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from mstc.time_gap import TimeGapStatistics
 from mstc.history_store import HistoryStore
-from mstc.multiscale_sampler import MultiScaleNeighborLoader, log_seconds_boundaries_to_ns
+from mstc.multiscale_sampler import MultiScaleNeighborLoader
 from mstc.multiscale_encoder import MultiScaleOrthrusEncoder
 
 from provnet_utils import *
@@ -191,14 +191,21 @@ def encoder_factory(cfg, msg_dim, in_dim, edge_dim, graph_reindexer, device, max
             raise ValueError("context.mode=multiscale requires multiscale.enabled=True")
         ms_cfg = context_mode.multiscale
 
-        if not getattr(time_gap_statistics, "scale_boundaries", None):
+        # Check for scale_boundaries_seconds (new schema) or scale_boundaries (legacy)
+        scale_bounds = getattr(time_gap_statistics, "scale_boundaries_seconds", None)
+        if scale_bounds is None:
+            scale_bounds = getattr(time_gap_statistics, "scale_boundaries", None)
+        if not scale_bounds:
             raise ValueError(
                 "context.mode=multiscale requires fitted TimeGapStatistics "
                 "from the training split"
             )
-        tau_short_ns, tau_medium_ns, tau_max_ns = log_seconds_boundaries_to_ns(
-            time_gap_statistics.scale_boundaries
-        )
+        # scale_boundaries_seconds are already in seconds; convert to ns
+        tau_short_ns = round(scale_bounds[0] * 1_000_000_000)
+        tau_medium_ns = round(scale_bounds[1] * 1_000_000_000)
+        # tau_extreme_ns (Q99) is stored but NOT used as hard cutoff
+        # Long scale: delta > tau_medium_ns (no upper bound)
+        tau_extreme_ns = round(scale_bounds[2] * 1_000_000_000) if len(scale_bounds) > 2 else None
 
         history_store = HistoryStore(
             num_nodes=max_node_num,
@@ -209,7 +216,6 @@ def encoder_factory(cfg, msg_dim, in_dim, edge_dim, graph_reindexer, device, max
             history_store=history_store,
             tau_short_ns=tau_short_ns,
             tau_medium_ns=tau_medium_ns,
-            tau_max_ns=tau_max_ns,
             short_budget=int(ms_cfg.neighbor_budgets[0]),
             medium_budget=int(ms_cfg.neighbor_budgets[1]),
             long_budget=int(ms_cfg.neighbor_budgets[2]),
@@ -292,9 +298,24 @@ def requires_time_gap_statistics(cfg) -> bool:
     return time_gap_enabled or multiscale_enabled
 
 
-def fit_time_gap_statistics(train_data):
-    """Fit C4 boundaries once from chronological training data only."""
-    return TimeGapStatistics().fit(train_data)
+def fit_time_gap_statistics(train_data, scale_quantiles=None, time_bucket_quantiles=None):
+    """Fit C4 boundaries once from chronological training data only.
+
+    Parameters
+    ----------
+    train_data
+        Training data list.
+    scale_quantiles
+        Quantile probabilities for scale boundaries (e.g., [0.5, 0.9, 0.99]).
+        If None, uses default [0.5, 0.9, 0.99].
+    time_bucket_quantiles
+        Quantile probabilities for time bucket boundaries (e.g., [0.2, 0.4, 0.6, 0.8]).
+        If None, uses default [0.2, 0.4, 0.6, 0.8].
+    """
+    return TimeGapStatistics(
+        scale_quantiles=scale_quantiles,
+        time_bucket_quantiles=time_bucket_quantiles,
+    ).fit(train_data)
 
 def batch_loader_factory(cfg, data, graph_reindexer):
     return custom_temporal_data_loader(data, batch_size=cfg.detection.gnn_training.encoder.batch_size)

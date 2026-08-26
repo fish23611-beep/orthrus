@@ -5,6 +5,11 @@ Tracks the distribution of inter-event times for each node during training,
 computes bucket boundaries from training quantiles, and provides batch-level
 transform that computes per-event time-gap targets without leaking future
 information into past computations.
+
+Key semantic contracts:
+- scale_boundaries_seconds: raw seconds values for MultiScaleNeighborLoader
+- time_bucket_boundaries_log1p: log1p(seconds) values for TimeGap classification
+- transform_batch: per-event exact target with causal supervision state update
 """
 
 import json
@@ -14,6 +19,10 @@ from typing import Dict, List, Literal, Optional
 
 import torch
 from torch_geometric.data import TemporalData
+
+
+# Scale boundaries are stored as raw seconds
+# Time bucket boundaries are stored as log1p(seconds)
 
 
 NO_HISTORY = 0
@@ -52,8 +61,8 @@ class TimeGapStatistics:
         Quantiles used to define the three scale boundaries (Q50 / Q90 / Q99).
     time_bucket_boundaries : list[float]
         Five bucket boundaries in log1p(seconds) space.
-    scale_boundaries : list[float]
-        Three scale boundaries in log1p(seconds) space.
+    scale_boundaries_seconds : list[float]
+        Three scale boundaries in seconds space (for MultiScaleNeighborLoader).
     _last_seen_ns : dict[int, int]
         Internal per-node timestamp cache.  Not serialised.
     """
@@ -70,8 +79,8 @@ class TimeGapStatistics:
         self.time_bucket_quantiles = list(time_bucket_quantiles)
         self.scale_quantiles = list(scale_quantiles)
 
-        self.time_bucket_boundaries: List[float] = []
-        self.scale_boundaries: List[float] = []
+        self.time_bucket_boundaries: List[float] = []  # log1p(seconds)
+        self.scale_boundaries_seconds: List[float] = []  # seconds
         self._last_seen_ns: Optional[Dict[int, int]] = None
 
     # ------------------------------------------------------------------
@@ -167,10 +176,14 @@ class TimeGapStatistics:
 
         all_intervals = finite_intervals_src + finite_intervals_dst
 
+        # Time bucket boundaries: computed from log1p(seconds) values
+        all_intervals_log1p = [math.log1p(x) for x in all_intervals]
         self.time_bucket_boundaries = self._quantile_boundaries(
-            all_intervals, self.time_bucket_quantiles
+            all_intervals_log1p, self.time_bucket_quantiles
         )
-        self.scale_boundaries = self._quantile_boundaries(
+
+        # Scale boundaries: computed from raw seconds values (for MultiScaleNeighborLoader)
+        self.scale_boundaries_seconds = self._quantile_boundaries(
             all_intervals, self.scale_quantiles
         )
 
@@ -220,13 +233,15 @@ class TimeGapStatistics:
         """
         Computes event-level time-gap targets for every event in ``g``.
 
-        Each event's target is based on **pre-batch state only**: the
-        ``last_seen_per_node`` snapshot passed in is not mutated during target
-        computation, so no event in the batch can influence another event's
-        target.
+        Per the final specification: events are processed in order of
+        (timestamp, global_event_index) for stable ordering. Each event:
+        1. Reads current src/dst target_last_seen
+        2. Computes src/dst target
+        3. Updates target_last_seen for involved nodes
+        4. Proceeds to next event
 
-        The returned ``updated_last_seen`` is the post-batch state, computed
-        as ``max(pre_batch_value, max(batch_times_of_node))`` per node.
+        This is the supervision state update - it does NOT affect encoder
+        HistoryStore which maintains separate causal query-before-insert.
 
         Parameters
         ----------
@@ -242,25 +257,48 @@ class TimeGapStatistics:
         tuple
             ``(src_target, dst_target, updated_last_seen)`` where each
             target is a ``torch.long`` tensor of shape ``[E]``.
+            Targets are in original event order.
         """
         event_count = len(g)
 
         if not (g.t[1:] >= g.t[:-1]).all():
             raise ValueError("Timestamps within a batch must be non-decreasing.")
 
-        # Single pass: compute each event's src/dst target using the immutable
-        # pre-batch snapshot for the node.  No intra-batch state propagation
-        # is permitted.
+        # Create local mutable copy of target state for per-event update
+        working_last_seen = dict(last_seen_per_node)
+
+        # Build stable sort order: (timestamp, global_event_index)
+        timestamps = g.t.numpy()
+        if hasattr(g, "global_event_index"):
+            event_indices = g.global_event_index.numpy()
+        else:
+            event_indices = torch.arange(event_count).numpy()
+
+        # Stable sort indices by (timestamp, global_event_index)
+        sort_indices = sorted(
+            range(event_count),
+            key=lambda i: (int(timestamps[i]), int(event_indices[i]))
+        )
+
+        # Create inverse mapping: original_index -> sorted_position
+        inverse_sort = [0] * event_count
+        for sorted_pos, orig_idx in enumerate(sort_indices):
+            inverse_sort[orig_idx] = sorted_pos
+
+        # Initialize target tensors
         src_target = torch.full((event_count,), NO_HISTORY, dtype=torch.long)
         dst_target = torch.full((event_count,), NO_HISTORY, dtype=torch.long)
-        batch_max: Dict[int, int] = {}
 
-        for i in range(event_count):
-            src_i = int(g.src[i].item())
-            dst_i = int(g.dst[i].item())
-            t_i_ns = int(g.t[i].item())
+        # Process events in stable sorted order
+        # Note: for self-loop (src == dst), both src and dst targets use the
+        # same pre-event snapshot, then state is updated once
+        for orig_idx in sort_indices:
+            src_i = int(g.src[orig_idx].item())
+            dst_i = int(g.dst[orig_idx].item())
+            t_i_ns = int(g.t[orig_idx].item())
 
-            last_src = last_seen_per_node.get(src_i)
+            # Compute src target
+            last_src = working_last_seen.get(src_i)
             if last_src is not None and last_src != -1:
                 delta_ns = t_i_ns - last_src
                 if delta_ns < 0:
@@ -268,11 +306,12 @@ class TimeGapStatistics:
                         f"Negative time delta detected: "
                         f"current t={t_i_ns}, last_seen[{src_i}]={last_src}."
                     )
-                src_target[i] = self._bucket(
+                src_target[orig_idx] = self._bucket(
                     math.log1p(delta_ns / 1_000_000_000.0)
                 )
 
-            last_dst = last_seen_per_node.get(dst_i)
+            # Compute dst target
+            last_dst = working_last_seen.get(dst_i)
             if last_dst is not None and last_dst != -1:
                 delta_ns = t_i_ns - last_dst
                 if delta_ns < 0:
@@ -280,29 +319,26 @@ class TimeGapStatistics:
                         f"Negative time delta detected: "
                         f"current t={t_i_ns}, last_seen[{dst_i}]={last_dst}."
                     )
-                dst_target[i] = self._bucket(
+                dst_target[orig_idx] = self._bucket(
                     math.log1p(delta_ns / 1_000_000_000.0)
                 )
 
-            for node in (src_i, dst_i):
-                prev = batch_max.get(node)
-                batch_max[node] = t_i_ns if prev is None else max(prev, t_i_ns)
+            # Update working state: both src and dst get current event time
+            # For self-loop (src == dst), this is a single update
+            working_last_seen[src_i] = t_i_ns
+            if dst_i != src_i:
+                working_last_seen[dst_i] = t_i_ns
 
-        # Post-batch state: max(pre_batch, max(batch_times_of_node)).
-        updated_last_seen = dict(last_seen_per_node)
-        for node, mx in batch_max.items():
-            prev = updated_last_seen.get(node)
-            updated_last_seen[node] = mx if (prev is None or prev == -1) else max(prev, mx)
-
-        return src_target, dst_target, updated_last_seen
+        # Return post-batch state (from working copy)
+        return src_target, dst_target, working_last_seen
 
     # ------------------------------------------------------------------
     # bucket helpers
     # ------------------------------------------------------------------
     def _bucket(self, z: float) -> int:
         """
-        Maps a log1p(seconds) value to a bucket index using the fitted
-        time-bucket boundaries.
+        Maps a log1p(seconds) value to a time bucket index using the fitted
+        time-bucket boundaries. Boundaries are already in log1p(seconds) space.
         """
         if z <= self.time_bucket_boundaries[0]:
             return VERY_SHORT
@@ -320,8 +356,10 @@ class TimeGapStatistics:
         values: List[float], quantiles: List[float]
     ) -> List[float]:
         """
-        Returns ``len(quantiles)`` boundaries in log1p-space from a list
-        of finite interval values.
+        Returns ``len(quantiles)`` quantile boundaries from a list of values.
+        Values are assumed to be in the desired output space already
+        (e.g., raw seconds for scale_boundaries_seconds, or log1p(seconds)
+        for time_bucket_boundaries_log1p).
         """
         if not values:
             raise ValueError("values list is empty.")
@@ -339,7 +377,7 @@ class TimeGapStatistics:
                 val = float(sorted_t[idx_low].item()) + frac * float(
                     (sorted_t[idx_low + 1] - sorted_t[idx_low]).item()
                 )
-            boundaries.append(math.log1p(val))
+            boundaries.append(val)
         return boundaries
 
     # ------------------------------------------------------------------
@@ -357,12 +395,12 @@ class TimeGapStatistics:
         """
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         payload = {
-            "unit": "seconds",
-            "transform": "log1p",
+            "raw_unit": "seconds",
+            "time_bucket_space": "log1p_seconds",
             "scale_quantiles": self.scale_quantiles,
-            "scale_boundaries": self.scale_boundaries,
+            "scale_boundaries_seconds": self.scale_boundaries_seconds,
             "time_bucket_quantiles": self.time_bucket_quantiles,
-            "time_bucket_boundaries": self.time_bucket_boundaries,
+            "time_bucket_boundaries_log1p": self.time_bucket_boundaries,
         }
         with open(path, "w") as fh:
             json.dump(payload, fh, indent=2)
@@ -371,6 +409,9 @@ class TimeGapStatistics:
     def load(cls, path: str) -> "TimeGapStatistics":
         """
         Loads fitted statistics from a JSON file.
+
+        Supports both the new schema (scale_boundaries_seconds) and legacy schema
+        (scale_boundaries in log1p space).
 
         Parameters
         ----------
@@ -384,10 +425,37 @@ class TimeGapStatistics:
         """
         with open(path) as fh:
             payload = json.load(fh)
+
+        time_bucket_quantiles = payload.get("time_bucket_quantiles")
+        scale_quantiles = payload.get("scale_quantiles")
+
+        # Support both new field names and legacy field names
+        if "scale_boundaries_seconds" in payload:
+            # New schema: boundaries already in seconds
+            scale_boundaries = payload["scale_boundaries_seconds"]
+        elif "scale_boundaries" in payload:
+            # Legacy schema: boundaries in log1p space - convert to seconds
+            # This maintains backward compatibility with old artifacts
+            scale_boundaries = [math.expm1(b) for b in payload["scale_boundaries"]]
+        else:
+            raise ValueError(
+                f"time_statistics.json at {path} is missing scale_boundaries. "
+                "This may indicate a corrupted or legacy artifact."
+            )
+
+        if "time_bucket_boundaries_log1p" in payload:
+            time_bucket_boundaries = payload["time_bucket_boundaries_log1p"]
+        elif "time_bucket_boundaries" in payload:
+            time_bucket_boundaries = payload["time_bucket_boundaries"]
+        else:
+            raise ValueError(
+                f"time_statistics.json at {path} is missing time_bucket_boundaries."
+            )
+
         obj = cls(
-            time_bucket_quantiles=payload.get("time_bucket_quantiles"),
-            scale_quantiles=payload.get("scale_quantiles"),
+            time_bucket_quantiles=time_bucket_quantiles,
+            scale_quantiles=scale_quantiles,
         )
-        obj.time_bucket_boundaries = list(payload["time_bucket_boundaries"])
-        obj.scale_boundaries = list(payload["scale_boundaries"])
+        obj.time_bucket_boundaries = list(time_bucket_boundaries)
+        obj.scale_boundaries_seconds = list(scale_boundaries)
         return obj

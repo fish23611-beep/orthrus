@@ -88,7 +88,20 @@ def _fit_and_save_time_gap_statistics(train_data, cfg):
             "so training can save metadata/time_statistics.json."
         )
 
-    statistics = fit_time_gap_statistics(train_data)
+    # Extract scale_quantiles from config if available
+    scale_quantiles = getattr(
+        getattr(getattr(cfg, "detection", None), "gnn_training", None),
+        "encoder", None
+    )
+    scale_quantiles = getattr(
+        getattr(scale_quantiles, "context", None), "multiscale", None
+    )
+    scale_quantiles = getattr(scale_quantiles, "scale_quantiles", None)
+
+    statistics = fit_time_gap_statistics(
+        train_data,
+        scale_quantiles=scale_quantiles,
+    )
     time_stats_path = os.path.join(metadata_dir, "time_statistics.json")
     os.makedirs(metadata_dir, exist_ok=True)
     statistics.save(time_stats_path)

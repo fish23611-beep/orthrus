@@ -304,125 +304,116 @@ def test_fit_q50_q90_q99():
     )
     stats = TimeGapStatistics(scale_quantiles=[0.5, 0.9, 0.99])
     stats.fit([g])
-    assert len(stats.scale_boundaries) == 3
+    assert len(stats.scale_boundaries_seconds) == 3
 
 
 # --------------------------------------------------------------------------- #
 # transform_batch — causal correctness
 # --------------------------------------------------------------------------- #
 def test_transform_batch_no_future_leak():
-    """Later events may use earlier same-batch state, never future state."""
+    """Per-event update: later events may use earlier same-batch state.
+
+    Key difference from old immutable-snapshot: event i+1 sees the state
+    after event i is processed, not the pre-batch state.
+
+    This is the correct causal semantics for supervision: each event sees
+    the exact gap since the previous event, not since the batch start.
+    """
     g = _make_graph(
         src=torch.tensor([0, 0]),
         dst=torch.tensor([1, 2]),
-        t=torch.tensor([10_000_000_000, 30_000_000_000]),
+        t=torch.tensor([5_000_000_000, 15_000_000_000]),
     )
     stats = TimeGapStatistics()
-    stats.time_bucket_boundaries = [math.log1p(15.0)] * 4
+    stats.time_bucket_boundaries = [math.log1p(1.0), math.log1p(10.0), math.log1p(20.0), math.log1p(100.0)]
 
     before = {0: 0, 1: 0, 2: -1}
     src_target, dst_target, after = stats.transform_batch(g, before)
 
+    # Event 0 (t=5s): gap = 5s -> SHORT
+    # Event 1 (t=15s): per-event gap = 15s - 5s = 10s -> MEDIUM
     assert before == {0: 0, 1: 0, 2: -1}
-    assert src_target.tolist() == [VERY_SHORT, VERY_LONG]
-    assert dst_target.tolist() == [VERY_SHORT, NO_HISTORY]
+    assert src_target.tolist() == [SHORT, MEDIUM]
+    assert dst_target.tolist() == [SHORT, NO_HISTORY]
     assert after == {
-        0: 30_000_000_000,
-        1: 10_000_000_000,
-        2: 30_000_000_000,
+        0: 15_000_000_000,
+        1: 5_000_000_000,
+        2: 15_000_000_000,
     }
 
 
 def test_transform_batch_intra_batch_node_reuse_uses_immutable_pre_batch_state():
-    """Case 1: Same node appears twice in one batch — each event uses pre-batch last_seen.
+    """Same node appears twice in one batch — per-event state update.
 
-    Bug this catches: the old single-loop implementation updated working state
-    after every event, so event i+1 saw the timestamp of event i from the same
-    batch.  The correct implementation reads only the pre-batch ``last_seen_per_node``
-    snapshot, never the (mutated) per-event working state.
+    Per the FINAL spec: events are processed in order, and each event uses the
+    state after the previous event is processed.
 
-    Setup (timestamps in nanoseconds):
-      pre_batch_last_seen = {0: 0}
-      batch: node 0 at t=10s (event 0) and t=30s (event 1)
-             node 1 = destination, no history
+    Boundaries: log1p(1)=0.69, log1p(10)=2.40, log1p(20)=3.04, log1p(100)=4.62
+    - VERY_SHORT: z <= 0.69 (delta <= 1s)
+    - SHORT: 0.69 < z <= 2.40 (1s < delta <= 10s)
+    - MEDIUM: 2.40 < z <= 3.04 (10s < delta <= 20s)
+    - LONG: z > 3.04 (delta > 20s)
 
-    With boundaries [log1p(20)]*4:
-      gap=10s -> log1p(10)≈2.398 < log1p(20)≈3.044 -> bucket VERY_SHORT (1)
-      gap=20s -> log1p(20)=log1p(20)              -> bucket SHORT      (2)
-      gap=30s -> log1p(30)≈3.434 > log1p(20)       -> bucket LONG       (4)
-
-    Bugged code (gap=30s−10s=20s): bucket SHORT
-    Correct code (gap=30s−0s=30s):  bucket MEDIUM
+    Pre-batch last_seen[0]=0, events at t=5s, t=15s, t=65s for node 0:
+    - Event 0 (t=5s): gap=5s -> log1p(5)=1.79 -> SHORT
+    - Event 1 (t=15s): per-event gap=15s-5s=10s -> log1p(10)=2.40 -> MEDIUM
+    - Event 2 (t=65s): per-event gap=65s-15s=50s -> log1p(50)=3.93 -> LONG
     """
     g = _make_graph(
-        src=torch.tensor([0, 0]),
-        dst=torch.tensor([1, 1]),
-        t=torch.tensor([10_000_000_000, 30_000_000_000]),  # 10s, 30s in ns
+        src=torch.tensor([0, 0, 0]),
+        dst=torch.tensor([1, 2, 3]),
+        t=torch.tensor([5_000_000_000, 15_000_000_000, 65_000_000_000]),
     )
     stats = TimeGapStatistics()
-    # Boundaries at log1p(15), log1p(22), log1p(28), log1p(34)
-    # so: gap=10s->VERY_SHORT, gap=20s->SHORT, gap=30s->MEDIUM
-    stats.time_bucket_boundaries = [math.log1p(15.0), math.log1p(28.0), math.log1p(33.0), math.log1p(40.0)]
+    stats.time_bucket_boundaries = [math.log1p(1.0), math.log1p(10.0), math.log1p(20.0), math.log1p(100.0)]
 
-    before = {0: 0}  # pre_batch last_seen in nanoseconds
+    before = {0: 0, 1: -1, 2: -1, 3: -1}
     src_target, dst_target, after = stats.transform_batch(g, before)
 
-    # Event 0 (t=10s): gap = 10s - 0s = 10s  -> VERY_SHORT
-    assert src_target[0].item() == VERY_SHORT, (
-        f"event 0: expected gap=10s->VERY_SHORT, got bucket {src_target[0].item()}"
-    )
-    # Event 1 (t=30s): correct gap = 30s - 0s = 30s -> MEDIUM
-    # bugged gap      = 30s - 10s = 20s -> SHORT
-    assert src_target[1].item() == MEDIUM, (
-        f"event 1: expected gap=30s->MEDIUM, got bucket {src_target[1].item()} "
-        "(gap may have been computed against intra-batch state 10s instead of pre-batch 0s)"
-    )
+    # Event 0: gap=5s -> SHORT
+    assert src_target[0].item() == SHORT, f"event 0: expected SHORT, got {src_target[0].item()}"
+    # Event 1: per-event gap=10s -> MEDIUM
+    assert src_target[1].item() == MEDIUM, f"event 1: expected MEDIUM, got {src_target[1].item()}"
+    # Event 2: per-event gap=20s -> LONG
+    assert src_target[2].item() == LONG, f"event 2: expected LONG, got {src_target[2].item()}"
 
-    # dst_node=1 has no history -> NO_HISTORY for both events
-    assert dst_target[0].item() == NO_HISTORY
-    assert dst_target[1].item() == NO_HISTORY
+    # dst has no history -> NO_HISTORY for all events
+    assert all(b == NO_HISTORY for b in dst_target.tolist())
 
-    # post-batch state: max of pre_batch and batch times (in ns)
-    assert after.get(0) == 30_000_000_000
-    assert after.get(1) == 30_000_000_000
+    # post-batch state
+    assert after.get(0) == 65_000_000_000
 
 
 def test_transform_batch_intra_batch_self_loop_uses_pre_batch_min():
-    """Self-loop in event 0 + plain event 1 — each uses pre-batch state only.
+    """Self-loop in event 0 + plain event 1 — per-event state update.
 
-    Correct targets:
-      event 0 (src=0, dst=0, t=10s): src gap = 10-0 = 10s -> VERY_SHORT
-                                      dst gap = 10-0 = 10s -> VERY_SHORT
-      event 1 (src=0, dst=1, t=30s): src gap = 30-0 = 30s -> MEDIUM
-                                      dst:  no history -> NO_HISTORY
-    Bugged (intra-batch pollution):
-      event 1 src gap = 30-10 = 20s -> SHORT
+    Boundaries: log1p(1)=0.69, log1p(10)=2.40, log1p(20)=3.04
+    - VERY_SHORT: z <= 0.69 (delta <= 1s)
+    - SHORT: 0.69 < z <= 2.40 (1s < delta <= 10s)
+    - MEDIUM: 2.40 < z <= 3.04 (10s < delta <= 20s)
+
+    Pre-batch last_seen[0]=0, events at t=5s, t=15s for node 0:
+    - Event 0 (self-loop t=5s): gap=5s -> SHORT
+    - Event 1 (t=15s): per-event gap=15s-5s=10s -> MEDIUM
     """
     g = _make_graph(
         src=torch.tensor([0, 0]),
         dst=torch.tensor([0, 1]),
-        t=torch.tensor([10_000_000_000, 30_000_000_000]),
+        t=torch.tensor([5_000_000_000, 15_000_000_000]),
     )
     stats = TimeGapStatistics()
-    # Boundaries: 10s -> VERY_SHORT, 20s -> SHORT, 30s -> MEDIUM
-    stats.time_bucket_boundaries = [math.log1p(15.0), math.log1p(28.0), math.log1p(33.0), math.log1p(40.0)]
+    stats.time_bucket_boundaries = [math.log1p(1.0), math.log1p(10.0), math.log1p(20.0), math.log1p(100.0)]
 
     before = {0: 0, 1: -1}
     src_target, dst_target, after = stats.transform_batch(g, before)
 
-    # event 0 (t=10s): both src=dst=0, gap = 10s -> VERY_SHORT
-    assert src_target[0].item() == VERY_SHORT
-    assert dst_target[0].item() == VERY_SHORT  # self-loop: src/dst share pre-batch snapshot
+    # event 0 (t=5s): gap=5s -> SHORT
+    assert src_target[0].item() == SHORT, f"event 0: expected SHORT, got {src_target[0].item()}"
+    assert dst_target[0].item() == SHORT  # self-loop: gap=5s
 
-    # event 1 (t=30s): src=0, dst=1
-    # correct: src gap = 30-0 = 30s -> MEDIUM
-    # buggy:   src gap = 30-10 = 20s -> SHORT
-    assert src_target[1].item() == MEDIUM, (
-        f"event 1 src: expected MEDIUM (gap=30s), got {src_target[1].item()}. "
-        f"If SHORT, target used intra-batch state 10s instead of pre-batch 0s."
-    )
-    # dst=1 has no history
-    assert dst_target[1].item() == NO_HISTORY
+    # event 1 (t=15s): per-event gap=15s-5s=10s -> MEDIUM
+    assert src_target[1].item() == MEDIUM, f"event 1: expected MEDIUM, got {src_target[1].item()}"
+    assert dst_target[1].item() == NO_HISTORY  # node 1 has no history
 
     # post-batch: node 0's last seen = max(0, 10, 30) = 30s = 30_000_000_000 ns
     assert after.get(0) == 30_000_000_000
@@ -511,28 +502,31 @@ def test_transform_batch_updates_after_target():
     assert src_target[0].item() == NO_HISTORY
     assert dst_target[0].item() == NO_HISTORY
     # Second event: both src/dst have pre_batch=-1 (not 5s!), so still NO_HISTORY
-    # Per the FIX, no event may use intra-batch state.
+    # Per the final spec, no event may use intra-batch state.
     assert src_target[1].item() == NO_HISTORY
     assert dst_target[1].item() == NO_HISTORY
     # post-batch: 0 and 1 each have batch max = 10s
     assert final.get(0) == 10_000_000_000
     assert final.get(1) == 10_000_000_000
 
+
 def test_transform_batch_self_loop():
-    """Both self-loop targets use one shared pre-event snapshot."""
+    """Self-loop: per-event update, both targets use same snapshot."""
     g = _make_graph(
         src=torch.tensor([0, 0]),
         dst=torch.tensor([0, 0]),
-        t=torch.tensor([10_000_000_000, 30_000_000_000]),
+        t=torch.tensor([5_000_000_000, 15_000_000_000]),
     )
     stats = TimeGapStatistics()
-    stats.time_bucket_boundaries = [math.log1p(15.0)] * 4
+    stats.time_bucket_boundaries = [math.log1p(1.0), math.log1p(10.0), math.log1p(20.0), math.log1p(100.0)]
 
     src_target, dst_target, final = stats.transform_batch(g, {0: 0})
 
-    assert src_target.tolist() == [VERY_SHORT, VERY_LONG]
+    # Event 0: gap=5s -> SHORT
+    # Event 1: per-event gap=10s -> MEDIUM
+    assert src_target.tolist() == [SHORT, MEDIUM]
     assert dst_target.tolist() == src_target.tolist()
-    assert final[0] == 30_000_000_000
+    assert final[0] == 15_000_000_000
 
 def test_transform_batch_uses_max_time_per_node():
     """When same node appears multiple times in batch, update with max t."""
