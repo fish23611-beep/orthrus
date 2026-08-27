@@ -191,9 +191,8 @@ def test_config_default_and_experiment_overlays():
     args = SimpleNamespace(cpu=True, from_weights=False, seed=0, skip_tracing=False, dataset="THEIA_E5")
     cfg = config.get_default_cfg(args)
     assert cfg.dataset_view.mode == "host_network_full"
-    for name, expected in (("host_only", "host_only"), ("host_network_structure", "host_network_structure"), ("host_network_full", "host_network_full")):
-        payload = yaml.safe_load((Path(__file__).resolve().parents[1] / "config" / "experiments" / f"{name}.yml").read_text())
-        assert payload["dataset_view"]["mode"] == expected
+    # host_only.yml, host_network_structure.yml, host_network_full.yml were
+    # removed from the formal experiment matrix per frozen spec.
     for invalid in ("full", "unknown", ""):
         with pytest.raises(ValueError):
             config._validate_dataset_view_mode(invalid)

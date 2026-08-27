@@ -25,7 +25,6 @@ REQUIRED = {
     "calibration_max.yml", "calibration_quantile.yml", "calibration_kmeans.yml",
     "calibration_global_p.yml", "calibration_relation.yml", "calibration_hierarchical.yml",
     "backbone_graphtransformer.yml", "backbone_graphsage.yml", "backbone_mlp.yml",
-    "host_only.yml", "host_network_structure.yml", "host_network_full.yml",
     "efficiency_multiscale.yml", "efficiency_multiscale_time.yml",
 }
 
@@ -105,6 +104,18 @@ def test_every_experiment_yaml_resolves_with_the_production_loader():
         assert cfg.logging.wandb_mode == "disabled"
 
 
+def test_every_formal_experiment_declares_the_frozen_semantics_version():
+    baseline_v1 = {
+        "baseline.yml",
+        "backbone_graphsage_baseline.yml",
+        "backbone_mlp.yml",
+    }
+    for path in sorted(EXPERIMENTS.glob("*.yml")):
+        cfg = resolve_experiment_config(path.name)
+        expected = "baseline_v1" if path.name in baseline_v1 else "temporal_v2"
+        assert cfg.experiment_identity.semantics_version == expected, path.name
+
+
 def test_baseline_is_isolated_from_mstc_paths():
     cfg = resolve_experiment_config("baseline.yml")
     enc, dec = cfg.detection.gnn_training.encoder, cfg.detection.gnn_training.decoder
@@ -152,13 +163,29 @@ def test_multiscale_budget_controls_are_fair():
     single = resolve_experiment_config("multiscale_single_window.yml")
     equal = resolve_experiment_config("multiscale_equal.yml")
     gated = resolve_experiment_config("multiscale_gate.yml")
-    assert recent20.detection.gnn_training.encoder.neighbor_size == 20
-    assert recent24.detection.gnn_training.encoder.neighbor_size == 24
-    assert tuple(single.detection.gnn_training.encoder.context.multiscale.neighbor_budgets) == (24, 0, 0)
-    for cfg in (equal, gated):
-        assert tuple(cfg.detection.gnn_training.encoder.context.multiscale.neighbor_budgets) == (8, 8, 8)
-    assert equal.detection.gnn_training.encoder.context.multiscale.fusion == "equal"
-    assert gated.detection.gnn_training.encoder.context.multiscale.fusion == "gated"
+
+    recent20_enc = recent20.detection.gnn_training.encoder
+    recent24_enc = recent24.detection.gnn_training.encoder
+    single_enc = single.detection.gnn_training.encoder
+    equal_ms = equal.detection.gnn_training.encoder.context.multiscale
+    gated_ms = gated.detection.gnn_training.encoder.context.multiscale
+
+    assert (recent20_enc.context.mode, recent20_enc.neighbor_size) == ("recent", 20)
+    assert (recent24_enc.context.mode, recent24_enc.neighbor_size) == ("recent", 24)
+    assert not recent20_enc.context.multiscale.enabled
+    assert not recent24_enc.context.multiscale.enabled
+
+    # Single-window has one Q99-bounded pool, not a Q50 short-scale budget.
+    assert single_enc.context.mode == "single_window"
+    assert tuple(single_enc.context.multiscale.neighbor_budgets) == (24,)
+
+    assert tuple(equal_ms.neighbor_budgets) == (8, 8, 8)
+    assert tuple(gated_ms.neighbor_budgets) == (8, 8, 8)
+    assert sum(single_enc.context.multiscale.neighbor_budgets) == 24
+    assert sum(equal_ms.neighbor_budgets) == 24
+    assert sum(gated_ms.neighbor_budgets) == 24
+    assert equal_ms.fusion == "equal"
+    assert gated_ms.fusion == "gated"
 
 
 def test_time_variants_are_real_loss_controls():
@@ -197,14 +224,6 @@ def test_backbone_variants_distinguish_graphsage_baseline_and_mstc():
     assert (graphsage_baseline.model.variant, graphsage_baseline.detection.gnn_training.encoder.backbone) == ("orthrus_baseline", "graphsage")
     assert (mlp.detection.gnn_training.encoder.backbone, mlp.detection.gnn_training.encoder.context.mode,
             mlp.detection.gnn_training.encoder.context.multiscale.enabled) == ("semantic_mlp", "none", False)
-
-
-def test_dataset_view_matrix_changes_only_the_view_mode():
-    full = _contract(resolve_experiment_config("host_network_full.yml"))
-    for filename, mode in (("host_only.yml", "host_only"), ("host_network_structure.yml", "host_network_structure")):
-        other = _contract(resolve_experiment_config(filename))
-        assert _diff(full, other) == {"dataset_view"}
-        assert other["dataset_view"] == mode
 
 
 def test_cli_seed_and_artifact_root_remain_authoritative(tmp_path):

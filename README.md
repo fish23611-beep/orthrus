@@ -254,7 +254,6 @@ definitions:
 | Time task | `time_type_only.yml`, `time_time_only.yml`, `time_joint.yml` |
 | Calibration | `calibration_max.yml`, `calibration_quantile.yml`, `calibration_kmeans.yml`, `calibration_global_p.yml`, `calibration_relation.yml`, `calibration_hierarchical.yml` |
 | Backbone | `backbone_graphtransformer.yml`, `backbone_graphsage_baseline.yml`, `backbone_graphsage.yml`, `backbone_mlp.yml` |
-| Dataset view | `host_only.yml`, `host_network_structure.yml`, `host_network_full.yml` |
 | Efficiency | `baseline.yml`, `efficiency_multiscale.yml`, `efficiency_multiscale_time.yml`, `mstc_full.yml` |
 
 ### Artifacts and result collection
