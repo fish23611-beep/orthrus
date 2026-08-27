@@ -55,7 +55,7 @@ def test_training_fits_train_only_and_saves_time_statistics(tmp_path):
     assert path.exists()
     loaded = TimeGapStatistics.load(str(path))
     assert loaded.time_bucket_boundaries == fitted.time_bucket_boundaries
-    assert loaded.scale_boundaries == fitted.scale_boundaries
+    assert loaded.scale_boundaries_seconds == fitted.scale_boundaries_seconds
 
 
 def test_testing_loads_existing_artifact_without_refitting(tmp_path, monkeypatch):
@@ -71,7 +71,7 @@ def test_testing_loads_existing_artifact_without_refitting(tmp_path, monkeypatch
     loaded = orthrus_gnn_testing._load_or_fit_time_gap_statistics(cfg, _train_data(100))
 
     assert loaded.time_bucket_boundaries == persisted.time_bucket_boundaries
-    assert loaded.scale_boundaries == persisted.scale_boundaries
+    assert loaded.scale_boundaries_seconds == persisted.scale_boundaries_seconds
 
 
 def test_detection_only_missing_artifact_fails_clearly(tmp_path):
@@ -151,11 +151,11 @@ def test_training_saves_to_run_dir_metadata_when_run_dir_is_set(tmp_path, monkey
     loaded_b = orthrus_gnn_testing._load_or_fit_time_gap_statistics(cfg_b, train_data_b)
 
     assert loaded_a.time_bucket_boundaries == fitted_a.time_bucket_boundaries
-    assert loaded_a.scale_boundaries == fitted_a.scale_boundaries
+    assert loaded_a.scale_boundaries_seconds == fitted_a.scale_boundaries_seconds
     assert loaded_b.time_bucket_boundaries == fitted_b.time_bucket_boundaries
-    assert loaded_b.scale_boundaries == fitted_b.scale_boundaries
+    assert loaded_b.scale_boundaries_seconds == fitted_b.scale_boundaries_seconds
     assert loaded_a.time_bucket_boundaries != loaded_b.time_bucket_boundaries
-    assert loaded_a.scale_boundaries != loaded_b.scale_boundaries
+    assert loaded_a.scale_boundaries_seconds != loaded_b.scale_boundaries_seconds
     assert not (shared_metadata / "time_statistics.json").exists()
 
 def test_testing_loads_from_run_dir_metadata_when_run_dir_is_set(tmp_path, monkeypatch):
@@ -179,7 +179,7 @@ def test_testing_loads_from_run_dir_metadata_when_run_dir_is_set(tmp_path, monke
     loaded = orthrus_gnn_testing._load_or_fit_time_gap_statistics(cfg_load, _train_data(2000))
 
     assert loaded.time_bucket_boundaries == fitted_a.time_bucket_boundaries
-    assert loaded.scale_boundaries == fitted_a.scale_boundaries
+    assert loaded.scale_boundaries_seconds == fitted_a.scale_boundaries_seconds
 
 
 def test_run_dir_takes_priority_over_shared_metadata_dir(tmp_path):

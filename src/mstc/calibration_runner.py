@@ -22,11 +22,17 @@ from typing import Any, Literal
 import numpy as np
 
 def _import_calibrator():
-    """Dynamically import HierarchicalRelationCalibrator to avoid import issues."""
+    """Import the calibrator without creating duplicate module identities."""
     import sys
     from pathlib import Path
 
-    # Try src.mstc.calibration first
+    try:
+        from .calibration import HierarchicalRelationCalibrator
+        return HierarchicalRelationCalibrator
+    except (ModuleNotFoundError, ImportError):
+        pass
+
+    # Support entry points that expose the repository root as a package.
     try:
         from src.mstc.calibration import HierarchicalRelationCalibrator
         return HierarchicalRelationCalibrator

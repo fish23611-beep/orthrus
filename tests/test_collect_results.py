@@ -7,7 +7,7 @@ if str(SRC_ROOT) not in sys.path: sys.path.insert(0,str(SRC_ROOT))
 from experiments import collect_results,run_matrix
 
 def config(tmp,name="mstc_full.yml"):
- p=tmp/name;p.write_text("model: {variant: mstc}\n",encoding="utf-8");return p.resolve()
+ p=tmp/name;p.write_text("experiment_identity: {semantics_version: temporal_v2}\nmodel: {variant: mstc}\n",encoding="utf-8");return p.resolve()
 def make_run(root,cfg,seed,status="completed",metrics=None,runtime=True,dataset="THEIA_E3"):
  scoped=run_matrix.run_artifact_root(root,cfg); marker=run_matrix.run_status_path(root,dataset,cfg,seed); payload=run_matrix._status_payload(dataset,cfg,seed,status,scoped_root=scoped)
  run_matrix._atomic_json(marker,payload); run_dir=scoped/dataset/"runs"/"mstc"/f"seed_{seed}"; run_dir.mkdir(parents=True,exist_ok=True)

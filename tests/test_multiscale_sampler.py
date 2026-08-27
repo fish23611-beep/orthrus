@@ -52,6 +52,18 @@ def _loader(
     )
 
 
+def _single_window_loader(tau_window_s=100, budget=24, num_nodes=64, capacity=64):
+    return SingleWindowNeighborLoader(
+        history_store=HistoryStore(
+            num_nodes=num_nodes,
+            candidate_capacity=capacity,
+            device="cpu",
+        ),
+        tau_window_ns=int(tau_window_s * S),
+        budget=budget,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # seconds_boundaries_to_ns
 # --------------------------------------------------------------------------- #
@@ -119,7 +131,7 @@ def test_long_scale_has_no_upper_bound():
     )
 
     node = 0
-    # Insert event at t=100s, query at ref_time=300s -> delta=200s > tau_max
+    # Insert at t=100s, query at 1100s: delta=1000s = 10 * Q99.
     loader.history_store.insert(
         src=torch.tensor([node]),
         dst=torch.tensor([node + 1]),
@@ -130,10 +142,10 @@ def test_long_scale_has_no_upper_bound():
     result = loader(
         src=torch.tensor([node]),
         dst=torch.tensor([node + 1]),
-        timestamp_ns=torch.tensor([300 * S], dtype=torch.int64),
+        timestamp_ns=torch.tensor([1100 * S], dtype=torch.int64),
     )
 
-    # delta=200s > tau_medium (70s), should be in long scale
+    # delta=1000s > tau_medium (70s), so it remains in long.
     q_idx = result["src_query_index"][0].item()
     assert result["long_mask"][q_idx].sum().item() > 0, "delta > tau_medium should be in long scale"
 
@@ -159,6 +171,54 @@ def test_tau_medium_less_than_tau_short_raises():
 def test_negative_budget_raises():
     with pytest.raises(ValueError, match="non-negative"):
         _loader(short_budget=-1)
+
+
+def test_single_window_q99_boundary_is_inclusive_and_later_history_is_excluded():
+    loader = _single_window_loader(tau_window_s=100, budget=24)
+    reference_time = 1_000 * S
+    loader.history_store.insert(
+        src=torch.tensor([0, 0, 0]),
+        dst=torch.tensor([1, 2, 3]),
+        event_id=torch.tensor([1, 2, 3]),
+        timestamp_ns=torch.tensor(
+            [reference_time - 99 * S, reference_time - 100 * S, reference_time - 101 * S],
+            dtype=torch.int64,
+        ),
+    )
+
+    result = loader(
+        src=torch.tensor([0]),
+        dst=torch.tensor([63]),
+        timestamp_ns=torch.tensor([reference_time], dtype=torch.int64),
+    )
+    q_idx = result["src_query_index"][0].item()
+    selected = set(result["window_event_id"][q_idx][result["window_mask"][q_idx]].tolist())
+
+    assert selected == {1, 2}
+    assert result["window_mask"][q_idx].sum().item() <= 24
+
+
+def test_single_window_returns_latest_24_from_30_in_q99_window():
+    loader = _single_window_loader(tau_window_s=100, budget=24)
+    reference_time = 1_000 * S
+    deltas = torch.arange(1, 31, dtype=torch.int64)
+    loader.history_store.insert(
+        src=torch.zeros(30, dtype=torch.long),
+        dst=torch.arange(1, 31, dtype=torch.long),
+        event_id=deltas.clone(),
+        timestamp_ns=reference_time - deltas * S,
+    )
+
+    result = loader(
+        src=torch.tensor([0]),
+        dst=torch.tensor([63]),
+        timestamp_ns=torch.tensor([reference_time], dtype=torch.int64),
+    )
+    q_idx = result["src_query_index"][0].item()
+    selected = result["window_event_id"][q_idx][result["window_mask"][q_idx]].tolist()
+
+    assert selected == list(range(1, 25))
+    assert len(selected) == 24
 
 
 # --------------------------------------------------------------------------- #
@@ -778,6 +838,27 @@ def test_history_state_dict_roundtrip():
     )
 
     assert result["medium_mask"][0].sum().item() == 1
+
+
+def test_single_window_history_state_dict_roundtrip():
+    loader = _single_window_loader(tau_window_s=100, budget=24)
+    loader.history_store.insert(
+        src=torch.tensor([0]),
+        dst=torch.tensor([1]),
+        event_id=torch.tensor([99]),
+        timestamp_ns=torch.tensor([130 * S], dtype=torch.int64),
+    )
+
+    restored = _single_window_loader(tau_window_s=100, budget=24)
+    restored.load_history_state_dict(loader.history_state_dict())
+    result = restored(
+        src=torch.tensor([0]),
+        dst=torch.tensor([63]),
+        timestamp_ns=torch.tensor([200 * S], dtype=torch.int64),
+    )
+    q_idx = result["src_query_index"][0].item()
+
+    assert result["window_event_id"][q_idx][result["window_mask"][q_idx]].tolist() == [99]
 
 
 # --------------------------------------------------------------------------- #

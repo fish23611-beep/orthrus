@@ -31,7 +31,7 @@ def _graph(src, dst, seconds):
 def _threshold_stats(seconds=15.0):
     stats = TimeGapStatistics()
     stats.time_bucket_boundaries = [math.log1p(seconds)] * 4
-    stats.scale_boundaries = [math.log1p(seconds)] * 3
+    stats.scale_boundaries_seconds = [seconds] * 3
     return stats
 
 
@@ -41,7 +41,7 @@ def test_fit_uses_previous_event_for_repeated_node():
     stats = TimeGapStatistics().fit([graph])
 
     assert stats.time_bucket_boundaries == pytest.approx([math.log1p(10.0)] * 4)
-    assert stats.scale_boundaries == pytest.approx([math.log1p(10.0)] * 3)
+    assert stats.scale_boundaries_seconds == pytest.approx([10.0] * 3)
 
 
 def test_fit_has_no_batch_size_parameter_and_is_window_partition_invariant():
@@ -57,8 +57,8 @@ def test_fit_has_no_batch_size_parameter_and_is_window_partition_invariant():
     assert partitioned_stats.time_bucket_boundaries == pytest.approx(
         whole_stats.time_bucket_boundaries
     )
-    assert partitioned_stats.scale_boundaries == pytest.approx(
-        whole_stats.scale_boundaries
+    assert partitioned_stats.scale_boundaries_seconds == pytest.approx(
+        whole_stats.scale_boundaries_seconds
     )
 
 
@@ -126,14 +126,14 @@ def test_save_load_roundtrip_contains_required_metadata(tmp_path):
     payload = json.loads(path.read_text())
 
     assert set(payload) >= {
-        "unit",
-        "transform",
+        "raw_unit",
+        "time_bucket_space",
         "scale_quantiles",
-        "scale_boundaries",
+        "scale_boundaries_seconds",
         "time_bucket_quantiles",
-        "time_bucket_boundaries",
+        "time_bucket_boundaries_log1p",
     }
-    assert payload["unit"] == "seconds"
-    assert payload["transform"] == "log1p"
+    assert payload["raw_unit"] == "seconds"
+    assert payload["time_bucket_space"] == "log1p_seconds"
     assert loaded.time_bucket_boundaries == stats.time_bucket_boundaries
-    assert loaded.scale_boundaries == stats.scale_boundaries
+    assert loaded.scale_boundaries_seconds == stats.scale_boundaries_seconds

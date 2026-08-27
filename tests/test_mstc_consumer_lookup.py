@@ -40,11 +40,6 @@ if str(SRC) not in sys.path:
 
 from data_utils import load_all_datasets  # noqa: E402
 
-# Import multiscale modules under test. The encoders module pulls in heavy
-# graph libraries; we mock it because the test exercises data_utils only.
-import unittest.mock
-sys.modules.setdefault("encoders", unittest.mock.MagicMock())
-
 from mstc.history_store import HistoryStore  # noqa: E402
 from mstc.multiscale_encoder import MultiScaleOrthrusEncoder  # noqa: E402
 from mstc.multiscale_sampler import MultiScaleNeighborLoader  # noqa: E402

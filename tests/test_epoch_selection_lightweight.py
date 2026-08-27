@@ -27,9 +27,13 @@ def load_evaluation(monkeypatch):
     wandb.logged = []
     wandb.log = lambda stats: wandb.logged.append(dict(stats))
     wandb.Image = lambda path: path
+    wandb_control = types.ModuleType("wandb_control")
+    wandb_control.wandb_log = wandb.log
+    wandb_control.wandb_is_active = lambda: False
     for name, module in {"detection": detection, "detection.node_evaluation": legacy,
                          "detection.evaluation_utils": utils, "data_utils": data_utils,
-                         "provnet_utils": provnet, "wandb": wandb}.items():
+                         "provnet_utils": provnet, "wandb": wandb,
+                         "wandb_control": wandb_control}.items():
         monkeypatch.setitem(sys.modules, name, module)
     detection.node_evaluation = legacy
     spec = importlib.util.spec_from_file_location("detection.selection_evaluation", SRC_ROOT / "detection" / "evaluation.py")

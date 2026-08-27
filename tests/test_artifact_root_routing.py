@@ -79,7 +79,7 @@ class TestFreshWorktreeAbsoluteSharedRoot:
 
         # Write a valid minimal config
         config_file = tmp_path / "baseline.yml"
-        config_file.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config_file.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
 
         # Patch set_task_paths to avoid DB/other deps
         original_set_task_paths = config_module.set_task_paths
@@ -121,7 +121,7 @@ class TestFreshWorktreeAbsoluteSharedRoot:
         monkeypatch.setenv("ORTHRUS_ARTIFACT_ROOT", str(env_root))
 
         config_file = tmp_path / "baseline.yml"
-        config_file.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config_file.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
 
         original_set_task_paths = config_module.set_task_paths
         config_module.set_task_paths = MagicMock()
@@ -154,7 +154,7 @@ class TestFreshWorktreeAbsoluteSharedRoot:
         shared_root.mkdir(parents=True)
 
         config_file = tmp_path / "baseline.yml"
-        config_file.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config_file.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
 
         # Patch to avoid DB/other heavy deps
         original_set_task_paths = config_module.set_task_paths
@@ -200,10 +200,10 @@ class TestSharedPreprocessingWithScopedRuns:
 
         # Two different configs
         config1 = tmp_path / "baseline.yml"
-        config1.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config1.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
 
         config2 = tmp_path / "mstc_full.yml"
-        config2.write_text("pipeline: {mode: full_pipeline}\ndetection: {gnn_training: {used_method: mstc}}\n", encoding="utf-8")
+        config2.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\ndetection: {gnn_training: {used_method: mstc}}\n", encoding="utf-8")
 
         scoped1 = run_matrix.run_artifact_root(root, config1.resolve())
         scoped2 = run_matrix.run_artifact_root(root, config2.resolve())
@@ -228,7 +228,7 @@ class TestSharedPreprocessingWithScopedRuns:
 
         root = tmp_path / "artifacts"
         config = tmp_path / "baseline.yml"
-        config.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
         resolved = config.resolve()
 
         scoped1 = run_matrix.run_artifact_root(root, resolved)
@@ -242,7 +242,7 @@ class TestSharedPreprocessingWithScopedRuns:
 
         root = tmp_path / "artifacts"
         config = tmp_path / "my-experiment.yml"
-        config.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
 
         scoped = run_matrix.run_artifact_root(root, config.resolve())
 
@@ -468,7 +468,7 @@ class TestConfigIdStability:
         from experiments import run_matrix
 
         config = tmp_path / "baseline.yml"
-        config.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
         resolved = config.resolve()
 
         id1 = run_matrix._config_id(resolved)
@@ -481,10 +481,10 @@ class TestConfigIdStability:
         from experiments import run_matrix
 
         config1 = tmp_path / "baseline.yml"
-        config1.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config1.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
 
         config2 = tmp_path / "mstc.yml"
-        config2.write_text("pipeline: {mode: full_pipeline}\ndetection: {gnn_training: {used_method: mstc}}\n", encoding="utf-8")
+        config2.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\ndetection: {gnn_training: {used_method: mstc}}\n", encoding="utf-8")
 
         id1 = run_matrix._config_id(config1.resolve())
         id2 = run_matrix._config_id(config2.resolve())
@@ -496,7 +496,7 @@ class TestConfigIdStability:
         from experiments import run_matrix
 
         config = tmp_path / "my config.yml"
-        config.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
 
         config_id = run_matrix._config_id(config.resolve())
 
@@ -510,7 +510,7 @@ class TestConfigIdStability:
 
         root = tmp_path / "artifacts"
         config = tmp_path / "baseline.yml"
-        config.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
 
         scoped = run_matrix.run_artifact_root(root, config.resolve())
 
@@ -537,7 +537,7 @@ class TestRunExperimentCompatibility:
         from experiments import run_experiment
 
         config_file = tmp_path / "baseline.yml"
-        config_file.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config_file.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
 
         captured_args = {}
         monkeypatch.setattr(run_experiment, "_run_pipeline", lambda args: captured_args.setdefault("args", args))
@@ -558,7 +558,7 @@ class TestRunExperimentCompatibility:
         from experiments import run_matrix
 
         config = tmp_path / "baseline.yml"
-        config.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
 
         calls = []
         monkeypatch.setattr(run_matrix.run_experiment, "main", lambda argv: calls.append(argv))
@@ -623,7 +623,7 @@ class TestDualRootEndToEnd:
 
         # Write config file
         config_file = tmp_path / "baseline.yml"
-        config_file.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config_file.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
 
         # Compute what run_matrix would compute
         from experiments import run_matrix
@@ -731,7 +731,7 @@ class TestDualRootEndToEnd:
 
         # Write config file
         config_file = tmp_path / "baseline.yml"
-        config_file.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config_file.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
 
         # Simulate standalone invocation (no --shared-artifact-root)
         original_set_task_paths = config_module.set_task_paths
@@ -773,7 +773,7 @@ class TestDualRootEndToEnd:
         import config as config_module
 
         config_file = tmp_path / "baseline.yml"
-        config_file.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+        config_file.write_text("experiment_identity: {semantics_version: temporal_v2}\npipeline: {mode: full_pipeline}\n", encoding="utf-8")
 
         original_set_task_paths = config_module.set_task_paths
         config_module.set_task_paths = lambda cfg: original_set_task_paths(cfg)

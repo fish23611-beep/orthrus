@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
+import yaml
+
 
 SRC_ROOT = Path(__file__).resolve().parents[1]
 if str(SRC_ROOT) not in sys.path:
@@ -28,6 +30,12 @@ _ORIGINAL_RUN_EXPERIMENT_MAIN = run_experiment.main
 
 
 _COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_RUNTIME_IDENTITY_KEYS = frozenset({
+    "artifact_root",
+    "dataset",
+    "seed",
+    "shared_artifact_root",
+})
 
 
 def _utc_now() -> str:
@@ -98,10 +106,94 @@ def parse_configs(value: str) -> list[Path]:
     return result
 
 
-def _config_id(config: Path) -> str:
+def _load_yaml_mapping(path: Path) -> dict:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            value = yaml.safe_load(handle)
+    except OSError as exc:
+        raise ValueError(f"Unable to read experiment config {path}: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid YAML in experiment config {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"Experiment config must contain a YAML mapping: {path}")
+    return value
+
+
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _effective_config(config: Path) -> dict:
+    """Return the semantic config used by the matrix identity.
+
+    The production loader resolves config/orthrus.yml before applying an
+    experiment overlay, so the identity mirrors that merge. Run-instance
+    fields live in separate canonical path levels and are removed here.
+    semantics_version must be explicit in the overlay rather than inferred.
+    """
+    config = config.expanduser().resolve()
+    overlay = _load_yaml_mapping(config)
+    identity = overlay.get("experiment_identity")
+    semantics_version = (
+        identity.get("semantics_version") if isinstance(identity, dict) else None
+    )
+    if not isinstance(semantics_version, str) or not semantics_version.strip():
+        raise ValueError(
+            f"Experiment config must explicitly declare "
+            f"experiment_identity.semantics_version: {config}"
+        )
+
+    base_path = SRC_ROOT.parent / "config" / "orthrus.yml"
+    base = {} if config == base_path.resolve() else _load_yaml_mapping(base_path)
+    effective = _deep_merge(base, overlay)
+    return {
+        key: value
+        for key, value in effective.items()
+        if key not in _RUNTIME_IDENTITY_KEYS
+    }
+
+
+def _normalized_effective_config(config: Path) -> str:
+    return json.dumps(
+        _effective_config(config),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _legacy_path_config_id(config: Path) -> str:
+    """Return the pre-temporal-v2 path-hash identity for read-only lookup."""
     safe_stem = _COMPONENT_RE.sub("-", config.stem).strip(".-") or "config"
     digest = hashlib.sha256(str(config).encode("utf-8")).hexdigest()[:12]
     return f"{safe_stem}-{digest}"
+
+
+def _config_id(config: Path) -> str:
+    """Hash normalized effective config content, including semantics_version."""
+    safe_stem = _COMPONENT_RE.sub("-", config.stem).strip(".-") or "config"
+    normalized = _normalized_effective_config(config)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    config_id = f"{safe_stem}-{digest}"
+
+    # Preserve the established directory format, but guarantee separation even
+    # in the vanishingly unlikely event of a truncated digest collision.
+    legacy_id = _legacy_path_config_id(config)
+    collision_counter = 0
+    while config_id == legacy_id:
+        collision_counter += 1
+        digest = hashlib.sha256(
+            f"effective-config-v2:{collision_counter}:{normalized}".encode("utf-8")
+        ).hexdigest()[:12]
+        config_id = f"{safe_stem}-{digest}"
+    return config_id
 
 
 def _safe_dataset(dataset: str) -> str:
@@ -119,6 +211,20 @@ def run_status_path(artifact_root: Path, dataset: str, config: Path, seed: int) 
 def run_artifact_root(artifact_root: Path, config: Path) -> Path:
     """Isolate C8-B artifact paths for configurations with the same model name."""
     return artifact_root / "matrix_artifacts" / _config_id(config)
+
+
+def legacy_run_status_path(artifact_root: Path, dataset: str, config: Path, seed: int) -> Path:
+    """Locate a legacy path-hash status marker without selecting it for writes."""
+    return (
+        artifact_root / "results" / "run_status"
+        / _safe_dataset(dataset) / _legacy_path_config_id(config)
+        / f"seed_{seed}" / "run_status.json"
+    )
+
+
+def legacy_run_artifact_root(artifact_root: Path, config: Path) -> Path:
+    """Locate a legacy path-hash artifact root without selecting it for writes."""
+    return artifact_root / "matrix_artifacts" / _legacy_path_config_id(config)
 
 
 def _status_payload(dataset: str, config: Path, seed: int, status: str, *, scoped_root: Path, **extra) -> dict:

@@ -372,25 +372,20 @@ class TestRuntimeMetadata:
 class TestOutputIsolation:
     """Verify smoke and formal runs use different run directories."""
 
-    def test_smoke_uses_different_config_path(self, tmp_path):
-        """Smoke config path is different from formal config path.
-
-        The run_matrix scheduler uses _config_id(config) as part of scoped_root.
-        Different config paths produce different _config_ids, ensuring smoke
-        runs never pollute formal experiment results.
-        """
+    def test_smoke_uses_different_effective_config(self, tmp_path):
+        """The bounded smoke override has a distinct semantic identity."""
         from experiments.run_matrix import _config_id
 
         formal_config = Path("config/experiments/baseline.yml")
-        smoke_config = Path("/tmp/smoke_baseline_1epoch.yml")
-
-        formal_id = _config_id(formal_config)
-        smoke_id = _config_id(smoke_config)
-
-        # Different config paths produce different config_ids
-        assert formal_id != smoke_id, (
-            "Smoke and formal configs must have different _config_ids for isolation"
+        smoke_config = tmp_path / "baseline.yml"
+        smoke_config.write_text(
+            "experiment_identity: {semantics_version: baseline_v1}\n"
+            "model: {variant: orthrus_baseline}\n"
+            "detection: {gnn_training: {num_epochs: 1}}\n",
+            encoding="utf-8",
         )
+
+        assert _config_id(formal_config) != _config_id(smoke_config)
 
     def test_collect_results_can_filter_smoke(self):
         """Verify collect_results can filter out smoke runs by is_smoke flag."""

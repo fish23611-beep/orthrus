@@ -379,7 +379,7 @@ def test_config_fallback_uses_original_config_when_run_dir_yaml_invalid(tmp_path
     # Original config file (valid YAML mapping)
     cfg_file = tmp_path / "mstc.yml"
     cfg_file.write_text(
-        "model:\n  variant: mstc\ndataset_view:\n  mode: host_only\n"
+        "experiment_identity:\n  semantics_version: temporal_v2\nmodel:\n  variant: mstc\ndataset_view:\n  mode: host_only\n"
         "detection:\n  gnn_training:\n    encoder:\n      backbone: graphsage\n",
         encoding="utf-8",
     )
@@ -429,10 +429,10 @@ def test_config_fallback_warning_when_both_invalid(tmp_path):
     cfg_file = tmp_path / "baseline.yml"
     cfg_file.write_text("not: [valid yaml either", encoding="utf-8")  # invalid
 
-    scoped = run_matrix.run_artifact_root(tmp_path, cfg_file)
+    scoped = run_matrix.legacy_run_artifact_root(tmp_path, cfg_file)
     dataset = "THEIA_E3"
     seed = 0
-    marker = run_matrix.run_status_path(tmp_path, dataset, cfg_file, seed)
+    marker = run_matrix.legacy_run_status_path(tmp_path, dataset, cfg_file, seed)
     run_dir = scoped / dataset / "runs" / "baseline" / f"seed_{seed}"
     run_dir.mkdir(parents=True)
     (run_dir / "node_scores").mkdir()
@@ -450,6 +450,7 @@ def test_config_fallback_warning_when_both_invalid(tmp_path):
 
     rows = collect_results.collect(tmp_path)
     row = rows[0]
+    assert row["config_id"] == run_matrix._legacy_path_config_id(cfg_file)
     # With valid run_dir YAML, no fallback needed
     assert row.get("config_fallback_warning", "") == ""
     # But if run_dir YAML were invalid, original would also be tried
@@ -703,7 +704,7 @@ def test_collect_results_includes_config_fallback_warning_field(tmp_path):
 
     cfg_file = tmp_path / "test.yml"
     cfg_file.write_text(
-        "model:\n  variant: baseline\ndetection:\n  gnn_training:\n    encoder:\n      backbone: graphsage\n",
+        "experiment_identity:\n  semantics_version: baseline_v1\nmodel:\n  variant: baseline\ndetection:\n  gnn_training:\n    encoder:\n      backbone: graphsage\n",
         encoding="utf-8",
     )
     scoped = run_matrix.run_artifact_root(tmp_path, cfg_file)

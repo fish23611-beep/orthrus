@@ -6,6 +6,8 @@ pipeline:
   run_tracing: false
 model:
   variant: mstc
+experiment_identity:
+  semantics_version: temporal_v2
 logging:
   wandb_mode: disabled
 detection:

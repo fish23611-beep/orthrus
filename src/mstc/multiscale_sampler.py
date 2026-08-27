@@ -26,6 +26,15 @@ from torch import Tensor
 from .history_store import HistoryStore
 
 
+def _recency_order(timestamps: Tensor, event_ids: Tensor) -> Tensor:
+    """Order by timestamp descending, then event id descending, without overflow."""
+    event_order = torch.argsort(event_ids, descending=True, stable=True)
+    timestamp_order = torch.argsort(
+        timestamps[event_order], descending=True, stable=True
+    )
+    return event_order[timestamp_order]
+
+
 # ------------------------------------------------------------------
 # Boundary conversion utility (for legacy compatibility)
 # ------------------------------------------------------------------
@@ -303,8 +312,7 @@ class MultiScaleNeighborLoader:
                 valid_nb = nb_cpu[q_idx][in_range]
                 valid_dir = dir_cpu[q_idx][in_range]
 
-                sort_keys = valid_ts * (10**10) + valid_ev
-                sorted_idx = torch.argsort(sort_keys, descending=True)
+                sorted_idx = _recency_order(valid_ts, valid_ev)
                 sorted_ts = valid_ts[sorted_idx]
                 sorted_ev = valid_ev[sorted_idx]
                 sorted_nb = valid_nb[sorted_idx]
@@ -558,8 +566,7 @@ class SingleWindowNeighborLoader:
             valid_nb = nb_cpu[q_idx][in_window]
             valid_dir = dir_cpu[q_idx][in_window]
 
-            sort_keys = valid_ts * (10**10) + valid_ev
-            sorted_idx = torch.argsort(sort_keys, descending=True)
+            sorted_idx = _recency_order(valid_ts, valid_ev)
             sorted_ts = valid_ts[sorted_idx]
             sorted_ev = valid_ev[sorted_idx]
             sorted_nb = valid_nb[sorted_idx]
@@ -612,4 +619,4 @@ class SingleWindowNeighborLoader:
 
     def load_history_state_dict(self, state: Dict[str, Tensor]) -> None:
         """Restore history state from a previously saved state_dict."""
-        self.history_store.load_history_state_dict(state)
+        self.history_store.load_state_dict(state)

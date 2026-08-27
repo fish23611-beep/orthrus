@@ -148,6 +148,7 @@ def _run_testing_main_loop(cfg, models):
         m_torch = stack.enter_context(patch.object(orthrus_gnn_testing, "torch"))
         m_torch.cuda.is_available.return_value = False
 
+        cfg._metadata_dir = None
         cfg._from_weights = False
         cfg.detection.gnn_training._trained_models_dir = "/fake"
         cfg.detection.gnn_testing._edge_losses_dir = "/fake"
@@ -257,6 +258,7 @@ def test_replay_protocol_unchanged_after_fix():
         # Patch reset_state on the mock encoder
         models[0].encoder.reset_state = MagicMock(side_effect=on_reset)
 
+        cfg._metadata_dir = None
         cfg._from_weights = False
         cfg.detection.gnn_training._trained_models_dir = "/fake"
         cfg.detection.gnn_testing._edge_losses_dir = "/fake"

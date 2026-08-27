@@ -18,10 +18,12 @@ import torch
 from torch_geometric.data import Data, TemporalData
 from torch_geometric.loader import TemporalDataLoader
 
-import unittest.mock
-sys.modules["encoders"] = unittest.mock.MagicMock()
-
-from src.data_utils import _inject_event_indices, _inject_full_data_event_fields, SPLIT_NAME_TO_INDEX, custom_temporal_data_loader
+from data_utils import (
+    _inject_event_indices,
+    _inject_full_data_event_fields,
+    SPLIT_NAME_TO_INDEX,
+    custom_temporal_data_loader,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -552,7 +554,7 @@ def test_per_event_split_mapping():
 
 def test_per_event_split_name_from_index():
     """Helper: INDEX_TO_SPLIT_NAME maps split index back to name."""
-    from src.data_utils import INDEX_TO_SPLIT_NAME
+    from data_utils import INDEX_TO_SPLIT_NAME
     assert INDEX_TO_SPLIT_NAME[0] == "train"
     assert INDEX_TO_SPLIT_NAME[1] == "val"
     assert INDEX_TO_SPLIT_NAME[2] == "test"

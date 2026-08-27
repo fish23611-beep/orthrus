@@ -15,7 +15,11 @@ from experiments import run_matrix
 
 def config(tmp_path: Path, name: str) -> Path:
     path = tmp_path / name
-    path.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+    path.write_text(
+        "experiment_identity: {semantics_version: temporal_v2}\n"
+        "pipeline: {mode: full_pipeline}\n",
+        encoding="utf-8",
+    )
     return path
 
 
@@ -27,6 +31,108 @@ def args(root: Path, configs: list[Path], *, datasets="THEIA_E3", seeds="0", ext
         "--artifact-root", str(root),
         *extra,
     ]
+
+
+def test_config_id_requires_explicit_semantics_version(tmp_path):
+    missing = tmp_path / "missing.yml"
+    missing.write_text("pipeline: {mode: full_pipeline}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"experiment_identity\.semantics_version"):
+        run_matrix._config_id(missing)
+
+
+def test_config_id_is_content_based_and_path_independent(tmp_path):
+    left = tmp_path / "left" / "same.yml"
+    right = tmp_path / "right" / "same.yml"
+    left.parent.mkdir()
+    right.parent.mkdir()
+    content = (
+        "experiment_identity: {semantics_version: temporal_v2}\n"
+        "model: {variant: mstc}\n"
+    )
+    left.write_text(content, encoding="utf-8")
+    right.write_text(content, encoding="utf-8")
+
+    assert run_matrix._config_id(left) == run_matrix._config_id(right)
+
+
+def test_config_id_uses_effective_config_not_overlay_shape(tmp_path):
+    implicit = tmp_path / "implicit" / "same.yml"
+    explicit = tmp_path / "explicit" / "same.yml"
+    implicit.parent.mkdir()
+    explicit.parent.mkdir()
+    implicit.write_text(
+        "experiment_identity: {semantics_version: temporal_v2}\n",
+        encoding="utf-8",
+    )
+    explicit.write_text(
+        "detection: {gnn_training: {lr: 0.00001}}\n"
+        "experiment_identity: {semantics_version: temporal_v2}\n",
+        encoding="utf-8",
+    )
+
+    assert run_matrix._config_id(implicit) == run_matrix._config_id(explicit)
+
+
+def test_config_id_excludes_run_instance_fields(tmp_path):
+    plain = tmp_path / "plain" / "same.yml"
+    runtime = tmp_path / "runtime" / "same.yml"
+    plain.parent.mkdir()
+    runtime.parent.mkdir()
+    plain.write_text(
+        "experiment_identity: {semantics_version: temporal_v2}\n"
+        "model: {variant: mstc}\n",
+        encoding="utf-8",
+    )
+    runtime.write_text(
+        "artifact_root: /mnt/other/artifacts\n"
+        "dataset: THEIA_E5\n"
+        "experiment_identity: {semantics_version: temporal_v2}\n"
+        "model: {variant: mstc}\n"
+        "seed: 99\n"
+        "shared_artifact_root: /mnt/other/shared\n",
+        encoding="utf-8",
+    )
+
+    assert run_matrix._config_id(plain) == run_matrix._config_id(runtime)
+
+
+def test_semantics_version_participates_in_config_id(tmp_path):
+    baseline = tmp_path / "baseline" / "same.yml"
+    temporal = tmp_path / "temporal" / "same.yml"
+    baseline.parent.mkdir()
+    temporal.parent.mkdir()
+    baseline.write_text(
+        "experiment_identity: {semantics_version: baseline_v1}\n",
+        encoding="utf-8",
+    )
+    temporal.write_text(
+        "experiment_identity: {semantics_version: temporal_v2}\n",
+        encoding="utf-8",
+    )
+
+    assert run_matrix._config_id(baseline) != run_matrix._config_id(temporal)
+
+
+def test_same_path_gets_a_new_id_when_effective_semantics_change(tmp_path):
+    cfg = config(tmp_path, "same.yml")
+    original = run_matrix._config_id(cfg)
+    cfg.write_text(
+        "experiment_identity: {semantics_version: temporal_v2}\n"
+        "pipeline: {mode: detection_only}\n",
+        encoding="utf-8",
+    )
+
+    assert run_matrix._config_id(cfg) != original
+
+
+def test_temporal_identity_cannot_silently_reuse_legacy_path_hash():
+    cfg = Path("config/experiments/mstc_full.yml").resolve()
+
+    assert run_matrix._config_id(cfg) != run_matrix._legacy_path_config_id(cfg)
+    assert run_matrix.run_artifact_root(Path("/artifacts"), cfg) != (
+        run_matrix.legacy_run_artifact_root(Path("/artifacts"), cfg)
+    )
 
 
 def test_matrix_expands_in_stable_dataset_config_seed_order(tmp_path, monkeypatch):

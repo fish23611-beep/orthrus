@@ -30,6 +30,27 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 
+_ISOLATED_MODULE_NAMES = {"mstc", "detection", "data_utils", "provnet_utils", "wandb", "wandb_control"}
+
+
+def _is_isolated_module(name: str) -> bool:
+    return name in _ISOLATED_MODULE_NAMES or name.startswith(("mstc.", "detection."))
+
+
+@pytest.fixture(autouse=True)
+def _restore_import_modules():
+    saved = {
+        name: module
+        for name, module in sys.modules.items()
+        if _is_isolated_module(name)
+    }
+    yield
+    for name in list(sys.modules):
+        if _is_isolated_module(name):
+            sys.modules.pop(name, None)
+    sys.modules.update(saved)
+
+
 # --------------------------------------------------------------------------- #
 # Canonical metrics expected schema
 # --------------------------------------------------------------------------- #
@@ -471,7 +492,7 @@ def test_collect_results_maps_all_canonical_metrics_to_csv(tmp_path):
 
     cfg_file = tmp_path / "mstc_full.yml"
     cfg_file.write_text(
-        "model:\n  variant: mstc\ndataset_view:\n  mode: host_only\n"
+        "experiment_identity:\n  semantics_version: temporal_v2\nmodel:\n  variant: mstc\ndataset_view:\n  mode: host_only\n"
         "detection:\n  gnn_training:\n    encoder:\n      backbone: graphsage\n",
         encoding="utf-8",
     )

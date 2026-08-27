@@ -4,13 +4,19 @@ Tests for src/mstc/time_gap.py — TimeGapStatistics.
 
 import math
 import os
+import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 import torch
 from torch_geometric.data import TemporalData
 
-from src.mstc.time_gap import (
+SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from mstc.time_gap import (
     NO_HISTORY,
     VERY_SHORT,
     SHORT,

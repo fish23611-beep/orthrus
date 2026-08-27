@@ -12,6 +12,27 @@ import pytest
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 
 
+_ISOLATED_MODULE_NAMES = {"mstc", "detection", "data_utils", "provnet_utils", "wandb", "wandb_control"}
+
+
+def _is_isolated_module(name: str) -> bool:
+    return name in _ISOLATED_MODULE_NAMES or name.startswith(("mstc.", "detection."))
+
+
+@pytest.fixture(autouse=True)
+def _restore_import_modules():
+    saved = {
+        name: module
+        for name, module in sys.modules.items()
+        if _is_isolated_module(name)
+    }
+    yield
+    for name in list(sys.modules):
+        if _is_isolated_module(name):
+            sys.modules.pop(name, None)
+    sys.modules.update(saved)
+
+
 def load_file(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None

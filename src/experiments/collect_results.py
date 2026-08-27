@@ -6,7 +6,6 @@ from typing import Any, Sequence
 
 SRC_ROOT = Path(__file__).resolve().parents[1]
 if str(SRC_ROOT) not in sys.path: sys.path.insert(0, str(SRC_ROOT))
-from experiments.run_matrix import _config_id
 
 FIELDS = [
  "dataset","config","config_path","config_id","seed","status","artifact_dir","git_commit","model_variant","backbone","dataset_view","experiment","failure_type","failure_message","failure_path","collection_error","config_fallback_warning",
@@ -70,7 +69,11 @@ def collect(artifact_root: Path, *, include_smoke: bool = False) -> list[dict]:
   if identity in seen:
    previous=seen[identity]; previous["status"]="incomplete"; previous["collection_error"]=(previous.get("collection_error","") + "; duplicate_identity").strip("; ")
    continue
-  row=empty_row(); row.update({"dataset":dataset,"config":config.stem,"config_path":str(config),"config_id":_config_id(config),"seed":seed,"status":status_name,"artifact_dir":"","git_commit":"","model_variant":"","backbone":"","dataset_view":"","experiment":config.stem,"failure_type":"","failure_message":"","failure_path":"","collection_error":"","config_fallback_warning":""})
+  # Preserve the scheduler identity encoded in the marker path. This keeps
+  # legacy path-hash artifacts readable even if their source config is missing
+  # or now resolves to a newer semantic identity.
+  config_id = marker.parents[1].name
+  row=empty_row(); row.update({"dataset":dataset,"config":config.stem,"config_path":str(config),"config_id":config_id,"seed":seed,"status":status_name,"artifact_dir":"","git_commit":"","model_variant":"","backbone":"","dataset_view":"","experiment":config.stem,"failure_type":"","failure_message":"","failure_path":"","collection_error":"","config_fallback_warning":""})
   scoped=Path(status.get("artifact_root", "")) if isinstance(status.get("artifact_root"),str) else None
   run_dir=find_run_dir(scoped,dataset,seed) if scoped else None
   if run_dir: row["artifact_dir"]=str(run_dir)

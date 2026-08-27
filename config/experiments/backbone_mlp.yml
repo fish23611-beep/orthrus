@@ -4,6 +4,8 @@ pipeline:
   run_tracing: false
 model:
   variant: orthrus_baseline
+experiment_identity:
+  semantics_version: baseline_v1
 logging:
   wandb_mode: disabled
 detection:

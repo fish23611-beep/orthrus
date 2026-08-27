@@ -33,8 +33,8 @@ ENTRYPOINTS = (
     "src/experiments/export_tables.py",
 )
 MASTER_NOTEBOOK_NAME = "ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb"
-REQUIRED_REPOSITORY_REF = "fix/c8-sparse-node-sidecar"
-REQUIRED_EXPECTED_COMMIT = "0d2498c7d9402f227c3688104044952a79949524"
+REQUIRED_REPOSITORY_REF = "fix/c8-loader-telemetry-persist"
+REQUIRED_EXPECTED_COMMIT = "d55a075d752e02d06f87189901d2221fedd4fd4b"
 # The Master Notebook is allowed to invoke the idempotent submodule
 # update either via the local ``git()`` wrapper or via a direct
 # ``subprocess.run(["git", ..., "submodule", "update", "--init",
@@ -203,7 +203,7 @@ def test_master_notebook_uses_one_coherent_frozen_ref_mechanism():
     """Branch/tag checkout and strict commit verification stay coherent.
 
     The Master Notebook must:
-      * pin REPOSITORY_REF == "fix/c8-sparse-node-sidecar"
+      * pin REPOSITORY_REF == "fix/c8-loader-telemetry-persist"
       * pin EXPECTED_COMMIT to a 40-character hex SHA
       * reject ``git rev-parse HEAD`` mismatches via ``actual_commit``
       * never use ``git describe --tags --exact-match`` (commit-only pin)

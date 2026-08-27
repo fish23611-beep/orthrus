@@ -35,6 +35,27 @@ import pytest
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 
 
+_ISOLATED_MODULE_NAMES = {"mstc", "detection", "data_utils", "provnet_utils", "wandb", "wandb_control", "labelling"}
+
+
+def _is_isolated_module(name: str) -> bool:
+    return name in _ISOLATED_MODULE_NAMES or name.startswith(("mstc.", "detection."))
+
+
+@pytest.fixture(autouse=True)
+def _restore_import_modules():
+    saved = {
+        name: module
+        for name, module in sys.modules.items()
+        if _is_isolated_module(name)
+    }
+    yield
+    for name in list(sys.modules):
+        if _is_isolated_module(name):
+            sys.modules.pop(name, None)
+    sys.modules.update(saved)
+
+
 # --------------------------------------------------------------------------- #
 # Source-level verification (A + B)
 # --------------------------------------------------------------------------- #
@@ -133,6 +154,8 @@ def _load_detection_evaluation_with_stubs():
     wandb_control.wandb_is_active = lambda: False
     wandb_control.wandb_log = wandb.log
     wandb_control.wandb_finish = lambda: None
+    labelling = types.ModuleType("labelling")
+    labelling.get_GP_of_each_attack = lambda cfg: dict()
 
     for name, module in {
         "detection": detection,
@@ -142,6 +165,7 @@ def _load_detection_evaluation_with_stubs():
         "provnet_utils": provnet,
         "wandb": wandb,
         "wandb_control": wandb_control,
+        "labelling": labelling,
     }.items():
         sys.modules[name] = module
 

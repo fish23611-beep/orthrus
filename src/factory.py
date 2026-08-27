@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.mstc.time_gap import TimeGapStatistics
-from src.mstc.history_store import HistoryStore
-from src.mstc.multiscale_sampler import MultiScaleNeighborLoader, SingleWindowNeighborLoader
-from src.mstc.multiscale_encoder import MultiScaleOrthrusEncoder, SingleWindowOrthrusEncoder
+from mstc.time_gap import TimeGapStatistics
+from mstc.history_store import HistoryStore
+from mstc.multiscale_sampler import MultiScaleNeighborLoader, SingleWindowNeighborLoader
+from mstc.multiscale_encoder import MultiScaleOrthrusEncoder, SingleWindowOrthrusEncoder
 
 from provnet_utils import *
 from config import *

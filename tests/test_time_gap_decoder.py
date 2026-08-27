@@ -1,8 +1,15 @@
 """Focused unit tests for the C4 TimeGapDecoder."""
 
+import sys
+from pathlib import Path
+
 import torch
 
-from src.decoders import TimeGapDecoder
+SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from decoders import TimeGapDecoder
 
 
 def test_forward_uses_shared_hidden_representation_then_two_heads():

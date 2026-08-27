@@ -443,6 +443,12 @@ def get_default_cfg(args):
      cfg.model = CN()
      cfg.model.variant = "orthrus_baseline"
 
+     # Experiment semantics are intentionally unset by default. Formal matrix
+     # configurations must declare this explicitly so artifact identity never
+     # guesses whether a run uses baseline_v1 or temporal_v2 semantics.
+     cfg.experiment_identity = CN()
+     cfg.experiment_identity.semantics_version = None
+
      # Epoch / model selection
      cfg.model_selection = CN()
      cfg.model_selection.method = "min_val_mean_edge_loss"  # ["min_val_mean_edge_loss", "last_epoch"]

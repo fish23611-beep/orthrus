@@ -67,7 +67,7 @@ def _run_standard_evaluation(evaluation, cfg, stats_by_epoch):
         stack.enter_context(
             patch.object(evaluation.wandb, "Image", return_value=MagicMock())
         )
-        wandb_log = stack.enter_context(patch.object(evaluation.wandb, "log"))
+        wandb_log = stack.enter_context(patch.object(evaluation, "wandb_log"))
 
         evaluation.standard_evaluation(cfg, evaluation_fn=controlled_evaluation_fn)
 

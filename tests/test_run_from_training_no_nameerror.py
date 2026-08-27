@@ -426,6 +426,7 @@ class TestSkipTracingConfig:
         args.stages = None
         args.skip_tracing = True  # explicitly True
 
+        args.max_windows_per_split = None
         cfg = get_default_cfg(args)
         assert cfg.pipeline.run_tracing is False, \
             "skip_tracing=True should set pipeline.run_tracing=False"
@@ -451,6 +452,7 @@ class TestSkipTracingConfig:
         args.stages = None
         args.skip_tracing = False  # explicitly False
 
+        args.max_windows_per_split = None
         cfg = get_default_cfg(args)
         assert cfg.pipeline.run_tracing is True, \
             "skip_tracing=False should keep pipeline.run_tracing=True"

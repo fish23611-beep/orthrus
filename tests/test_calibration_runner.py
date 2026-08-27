@@ -1,34 +1,19 @@
 """Unit tests for calibration_runner post-processing module."""
 
-import importlib.util
 import json
 import pickle
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-CALIBRATION_PATH = Path(__file__).resolve().parents[1] / "src" / "mstc" / "calibration.py"
-CALIBRATION_SPEC = importlib.util.spec_from_file_location("calibration_for_tests", CALIBRATION_PATH)
-assert CALIBRATION_SPEC is not None and CALIBRATION_SPEC.loader is not None
-CALIBRATION_MODULE = importlib.util.module_from_spec(CALIBRATION_SPEC)
-import sys
-sys.modules[CALIBRATION_SPEC.name] = CALIBRATION_MODULE
-CALIBRATION_SPEC.loader.exec_module(CALIBRATION_MODULE)
-HierarchicalRelationCalibrator = CALIBRATION_MODULE.HierarchicalRelationCalibrator
+SRC = Path(__file__).resolve().parents[1] / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
-# Import runner using relative import
-import importlib.util
-import sys
-
-RUNNER_PATH = Path(__file__).resolve().parents[1] / "src" / "mstc" / "calibration_runner.py"
-RUNNER_SPEC = importlib.util.spec_from_file_location("calibration_runner_for_tests", RUNNER_PATH)
-assert RUNNER_SPEC is not None and RUNNER_SPEC.loader is not None
-RUNNER_MODULE = importlib.util.module_from_spec(RUNNER_SPEC)
-sys.modules[RUNNER_SPEC.name] = RUNNER_MODULE
-RUNNER_SPEC.loader.exec_module(RUNNER_MODULE)
-run_calibration = RUNNER_MODULE.run_calibration
-load_event_records_from_csv = RUNNER_MODULE.load_event_records_from_csv
+from mstc.calibration import HierarchicalRelationCalibrator
+from mstc.calibration_runner import load_event_records_from_csv, run_calibration
 
 
 def _record(score, src=1, edge=2, dst=3, event_index=0, **extra):

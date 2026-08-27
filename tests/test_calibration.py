@@ -1,20 +1,17 @@
 """Unit tests for hierarchical empirical event-score calibration."""
 
 import math
-import importlib.util
 import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-CALIBRATION_PATH = Path(__file__).resolve().parents[1] / "src" / "mstc" / "calibration.py"
-CALIBRATION_SPEC = importlib.util.spec_from_file_location("calibration_for_tests", CALIBRATION_PATH)
-assert CALIBRATION_SPEC is not None and CALIBRATION_SPEC.loader is not None
-CALIBRATION_MODULE = importlib.util.module_from_spec(CALIBRATION_SPEC)
-sys.modules[CALIBRATION_SPEC.name] = CALIBRATION_MODULE
-CALIBRATION_SPEC.loader.exec_module(CALIBRATION_MODULE)
-HierarchicalRelationCalibrator = CALIBRATION_MODULE.HierarchicalRelationCalibrator
+SRC = Path(__file__).resolve().parents[1] / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from mstc.calibration import HierarchicalRelationCalibrator
 
 
 def _record(score, src=1, edge=2, dst=3, **extra):

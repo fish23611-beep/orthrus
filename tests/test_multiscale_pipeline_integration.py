@@ -35,8 +35,12 @@ if "decoders" in sys.modules:
     del sys.modules["decoders"]
 
 from mstc.history_store import HistoryStore
-from mstc.multiscale_sampler import MultiScaleNeighborLoader, seconds_boundaries_to_ns
-from mstc.multiscale_encoder import MultiScaleOrthrusEncoder
+from mstc.multiscale_sampler import (
+    MultiScaleNeighborLoader,
+    SingleWindowNeighborLoader,
+    seconds_boundaries_to_ns,
+)
+from mstc.multiscale_encoder import MultiScaleOrthrusEncoder, SingleWindowOrthrusEncoder
 from encoders import OrthrusEncoder, GraphTransformer
 from decoders import EdgeTypeDecoder
 
@@ -143,7 +147,12 @@ def _make_full_data(num_events=20, device="cpu", max_node=10):
     fd.dst = torch.randint(0, max_node, (num_events,), dtype=torch.long, device=device)
     fd.t = torch.arange(num_events, dtype=torch.long, device=device) * 10_000_000_000 + t_base
     fd.msg = torch.randn(num_events, msg_dim, device=device)
-    fd.edge_type = torch.randint(0, edge_dim, (num_events,), dtype=torch.long, device=device)
+    fd.edge_type_index = torch.randint(
+        0, edge_dim, (num_events,), dtype=torch.long, device=device
+    )
+    fd.edge_type = torch.nn.functional.one_hot(
+        fd.edge_type_index, num_classes=edge_dim
+    ).float()
     fd.x_src = torch.randn(num_events, x_dim, device=device)
     fd.x_dst = torch.randn(num_events, x_dim, device=device)
     return fd
@@ -159,9 +168,8 @@ def _make_batch(indices, full_data, max_node=None):
     ])
     batch.t = full_data.t[indices]
     batch.msg = full_data.msg[indices]
-    batch.edge_type = torch.nn.functional.one_hot(
-        full_data.edge_type[indices], num_classes=10
-    ).float()
+    batch.edge_type = full_data.edge_type[indices]
+    batch.edge_type_index = full_data.edge_type_index[indices]
     batch.x_src = full_data.x_src[indices]
     batch.x_dst = full_data.x_dst[indices]
     return batch
@@ -187,6 +195,48 @@ def test_encoder_factory_recent_mode_returns_orthrus_encoder():
     )
 
 
+def test_pure_baseline_factory_does_not_construct_mstc_paths(monkeypatch):
+    """Pure ORTHRUS uses recent history and the Orthrus wrapper only."""
+    import factory
+    from model import Orthrus
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("baseline entered an MSTC-only constructor")
+
+    monkeypatch.setattr(factory, "MultiScaleNeighborLoader", forbidden)
+    monkeypatch.setattr(factory, "SingleWindowNeighborLoader", forbidden)
+    monkeypatch.setattr(factory, "MSTCOrthrus", forbidden)
+
+    cfg = _make_fake_cfg(mode="recent", multiscale_enabled=False)
+    cfg.model = SimpleNamespace(variant="orthrus_baseline")
+    cfg.detection.gnn_training.decoder = SimpleNamespace(
+        used_methods="predict_edge_type"
+    )
+    encoder = factory.encoder_factory(
+        cfg,
+        msg_dim=64,
+        in_dim=64,
+        edge_dim=10,
+        graph_reindexer=FakeGraphReindexer(num_nodes=20, device="cpu"),
+        device="cpu",
+        max_node_num=20,
+    )
+    model = factory.model_factory(
+        encoder,
+        [],
+        cfg,
+        in_dim=64,
+        graph_reindexer=FakeGraphReindexer(num_nodes=20, device="cpu"),
+        device="cpu",
+        max_node_num=20,
+        time_gap_statistics=object(),
+    )
+
+    assert isinstance(encoder, OrthrusEncoder)
+    assert isinstance(model, Orthrus)
+    assert factory.requires_time_gap_statistics(cfg) is False
+
+
 # =============================================================================
 # Test 2: encoder_factory multiscale mode returns encoder with global_event_index requirement
 # =============================================================================
@@ -210,6 +260,34 @@ def test_encoder_factory_multiscale_mode_returns_multiscale_encoder():
     assert encoder.neighbor_loader.tau_short_ns == 2_000_000_000
     assert encoder.neighbor_loader.tau_medium_ns == 5_000_000_000
     # tau_max_ns is optional diagnostic parameter, not set by factory
+
+
+def test_encoder_factory_single_window_uses_q99_and_a_distinct_sampler_mode():
+    """Single-window uses one Q99-bounded pool rather than the Q50 short scale."""
+    from factory import encoder_factory
+
+    cfg = _make_fake_cfg(
+        mode="single_window",
+        multiscale_enabled=True,
+        neighbor_budgets=[24],
+        fusion="equal",
+    )
+    encoder = encoder_factory(
+        cfg,
+        msg_dim=64,
+        in_dim=64,
+        edge_dim=10,
+        graph_reindexer=FakeGraphReindexer(num_nodes=20, device="cpu"),
+        device="cpu",
+        max_node_num=20,
+        time_gap_statistics=_time_statistics(),
+    )
+
+    assert isinstance(encoder, SingleWindowOrthrusEncoder)
+    assert isinstance(encoder.neighbor_loader, SingleWindowNeighborLoader)
+    assert not isinstance(encoder.neighbor_loader, MultiScaleNeighborLoader)
+    assert encoder.neighbor_loader.tau_window_ns == 9_000_000_000
+    assert encoder.neighbor_loader.budget == 24
 
 
 # =============================================================================
