@@ -72,6 +72,7 @@ C8 Reduced matrix + All-in-One + analysis/export
   - 正式结果禁止 test MCC 选择 epoch；
   - 默认按 validation objective 选择，或显式 last_epoch；
   - type-only/baseline objective = mean val loss_type；
+  - time-only objective = mean val loss_time；
   - joint MSTC objective = mean val score_raw = mean(loss_type + lambda_time*loss_time)。
 - `src/detection/orthrus_gnn_testing.py`
   - 每 checkpoint：reset history → replay train → val → 不 reset → test。
@@ -98,6 +99,29 @@ runtime.json
 ```
 
 `collect_results.py` 后续必须扫描这个 schema，不允许假设 `<artifact_root>/runs/...`。
+
+### Experiment identity / config-id
+
+正式论文 run 增加显式语义版本；每个正式配置必须显式声明，不允许靠默认值猜测：
+
+```yaml
+# MSTC Full / temporal ablations / GraphSAGE+MSTC
+experiment_identity:
+  semantics_version: temporal_v2
+
+# baseline.yml / backbone_graphsage_baseline.yml / backbone_mlp.yml
+experiment_identity:
+  semantics_version: baseline_v1
+```
+
+约束：
+
+- `config_id` 基于规范化后的有效配置内容稳定 hash，并包含 `semantics_version`；
+- 禁止继续只 hash config path；
+- `seed`、`dataset`、运行时路径、硬件信息、时间戳不进入配置语义 hash；seed/dataset 由 canonical path 独立表达；
+- Git commit 单独记录，不作为每次 config-id 变化的唯一依据；
+- 旧 path-hash artifact id 只读兼容，新的正式 run 不得覆盖；
+- 若 identity 升级暂时无法安全落地，则 `temporal_v2` 必须使用独立 artifact root 过渡，`--force` 不算隔离方案。
 
 ### 测试
 
@@ -173,7 +197,9 @@ MSTC-PIDS
 ### 修改文件
 
 - `src/data_utils.py`
-  - `src_type / dst_type / edge_type_index / local_event_index / global_event_index / window_id / split`。
+  - `src_type / dst_type / edge_type_index / local_event_index / global_event_index / window_id / split`；
+  - `split` 固定逐事件整数编码 `0=train, 1=val, 2=test`；
+  - 正式 MSTC train/val/test 路径必须保证 `global_event_index` 唯一、稳定、batching 后保留；缺失时 fail fast，不得静默退化为 batch position。
 - `src/mstc/time_gap.py`
   - `TimeGapStatistics`；
   - `TimeGapTargetBuilder`。
@@ -295,6 +321,8 @@ Equal-24        = 8+8+8, equal non-empty scale fusion
 Gated-24        = 8+8+8, learned masked gate
 ```
 
+“Long 无 Q99 上界”只表示时间分组不被 Q99 截断；HistoryStore 的候选仍受 `candidate_capacity` 约束，必须报告 `candidate_truncation_ratio`，不得宣称无限历史。
+
 只 Gated-24 报 gate distribution。
 
 ### Encoder
@@ -347,6 +375,8 @@ triplet(src_type, edge_type, dst_type)
 
 `min_triplet_samples=100 / min_type_pair_samples=200` 是预固定支持下限；报告 fallback rate，不做额外网格搜索。
 
+独立 `Relation Triplet Calibration` 对照固定为 `triplet support >=100 → triplet，否则 → global`，不使用 type-pair 回退；`Hierarchical` 才使用 `triplet → type_pair → global`。
+
 真实 `edge_type` 只用于模型输出后的 post-hoc conditioning，不作为当前事件模型输入。
 
 ### Node aggregation API
@@ -372,6 +402,16 @@ KMeans 属于 node-decision 方法，不把它当普通 scalar threshold 描述�
 
 ### Ablation correctness
 
+`w/o Time Prediction`：
+
+```text
+decoder.time_gap.enabled=false
+lambda_time=0
+score_raw=loss_type
+```
+
+关闭后不实例化/不优化 TimeGapDecoder，参数量统计也不包含该预测头；与 Type-only 诊断配置训练语义一致时直接复用。
+
 `w/o Calibration`：
 
 ```text
@@ -380,7 +420,9 @@ raw event score
 + same validation_quantile(0.999)
 ```
 
-只去掉 calibration，不同时改变 threshold strategy。
+只去掉 calibration，不同时改变 threshold strategy；数值阈值必须基于该 ablation 自己的正常 validation node scores 重新计算。
+
+`w/o Top-k` 同理：聚合改为 `mean` 后，validation quantile 方法保持不变，但数值阈值必须基于 mean 聚合后的 validation node scores 重算，禁止复用 Full/K=5 阈值。
 
 ### 训练 checkpoint 边界
 
@@ -398,14 +440,17 @@ training checkpoint 只保存训练状态；calibrator/threshold/node prediction
 
 - 两层 SAGEConv；
 - 无 edge features 时显式忽略 edge_attr；
-- 能接入 C5 的 shared multi-scale sampler/encoder、C4 time task、C6 calibration/aggregation。
+- 能接入 C5 的 shared multi-scale sampler/encoder、C4 time task、C6 calibration/aggregation；
+- `backbone_graphsage_baseline.yml`：plain GraphSAGE baseline，关闭 MSTC multi-scale/time/calibration，用于主结果；
+- `backbone_graphsage.yml`：GraphSAGE + MSTC modules，用于跨骨干专项。
 
 ### Semantic MLP
 
 - 输入 `concat(x_src,x_dst)`；
 - 不读 edge_index/history；
 - 不进入 MultiScaleOrthrusEncoder；
-- 不使用 gate。
+- 不使用 gate；
+- 主结果 `backbone_mlp.yml` 为 plain Semantic MLP：`decoder.time_gap.enabled=false`，只走 edge-type anomaly path；如启用 time head 只能作为额外诊断，不得替代主 baseline。
 
 因此删除旧计划“Semantic MLP 需要调整 gate 输入维度”的描述。
 
@@ -437,11 +482,22 @@ training checkpoint 只保存训练状态；calibrator/threshold/node prediction
 
 ```text
 Datasets: THEIA_E3, THEIA_E5
-Models: Semantic MLP, GraphSAGE, ORTHRUS-ano, MSTC-PIDS Full
+Models: Semantic MLP, GraphSAGE, ORTHRUS-ano (统一论文协议), MSTC-PIDS Full
 Seeds: 0,1,2
 ```
 
-全部 `corpus_scope=train_only`。
+全部 `corpus_scope=train_only`。其中 `ORTHRUS-ano` 指保持官方模型结构但采用统一论文协议的版本；官方整库语料/旧 test-based selection 仅为 compatibility-only。
+
+主结果配置固定映射：
+
+```text
+Semantic MLP    → backbone_mlp.yml
+GraphSAGE       → backbone_graphsage_baseline.yml
+ORTHRUS-ano     → baseline.yml
+MSTC-PIDS Full  → mstc_full.yml
+```
+
+`backbone_graphsage.yml` 仅用于 GraphSAGE + MSTC 跨骨干实验。
 
 ### E3-only 实验
 
@@ -452,6 +508,26 @@ Seeds: 0,1,2
 - GraphTransformer+MSTC vs GraphSAGE+MSTC：3 seeds；
 - efficiency：复用现有 runtime，不重新训练；
 - Top-k sensitivity：3 seeds，纯后处理。
+
+### 训练/后处理复用映射
+
+```text
+A0 ORTHRUS-ano             ← E3 主结果 ORTHRUS seeds 0/1/2
+A6 Full                     ← E3 主结果 MSTC Full seeds 0/1/2
+Recent-24                   ← A1 w/o Multi-scale seed 0（训练语义完全一致时）
+Equal-24                    ← A2 w/o Gate seed 0（训练语义完全一致时）
+Type-only                   ← A3 w/o Time seed 0（训练语义完全一致时）
+Gated-24 / Joint            ← A6 seed 0
+GraphTransformer + MSTC    ← 默认 Full 为 GraphTransformer 时复用 A6 seeds 0/1/2
+GraphSAGE + MSTC            ← 使用 backbone_graphsage.yml，独立 3 seeds（不能复用 plain GraphSAGE baseline）
+A4 w/o Calibration         ← A6 raw event scores，postprocess only
+A5 w/o Top-k               ← A6 calibrated event scores，postprocess only
+Calibration/Node Decision  ← A6 event scores；No Calibration=A4，Hierarchical/Validation-Quantile=A6，其余只重跑后处理
+Top-k sensitivity          ← A6 calibrated event scores；K=5 直接对应 Full
+Efficiency                 ← 对应已有 runtime.json
+```
+
+如果训练语义存在额外差异则不得强行复用；先对齐配置或明确独立训练。运行器不得仅因 YAML 文件名不同就重复训练。
 
 ### 删除的正式实验
 
@@ -505,7 +581,7 @@ topk_sensitivity
 唯一正式 Notebook：
 
 ```text
-notebooks/<现有 All-in-One Notebook 的实际文件名>.ipynb
+notebooks/ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb
 ```
 
 Sections：
@@ -525,7 +601,7 @@ Sections：
 11 paper export
 ```
 
-Notebook 只调用 Python CLI，不复制训练逻辑。沿用仓库现有 All-in-One Notebook 的实际文件名，不新建/重命名第二个官方入口。
+Notebook 只调用 Python CLI，不复制训练逻辑。唯一正式入口固定为 `notebooks/ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb`，不新建/重命名第二个官方入口。
 
 ### OOM 规则
 
@@ -550,12 +626,15 @@ number of layers
 |---|---|---|
 | C1 | test-based epoch selection | compatibility-only，论文默认关闭 |
 | C1 | artifact path 漂移 | 单一 canonical matrix_artifacts schema |
+| C1/C8 | config-id 只 hash 路径导致语义碰撞 | effective-config hash + explicit semantics_version；legacy id 只读 |
 | C2 | `train_only` 只写配置不生效 | 必须测试 val/test token 不进入 W2V fit |
 | C3 | time target 与 history 状态混用 | 两套 state 分离 |
 | C3 | quantile 数据域含糊 | scale=seconds；bucket=log1p_seconds |
+| C3 | 同 timestamp 时缺失 global_event_index | 正式 MSTC 路径缺失即 fail fast，不用 batch position 兜底 |
 | C4 | raw anomaly score 多版本 | 唯一 score_raw contract |
 | C5 | Q99 丢掉极长历史 | long 为 >Q90，Q99 不截断 |
 | C5 | GraphTransformer 硬编码 | shared configurable graph backbone |
+| C7/C8 | plain GraphSAGE 与 GraphSAGE+MSTC 配置混用 | baseline 与 MSTC config 分离：`backbone_graphsage_baseline.yml` / `backbone_graphsage.yml` |
 | C6 | calibration/threshold 同时变化 | 分层实验，一次只改一层 |
 | C6 | include_dst 时机错误 | event→node 映射阶段生效 |
 | C8 | Top-k 变成重复训练 | dedicated postprocess，missing source 就 fail |
@@ -583,7 +662,10 @@ number of layers
 15. 不存在 Host-network/zero-shot 等已删除实验的正式配置；
 16. 正式 OOM 策略不静默改变模型语义；
 17. paper tables 只使用 mean±std，不挑 best seed；
-18. `pytest -q` 全部通过。
+18. `global_event_index` 正式数据链唯一、稳定、batching 后保留；
+19. 新正式 run 的 config-id 能区分 temporal semantics，不与 legacy path-hash artifacts 静默碰撞；
+20. Single-window-24 使用 Q99 时间窗，正式 Long 不被 Q99 截断；
+21. `pytest -q` 全部通过。
 
 ---
 

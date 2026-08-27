@@ -37,10 +37,12 @@
 
 主要比较对象是：
 
-1. 原始 ORTHRUS-ano；
+1. 统一论文协议下的 ORTHRUS-ano；
 2. Semantic MLP；
 3. GraphSAGE；
 4. 完整 MSTC-PIDS。
+
+为避免术语歧义：下文若简写为 `ORTHRUS-ano`，除非明确标注 `compatibility-only`，均指**保持官方 ORTHRUS 模型结构/异常检测逻辑，但统一采用本论文的数据与选择协议**（尤其是 `semantic_features.corpus_scope=train_only`、validation-based checkpoint selection 和统一 artifact contract）的版本。原仓库整库语料/旧 test-based selection 仅属于官方兼容复现，不得与论文主表中的 ORTHRUS-ano 混用。
 
 论文实验遵循以下总原则：
 
@@ -223,6 +225,7 @@ config/experiments/
     threshold_max_validation.yml
     threshold_kmeans.yml
     backbone_graphtransformer.yml
+    backbone_graphsage_baseline.yml
     backbone_graphsage.yml
     backbone_mlp.yml
 
@@ -230,7 +233,7 @@ config/analysis/
     topk_sensitivity.yml
 
 notebooks/
-    <现有 All-in-One Notebook 的实际文件名>.ipynb
+    ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb
 
 tests/
     test_time_gap.py
@@ -365,6 +368,34 @@ artifacts/
 
 `collect_results.py`、`export_tables.py` 和 All-in-One Notebook 都必须按上述 contract 查找文件，不得再假设 `artifact_root/runs/...` 这种缺少 dataset/config-id 层的路径。
 
+### 5.3.1 `config_id` / 实验语义身份合同
+
+`config_id` 不得只对配置文件路径字符串做 hash。论文正式运行必须使实验身份能够区分“配置内容相同路径但研究语义已改变”的情况。
+
+统一要求：
+
+```yaml
+experiment_identity:
+  semantics_version: temporal_v2
+```
+
+- 受 MSTC 时间语义影响的正式配置（Full、multi-scale/time 消融、GraphSAGE+MSTC 等）使用 `temporal_v2`；
+- 纯论文 baseline（`baseline.yml`、`backbone_graphsage_baseline.yml`、`backbone_mlp.yml`）使用预先固定的 `baseline_v1`；
+- 每个正式论文配置都必须显式声明 `experiment_identity.semantics_version`，不得依赖默认值静默推断；
+- `semantics_version` 必须进入 `config_id` 的 hash 输入；
+- `config_id` 的 hash 输入应来自**规范化后的有效实验配置内容**（稳定序列化后 hash），而不是 `str(config_path)`；
+- `seed`、`dataset`、`artifact_root`、绝对路径、运行机器、时间戳等 run-instance / runtime 字段不得进入配置语义 hash；`seed` 和 `dataset` 已由 canonical path 的独立层级表达；
+- Git commit 单独写入 `environment.json` / `config_resolved.yml`，不把每个无关代码提交都强行变成新的 config-id；
+- 旧的 path-hash config-id 仅视为 legacy artifact identity，允许只读兼容，不得被新的正式论文运行覆盖。
+
+建议格式：
+
+```text
+<safe_config_name>-<12-hex effective-config hash>
+```
+
+如果现有实现暂时无法安全升级 identity，正式 `temporal_v2` 运行必须使用独立 artifact root 作为过渡隔离；`--force` 不是 artifact 隔离方案。
+
 每次训练运行保存：
 
 - 数据集；
@@ -418,6 +449,9 @@ model_selection:
 ```text
 Type-only / ORTHRUS baseline:
     mean validation loss_type
+
+Time-only:
+    mean validation loss_time
 
 Joint MSTC:
     mean validation score_raw
@@ -583,13 +617,16 @@ evaluate_only  = evaluate（已有事件级/节点级所需产物）
 
 修改`src/data_utils.py`。
 
-在解析消息时，为每个TemporalData显式保存：
+在解析消息时，为每个 `TemporalData` 显式保存：
 
 ```python
 g.src_type
 g.dst_type
 g.edge_type_index
-g.event_index
+g.local_event_index
+g.global_event_index
+g.window_id
+g.split
 ```
 
 格式：
@@ -598,10 +635,13 @@ g.event_index
 g.src_type.shape == [num_events]
 g.dst_type.shape == [num_events]
 g.edge_type_index.shape == [num_events]
-g.event_index.shape == [num_events]
+g.local_event_index.shape == [num_events]
+g.global_event_index.shape == [num_events]
+g.window_id.shape == [num_events]
+g.split.shape == [num_events]
 ```
 
-其中类型索引从0开始。
+上述索引字段使用整数张量；类型索引从 0 开始；`local_event_index` 是当前窗口内从 0 开始的事件索引；`global_event_index` 必须与 `train + val + test` 构成的 `full_data` 事件拼接位置一一对应，并在 batching 后保持不变；`window_id` 标识全局窗口；`split` 采用固定整数编码 `0=train, 1=val, 2=test`。正式 MSTC 路径不得用含糊的 `event_index` 或 batch position 代替 `global_event_index`。
 
 不要在后处理阶段依赖：
 
@@ -1003,6 +1043,8 @@ long:
 
 `tau_extreme_seconds=Q99` 不截断 long，只用于诊断与 Single-window 对照。
 
+这里“Long 无 Q99 上界”仅表示**时间分组规则不以 Q99 截断**；实际可查询的历史候选仍受 `candidate_capacity` 和 HistoryStore 保留策略约束。因此论文中不得把该实现描述成“无限历史”或“任意长期依赖”，必须同时报告 `candidate_truncation_ratio`。
+
 每个尺度只保留该尺度中最近的 K 条边；不足 K 不重复填充；为空提供显式 mask。
 
 ## 10.5 公平邻居预算
@@ -1215,6 +1257,15 @@ calibration:
 ```
 
 `100/200` 是预先固定的最小支持数，不依据 test 搜索最优值。本篇论文不额外增加这两个参数的网格扫描，但必须报告各层 fallback rate 和样本数分布。
+
+为了让 §17.5 的 `Relation Triplet Calibration` 与 `Hierarchical Relation Calibration` 成为单变量、可解释的对照，单独的 Relation Triplet 模式固定为：
+
+```text
+triplet 支持数 >= 100 → triplet reference
+否则 → global reference
+```
+
+Relation Triplet 模式**不使用 type-pair 中间回退层**；Hierarchical 模式相对于它的新增机制正是 `triplet → type_pair → global` 的分层回退。测试遇到 unseen triplet 时同样回退到 global，不允许报错或临时用 test 分布建参考。
 
 ## 11.2 经验 p 值
 
@@ -1521,6 +1572,15 @@ GraphSAGE 不使用 edge features 时必须明确说明，但它必须能够接�
 
 跨骨干专项仅在 THEIA_E3 运行，用来回答 MSTC 模块是否只对 GraphTransformer 有效。
 
+配置职责必须分开：
+
+```text
+backbone_graphsage_baseline.yml = plain GraphSAGE baseline；关闭 MSTC multi-scale/time/calibration，仅保留与 baseline 公平的 edge-type anomaly path
+backbone_graphsage.yml          = GraphSAGE + MSTC modules；用于 §17.6 跨骨干验证
+```
+
+论文主结果中的“GraphSAGE”必须使用 `backbone_graphsage_baseline.yml`；不得拿 `GraphSAGE + MSTC` 配置冒充 plain GraphSAGE baseline。
+
 ## 14.3 Semantic MLP
 
 新增简单基线：
@@ -1538,7 +1598,9 @@ concat(x_src, x_dst)
 
 不读取历史图，不进入 `MultiScaleOrthrusEncoder`，不使用 gate。
 
-预测边类型，可按配置启用 time head。MLP 只回答：
+论文主结果中的 `backbone_mlp.yml` 定义为 **plain Semantic MLP baseline**：只预测 edge type，`decoder.time_gap.enabled=false`，不启用 MSTC multi-scale/gate/time-task。若另做诊断可按配置启用 time head，但不得把该诊断配置当成主结果里的 Semantic MLP。
+
+MLP 只回答：
 
 ```text
 复杂图历史建模是否明显优于简单语义映射？
@@ -1630,6 +1692,17 @@ semantic_features:
   corpus_scope: train_only
 ```
 
+主结果配置映射固定为：
+
+```text
+Semantic MLP    → backbone_mlp.yml
+GraphSAGE       → backbone_graphsage_baseline.yml
+ORTHRUS-ano     → baseline.yml
+MSTC-PIDS Full  → mstc_full.yml
+```
+
+`backbone_graphsage.yml` 专用于 GraphSAGE + MSTC 的跨骨干实验，不属于主结果中的 plain GraphSAGE baseline。
+
 因此主结果共 `2 datasets × 4 models × 3 seeds = 24` 个模型运行，不再使用 5 seeds 扩大主矩阵。
 
 ## 17.2 完整消融：仅 THEIA_E3
@@ -1656,15 +1729,19 @@ w/o Gate:
     保留三尺度，对非空尺度等权平均
 
 w/o Time Prediction:
-    lambda_time = 0，score_raw = loss_type
+    关闭 `decoder.time_gap.enabled`（不实例化/不优化 TimeGap 预测头），
+    lambda_time = 0，score_raw = loss_type；
+    参数量统计也不得包含被关闭的 TimeGapDecoder
 
 w/o Calibration:
     保留同一 topk_mean 与 validation_quantile 决策规则，
     仅把 score_calibrated 替换为 score_raw，避免同时改变校准和阈值策略
 
 w/o Top-k:
-    保留同一 calibrated event score 和 validation_quantile，
-    节点聚合由 topk_mean(K=5) 改为 mean
+    保留同一 calibrated event score 和 validation_quantile 方法，
+    节点聚合由 topk_mean(K=5) 改为 mean；
+    数值阈值必须根据 mean 聚合后的正常 validation node scores 重新计算，
+    禁止复用 Full/K=5 的数值阈值
 ```
 
 E5 不重复完整消融，E5 的作用是验证完整方法的跨数据集稳定性。
@@ -1760,7 +1837,29 @@ Plain ORTHRUS-ano 和 plain GraphSAGE 已出现在主结果，不再另建重复
 
 该实验回答：MSTC 的多尺度/时间/校准模块是否能跨图骨干工作。
 
-## 17.7 效率
+## 17.7 训练/后处理复用映射（硬约束）
+
+为避免同一配置重复训练，实验运行器必须优先复用以下已有 run；只有配置的训练语义实际不同才允许新增训练：
+
+```text
+A0 ORTHRUS-ano                 ← 复用 E3 主结果 ORTHRUS-ano seeds 0/1/2
+A6 Full                         ← 复用 E3 主结果 MSTC-PIDS Full seeds 0/1/2
+A1 w/o Multi-scale             ← 与 Recent-24 训练语义一致时，Recent-24 复用 A1 seed 0
+A2 w/o Adaptive Gate           ← 与 Multi-scale Equal-24 训练语义一致时，Equal-24 复用 A2 seed 0
+A3 w/o Time Prediction         ← 与 Type-only 训练语义一致时，Type-only 复用 A3 seed 0
+Multi-scale Gated-24           ← 复用 A6 seed 0
+Joint                          ← 复用 A6 seed 0
+GraphTransformer + MSTC        ← 默认 Full backbone 为 GraphTransformer 时复用 A6 seeds 0/1/2
+A4 w/o Calibration             ← 不重新训练；复用 A6 raw event scores，仅重跑后处理
+A5 w/o Top-k                   ← 不重新训练；复用 A6 calibrated event scores，仅重跑节点聚合/阈值
+Calibration / Node Decision    ← 复用 A6 各 seed 的事件级产物；No Calibration=A4，Hierarchical/Validation-Quantile=A6，其他方法仅重跑后处理
+Top-k sensitivity              ← 复用 A6 各 seed 的 calibrated event scores；K=5 直接对应 Full 主配置
+Efficiency                     ← 复用对应 run 的 runtime.json
+```
+
+如果某一对配置除目标变量外仍存在其他训练差异，则不得强行复用；必须先报告差异并把它们对齐，或明确作为独立训练。运行器不得因为文件名不同就自动重复训练。
+
+## 17.8 效率
 
 不为了效率表重新训练。直接复用主结果和消融 run 的 `runtime.json`，汇总：
 
@@ -1772,7 +1871,7 @@ MSTC-PIDS Full
 
 报告 parameter_count、train time、test time、peak memory、events/s。
 
-## 17.8 Top-k 参数敏感性：仅 THEIA_E3，纯后处理
+## 17.9 Top-k 参数敏感性：仅 THEIA_E3，纯后处理
 
 使用主结果中 MSTC-PIDS Full 的 seeds：
 
@@ -1802,7 +1901,7 @@ Attack Detection Rate
 
 同时输出 `num_events < K` 节点比例。
 
-## 17.9 明确删除的实验
+## 17.10 明确删除的实验
 
 本篇论文不再运行：
 
@@ -1822,7 +1921,7 @@ full-dataset Word2Vec vs train-only Word2Vec 对照
 对每个被检测的高分事件保存：
 
 ```text
-event_index
+global_event_index
 timestamp
 source
 destination
@@ -1893,7 +1992,12 @@ pipeline:
 
 model:
   variant: mstc
-  seed: 0
+
+experiment_identity:
+  semantics_version: temporal_v2
+
+# seed / dataset 由 run_experiment.py / run_matrix.py 的运行参数提供，
+# 不写入 config-id 的实验语义 hash。
 
 semantic_features:
   corpus_scope: train_only
@@ -1986,7 +2090,7 @@ python src/experiments/run_matrix.py \
   --datasets THEIA_E3,THEIA_E5 \
   --configs \
     config/experiments/backbone_mlp.yml,\
-    config/experiments/backbone_graphsage.yml,\
+    config/experiments/backbone_graphsage_baseline.yml,\
     config/experiments/baseline.yml,\
     config/experiments/mstc_full.yml \
   --seeds 0,1,2 \
@@ -2032,7 +2136,7 @@ python src/experiments/run_topk_sensitivity.py \
 本篇论文只维护一个正式 Notebook：
 
 ```text
-notebooks/<现有 All-in-One Notebook 的实际文件名>.ipynb
+notebooks/ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb
 ```
 
 Notebook 只负责环境准备、参数组织和调用 Python CLI，不在单元格里复制一套独立训练/评估实现。
@@ -2064,7 +2168,7 @@ Section 11  Paper artifact export
 - 输出 `config_resolved.yml` 与环境信息；
 - Section 10/11 至少汇总 `main_results.csv`、`ablation_results.csv`、`score_calibration_results.csv`、`node_decision_results.csv`、`efficiency_results.csv`、`topk_sensitivity_results.csv` 和 `topk_event_count_summary.csv`。
 
-沿用仓库现有 All-in-One Notebook 的实际文件名，不因为本次文档修订再复制或重命名出第二个“官方 Notebook”。
+唯一正式 Notebook 固定为 `notebooks/ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb`；不因为文档修订再复制或重命名出第二个“官方 Notebook”。
 
 ## OOM 处理
 
@@ -2209,8 +2313,11 @@ torch.testing.assert_close(..., atol=1e-6, rtol=1e-5)
 21. 不运行 Host-network 三视图、跨 E3/E5 zero-shot、history device 对比、Top-k Sum 对照；
 22. 不运行攻击重建也不会报错；
 23. `--run_from_training` 不会报未定义变量；
-24. 所有测试通过；
-25. README 与两份设计文档同步更新。
+24. `global_event_index` 在正式 train/val/test 数据链中唯一、稳定且 batching 后不丢失；
+25. 新正式论文 run 的 `config_id` 基于有效配置内容并包含 `semantics_version`，不会与旧 path-hash artifacts 静默碰撞；
+26. Single-window-24 使用 Q99 时间窗，而正式 Multi-scale Long 不受 Q99 截断；
+27. 所有测试通过；
+28. README 与两份设计文档同步更新。
 
 # 24. 开发顺序
 
