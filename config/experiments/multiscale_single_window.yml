@@ -1,4 +1,6 @@
 # Single-window 24-neighbor control.
+# Uses Q99 as upper bound for the time window, max 24 neighbors.
+# This is distinct from canonical multi-scale (Q50/Q90/unbounded).
 pipeline:
   mode: detection_only
   run_tracing: false
@@ -10,15 +12,14 @@ detection:
   gnn_training:
     encoder:
       backbone: graph_transformer
-      neighbor_size: 24
       context:
-        mode: multiscale
+        mode: single_window
         multiscale:
           enabled: true
           candidate_capacity: 64
           history_device: cpu
           scale_quantiles: [0.50, 0.90, 0.99]
-          neighbor_budgets: [24, 0, 0]
+          neighbor_budgets: [24]
           share_encoder: true
           fusion: equal
           use_scale_embedding: false

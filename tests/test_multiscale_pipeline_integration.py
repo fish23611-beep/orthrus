@@ -35,7 +35,7 @@ if "decoders" in sys.modules:
     del sys.modules["decoders"]
 
 from mstc.history_store import HistoryStore
-from mstc.multiscale_sampler import MultiScaleNeighborLoader, log_seconds_boundaries_to_ns
+from mstc.multiscale_sampler import MultiScaleNeighborLoader, seconds_boundaries_to_ns
 from mstc.multiscale_encoder import MultiScaleOrthrusEncoder
 from encoders import OrthrusEncoder, GraphTransformer
 from decoders import EdgeTypeDecoder
@@ -123,8 +123,9 @@ def _make_fake_cfg(mode="recent", multiscale_enabled=False, **multiscale_kwargs)
 
 
 def _time_statistics():
+    # Return scale_boundaries_seconds (raw seconds) instead of log1p scale_boundaries
     return SimpleNamespace(
-        scale_boundaries=[math.log1p(2.0), math.log1p(5.0), math.log1p(9.0)]
+        scale_boundaries_seconds=[2.0, 5.0, 9.0]
     )
 
 
@@ -205,9 +206,10 @@ def test_encoder_factory_multiscale_mode_returns_multiscale_encoder():
     assert getattr(encoder, "requires_global_event_index", False), (
         f"Multiscale encoder should require global_event_index, but got requires_global_event_index={getattr(encoder, 'requires_global_event_index', False)}"
     )
+    # tau_short_ns and tau_medium_ns are set from scale_boundaries_seconds
     assert encoder.neighbor_loader.tau_short_ns == 2_000_000_000
     assert encoder.neighbor_loader.tau_medium_ns == 5_000_000_000
-    assert encoder.neighbor_loader.tau_max_ns == 9_000_000_000
+    # tau_max_ns is optional diagnostic parameter, not set by factory
 
 
 # =============================================================================
@@ -281,7 +283,7 @@ def test_mstc_orthrus_passes_global_event_index_to_multiscale_encoder():
 
     device = "cpu"
     max_node_num = 10
-    tau_short_ns, tau_medium_ns, tau_max_ns = log_seconds_boundaries_to_ns([0.50, 0.90, 0.99])
+    tau_short_ns, tau_medium_ns, tau_max_ns = seconds_boundaries_to_ns([0.50, 0.90, 0.99])
     history_store = HistoryStore(num_nodes=max_node_num, candidate_capacity=8, device="cpu")
     neighbor_loader = MultiScaleNeighborLoader(
         history_store=history_store,
@@ -406,7 +408,7 @@ def test_reset_state_works_for_both_encoder_types():
                 edge_dim=10,
             )
         else:
-            tau_short_ns, tau_medium_ns, tau_max_ns = log_seconds_boundaries_to_ns([0.50, 0.90, 0.99])
+            tau_short_ns, tau_medium_ns, tau_max_ns = seconds_boundaries_to_ns([0.50, 0.90, 0.99])
             history_store = HistoryStore(num_nodes=max_node_num, candidate_capacity=8, device="cpu")
             neighbor_loader = MultiScaleNeighborLoader(
                 history_store=history_store,
@@ -453,7 +455,7 @@ def test_multiscale_encoder_causal_ordering():
     """MultiScaleOrthrusEncoder should query history before inserting current events."""
     device = "cpu"
     max_node_num = 5
-    tau_short_ns, tau_medium_ns, tau_max_ns = log_seconds_boundaries_to_ns([0.50, 0.90, 0.99])
+    tau_short_ns, tau_medium_ns, tau_max_ns = seconds_boundaries_to_ns([0.50, 0.90, 0.99])
     history_store = HistoryStore(num_nodes=max_node_num, candidate_capacity=16, device="cpu")
     neighbor_loader = MultiScaleNeighborLoader(
         history_store=history_store,
@@ -537,7 +539,7 @@ def test_multiscale_encoder_backward_pass():
     """MultiScaleOrthrusEncoder should support backward pass with finite gradients."""
     device = "cpu"
     max_node_num = 5
-    tau_short_ns, tau_medium_ns, tau_max_ns = log_seconds_boundaries_to_ns([0.50, 0.90, 0.99])
+    tau_short_ns, tau_medium_ns, tau_max_ns = seconds_boundaries_to_ns([0.50, 0.90, 0.99])
     history_store = HistoryStore(num_nodes=max_node_num, candidate_capacity=16, device="cpu")
     neighbor_loader = MultiScaleNeighborLoader(
         history_store=history_store,
@@ -601,7 +603,7 @@ def test_mstc_orthrus_multiscale_end_to_end_training():
 
     device = "cpu"
     max_node_num = 10
-    tau_short_ns, tau_medium_ns, tau_max_ns = log_seconds_boundaries_to_ns([0.50, 0.90, 0.99])
+    tau_short_ns, tau_medium_ns, tau_max_ns = seconds_boundaries_to_ns([0.50, 0.90, 0.99])
     history_store = HistoryStore(num_nodes=max_node_num, candidate_capacity=16, device="cpu")
     neighbor_loader = MultiScaleNeighborLoader(
         history_store=history_store,
@@ -687,7 +689,7 @@ def test_gate_weights_accessible_after_forward():
     """MultiScaleOrthrusEncoder should store gate weights after forward."""
     device = "cpu"
     max_node_num = 5
-    tau_short_ns, tau_medium_ns, tau_max_ns = log_seconds_boundaries_to_ns([0.50, 0.90, 0.99])
+    tau_short_ns, tau_medium_ns, tau_max_ns = seconds_boundaries_to_ns([0.50, 0.90, 0.99])
     history_store = HistoryStore(num_nodes=max_node_num, candidate_capacity=16, device="cpu")
     neighbor_loader = MultiScaleNeighborLoader(
         history_store=history_store,
@@ -758,7 +760,7 @@ def test_history_state_dict_roundtrip():
     """MultiScaleOrthrusEncoder should support history_state_dict roundtrip."""
     device = "cpu"
     max_node_num = 5
-    tau_short_ns, tau_medium_ns, tau_max_ns = log_seconds_boundaries_to_ns([0.50, 0.90, 0.99])
+    tau_short_ns, tau_medium_ns, tau_max_ns = seconds_boundaries_to_ns([0.50, 0.90, 0.99])
     history_store = HistoryStore(num_nodes=max_node_num, candidate_capacity=16, device="cpu")
     neighbor_loader = MultiScaleNeighborLoader(
         history_store=history_store,
@@ -837,7 +839,7 @@ def test_multiscale_encoder_equal_fusion_synthetic_end_to_end():
 
     device = "cpu"
     max_node_num = 10
-    tau_short_ns, tau_medium_ns, tau_max_ns = log_seconds_boundaries_to_ns([0.50, 0.90, 0.99])
+    tau_short_ns, tau_medium_ns, tau_max_ns = seconds_boundaries_to_ns([0.50, 0.90, 0.99])
     history_store = HistoryStore(num_nodes=max_node_num, candidate_capacity=16, device="cpu")
     neighbor_loader = MultiScaleNeighborLoader(
         history_store=history_store,
@@ -904,7 +906,7 @@ def test_equal_fusion_weights_in_synthetic_forward():
     """In synthetic pipeline, equal fusion produces correct weights per valid mask."""
     device = "cpu"
     max_node_num = 10
-    tau_short_ns, tau_medium_ns, tau_max_ns = log_seconds_boundaries_to_ns([0.50, 0.90, 0.99])
+    tau_short_ns, tau_medium_ns, tau_max_ns = seconds_boundaries_to_ns([0.50, 0.90, 0.99])
     history_store = HistoryStore(num_nodes=max_node_num, candidate_capacity=16, device="cpu")
     neighbor_loader = MultiScaleNeighborLoader(
         history_store=history_store,

@@ -327,3 +327,293 @@ class MultiScaleOrthrusEncoder(nn.Module):
 
     def get_last_scale_mask(self) -> Optional[Tensor]:
         return None if self.last_scale_mask is None else self.last_scale_mask.clone()
+
+
+# ------------------------------------------------------------------
+# SingleWindowOrthrusEncoder
+# ------------------------------------------------------------------
+class SingleWindowOrthrusEncoder(nn.Module):
+    """
+    Single-window Orthrus encoder for ablation experiments.
+
+    Uses a single time window (0, tau_window_ns] instead of three scales.
+    This is designed for the single-window-24 ablation where we want to
+    test a simple Q99 window without the multi-scale complexity.
+
+    Parameters
+    ----------
+    shared_graph_encoder
+        The underlying graph encoder (GraphTransformer or GraphSAGE).
+    neighbor_loader
+        SingleWindowNeighborLoader instance.
+    in_dim
+        Input feature dimension.
+    temporal_dim
+        Temporal embedding dimension.
+    node_out_dim
+        Output dimension per node.
+    use_node_feats_in_gnn
+        Whether to use node features in the GNN.
+    edge_features
+        List of edge feature types to use.
+    device
+        Device for computation.
+    gate_hidden_dim
+        Hidden dimension for the fusion gate MLP.
+    fusion
+        Fusion strategy: "gated" or "equal".
+    """
+
+    def __init__(
+        self,
+        shared_graph_encoder: Optional[nn.Module] = None,
+        neighbor_loader: Any = None,
+        in_dim: Optional[int] = None,
+        temporal_dim: Optional[int] = None,
+        node_out_dim: Optional[int] = None,
+        use_node_feats_in_gnn: bool = True,
+        edge_features: Sequence[str] | str = ("edge_type", "msg"),
+        device: str | torch.device = "cpu",
+        gate_hidden_dim: int = 64,
+        encoder: Optional[nn.Module] = None,
+        fusion: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        if shared_graph_encoder is None:
+            shared_graph_encoder = encoder
+        if shared_graph_encoder is None:
+            raise ValueError("shared_graph_encoder is required")
+        if neighbor_loader is None:
+            raise ValueError("neighbor_loader is required")
+        if in_dim is None or temporal_dim is None or node_out_dim is None:
+            raise ValueError("in_dim, temporal_dim, and node_out_dim are required")
+        if gate_hidden_dim <= 0:
+            raise ValueError("gate_hidden_dim must be positive")
+
+        self.shared_graph_encoder = shared_graph_encoder
+        self.neighbor_loader = neighbor_loader
+        self.device = torch.device(device)
+        self.in_dim = int(in_dim)
+        self.temporal_dim = int(temporal_dim)
+        self.node_out_dim = int(node_out_dim)
+        self.use_node_feats_in_gnn = bool(use_node_feats_in_gnn)
+        self.requires_global_event_index = True  # Capability flag for factory/model
+        if isinstance(edge_features, str):
+            edge_features = edge_features.split(",")
+        self.edge_features = tuple(feature.strip() for feature in edge_features)
+
+        self.src_linear = nn.Linear(self.in_dim, self.temporal_dim)
+        self.dst_linear = nn.Linear(self.in_dim, self.temporal_dim)
+        self.current_src_out_proj = nn.Linear(self.temporal_dim, self.node_out_dim)
+        self.current_dst_out_proj = nn.Linear(self.temporal_dim, self.node_out_dim)
+
+        self.fusion = str(fusion).strip().lower() if fusion is not None else "equal"
+        if self.fusion not in ("equal",):
+            # Single-window only supports equal fusion (all neighbors equally weighted)
+            self.fusion = "equal"
+
+        self.last_scale_mask: Optional[Tensor] = None
+
+    def _module_device(self) -> torch.device:
+        return next(self.parameters()).device
+
+    @staticmethod
+    def _full_values(full_data: Any, field: str, event_ids: Tensor, device: torch.device) -> Tensor:
+        if not hasattr(full_data, field):
+            raise ValueError(f"full_data is missing required field '{field}'")
+        if hasattr(full_data, "get_event_values"):
+            return full_data.get_event_values(field, event_ids).to(device)
+        values = getattr(full_data, field)
+        return values.cpu()[event_ids.cpu()].to(device)
+
+    def _edge_features(self, full_data: Any, event_ids: Tensor, device: torch.device) -> Optional[Tensor]:
+        parts = []
+        for feature in self.edge_features:
+            if feature in ("", "none"):
+                continue
+            if feature not in ("edge_type", "msg"):
+                raise ValueError(f"Unsupported edge feature '{feature}'")
+            parts.append(self._full_values(full_data, feature, event_ids, device))
+        return torch.cat(parts, dim=-1) if parts else None
+
+    def _historical_node_features(
+        self, full_data: Any, event_ids: Tensor, device: torch.device
+    ) -> tuple[Tensor, Tensor]:
+        if hasattr(full_data, "x_src") and hasattr(full_data, "x_dst"):
+            return (
+                self._full_values(full_data, "x_src", event_ids, device),
+                self._full_values(full_data, "x_dst", event_ids, device),
+            )
+        if not hasattr(full_data, "msg"):
+            raise ValueError("full_data must provide x_src/x_dst or msg for historical nodes")
+        message = self._full_values(full_data, "msg", event_ids, device)
+        if message.ndim != 2 or message.size(-1) < 2 * self.in_dim:
+            raise ValueError(
+                "full_data.msg must contain source and destination node features "
+                f"with at least {2 * self.in_dim} columns"
+            )
+        return message[:, :self.in_dim], message[:, self.in_dim:2 * self.in_dim]
+
+    def _scan_window(
+        self,
+        sampled: Dict[str, Tensor],
+        full_data: Any,
+        device: torch.device,
+    ) -> list[tuple[int, int, int, int]]:
+        event_ids = sampled["window_event_id"].cpu()
+        neighbors = sampled["window_neighbor_id"].cpu()
+        directions = sampled["window_direction"].cpu()
+        masks = sampled["window_mask"].cpu()
+        query_nodes = sampled["query_nodes"].cpu()
+        records: list[tuple[int, int, int, int]] = []
+        seen_event_ids: set[int] = set()
+
+        for q_idx in range(event_ids.size(0)):
+            for slot in range(event_ids.size(1)):
+                if not bool(masks[q_idx, slot]):
+                    continue
+                event_id = int(event_ids[q_idx, slot])
+                if event_id == -1 or event_id in seen_event_ids:
+                    continue
+                direction = int(directions[q_idx, slot])
+                if direction not in (0, 1):
+                    raise ValueError(f"history direction must be 0 or 1, got {direction}")
+                query = int(query_nodes[q_idx])
+                neighbor = int(neighbors[q_idx, slot])
+                full_src = int(self._full_values(full_data, "src", torch.tensor([event_id]), device)[0])
+                full_dst = int(self._full_values(full_data, "dst", torch.tensor([event_id]), device)[0])
+                full_timestamp = int(self._full_values(full_data, "t", torch.tensor([event_id]), device)[0])
+                sampled_timestamp = int(sampled["window_timestamp_ns"].cpu()[q_idx, slot])
+                expected_src = query if direction == 0 else neighbor
+                expected_dst = neighbor if direction == 0 else query
+                if (full_src, full_dst) != (expected_src, expected_dst):
+                    raise ValueError("history direction and full_data edge endpoints disagree")
+                if full_timestamp != sampled_timestamp:
+                    raise ValueError("history timestamp and full_data timestamp disagree")
+                seen_event_ids.add(event_id)
+                records.append((event_id, query, neighbor, direction))
+        return records
+
+    def _encode_window(
+        self,
+        sampled: Dict[str, Tensor],
+        current_src_hidden: Tensor,
+        current_dst_hidden: Tensor,
+        current_src_out: Tensor,
+        current_dst_out: Tensor,
+        full_data: Any,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        records = self._scan_window(sampled, full_data, device)
+        query_nodes = sampled["query_nodes"].to(device).long()
+        src_indices = sampled["src_query_index"].to(device).long()
+        dst_indices = sampled["dst_query_index"].to(device).long()
+        src_query_nodes = query_nodes[src_indices]
+        dst_query_nodes = query_nodes[dst_indices]
+        batch_size = current_src_hidden.size(0)
+        has_history = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        for _, query, neighbor, direction in records:
+            if direction == 0:
+                has_history |= src_query_nodes == query
+            else:
+                has_history |= dst_query_nodes == query
+
+        if not records:
+            return current_src_out, current_dst_out, has_history
+
+        event_ids = torch.tensor([record[0] for record in records], dtype=torch.long, device=device)
+        edge_src_global = torch.tensor(
+            [query if direction == 0 else neighbor for _, query, neighbor, direction in records],
+            dtype=torch.long,
+            device=device,
+        )
+        edge_dst_global = torch.tensor(
+            [neighbor if direction == 0 else query for _, query, neighbor, direction in records],
+            dtype=torch.long,
+            device=device,
+        )
+        node_ids = torch.cat([query_nodes, edge_src_global, edge_dst_global]).unique(sorted=True)
+        node_to_local = {int(node): index for index, node in enumerate(node_ids.cpu().tolist())}
+        local_src = torch.tensor([node_to_local[int(node)] for node in edge_src_global.cpu()], dtype=torch.long, device=device)
+        local_dst = torch.tensor([node_to_local[int(node)] for node in edge_dst_global.cpu()], dtype=torch.long, device=device)
+        edge_index = torch.stack([local_src, local_dst])
+
+        node_src_hidden = torch.zeros((node_ids.numel(), self.temporal_dim), dtype=current_src_hidden.dtype, device=device)
+        node_dst_hidden = torch.zeros_like(node_src_hidden)
+        historical_src, historical_dst = self._historical_node_features(full_data, event_ids, device)
+        for row, (edge_src, edge_dst) in enumerate(zip(edge_src_global.tolist(), edge_dst_global.tolist())):
+            node_src_hidden[node_to_local[edge_src]] = self.src_linear(historical_src[row])
+            node_dst_hidden[node_to_local[edge_dst]] = self.dst_linear(historical_dst[row])
+
+        for batch_index in range(batch_size):
+            node_src_hidden[node_to_local[int(src_query_nodes[batch_index])]] = current_src_hidden[batch_index]
+            node_dst_hidden[node_to_local[int(dst_query_nodes[batch_index])]] = current_dst_hidden[batch_index]
+        node_features = node_src_hidden + node_dst_hidden
+
+        encoded = self.shared_graph_encoder(
+            node_features,
+            edge_index,
+            edge_feats=self._edge_features(full_data, event_ids, device),
+        )
+        src_local = torch.tensor([node_to_local[int(node)] for node in src_query_nodes], dtype=torch.long, device=device)
+        dst_local = torch.tensor([node_to_local[int(node)] for node in dst_query_nodes], dtype=torch.long, device=device)
+        encoded_src = encoded[src_local]
+        encoded_dst = encoded[dst_local]
+
+        # For single-window: use equal fusion (average of neighbors)
+        # If no history, fall back to current features
+        encoded_src = torch.where(has_history.unsqueeze(-1), encoded_src, current_src_out)
+        encoded_dst = torch.where(has_history.unsqueeze(-1), encoded_dst, current_dst_out)
+
+        return encoded_src, encoded_dst, has_history
+
+    def forward(self, edge_index, t, msg, x, full_data, inference=False, **kwargs) -> tuple[Tensor, Tensor]:
+        del msg, inference
+        global_event_index = kwargs.get("global_event_index")
+        if global_event_index is None:
+            raise ValueError("global_event_index is required")
+        src, dst = edge_index
+        batch_size = src.numel()
+        if not isinstance(global_event_index, Tensor):
+            raise ValueError("global_event_index must be a Tensor")
+        if global_event_index.dtype != torch.long:
+            raise ValueError("global_event_index must have dtype torch.long")
+        if global_event_index.ndim != 1:
+            raise ValueError("global_event_index must be one-dimensional")
+        if global_event_index.numel() != batch_size:
+            raise ValueError("global_event_index length must equal batch size")
+
+        device = self._module_device()
+        src, dst, t = src.to(device), dst.to(device), t.to(device)
+        x_src, x_dst = x
+        if x_src.size(0) != batch_size:
+            x_src, x_dst = x_src[edge_index[0]], x_dst[edge_index[1]]
+        x_src, x_dst = x_src.to(device), x_dst.to(device)
+        current_src_hidden = self.src_linear(x_src) if self.use_node_feats_in_gnn else self.src_linear(torch.zeros_like(x_src))
+        current_dst_hidden = self.dst_linear(x_dst) if self.use_node_feats_in_gnn else self.dst_linear(torch.zeros_like(x_dst))
+        current_src_out = self.current_src_out_proj(current_src_hidden)
+        current_dst_out = self.current_dst_out_proj(current_dst_hidden)
+
+        sampled = self.neighbor_loader(src, dst, timestamp_ns=t)
+        encoded_src, encoded_dst, has_history = self._encode_window(
+            sampled, current_src_hidden, current_dst_hidden,
+            current_src_out, current_dst_out, full_data, device,
+        )
+
+        self.last_scale_mask = has_history.unsqueeze(-1)
+        self.neighbor_loader.insert(src, dst, timestamp_ns=t, global_event_index=global_event_index)
+        return encoded_src, encoded_dst
+
+    def reset_state(self) -> None:
+        self.neighbor_loader.reset_state()
+        self.last_scale_mask = None
+
+    def history_state_dict(self) -> Dict[str, Tensor]:
+        return self.neighbor_loader.history_state_dict()
+
+    def load_history_state_dict(self, state: Dict[str, Tensor]) -> None:
+        self.neighbor_loader.load_history_state_dict(state)
+
+    def get_last_scale_mask(self) -> Optional[Tensor]:
+        return None if self.last_scale_mask is None else self.last_scale_mask.clone()

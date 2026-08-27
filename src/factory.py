@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mstc.time_gap import TimeGapStatistics
-from mstc.history_store import HistoryStore
-from mstc.multiscale_sampler import MultiScaleNeighborLoader
-from mstc.multiscale_encoder import MultiScaleOrthrusEncoder
+from src.mstc.time_gap import TimeGapStatistics
+from src.mstc.history_store import HistoryStore
+from src.mstc.multiscale_sampler import MultiScaleNeighborLoader, SingleWindowNeighborLoader
+from src.mstc.multiscale_encoder import MultiScaleOrthrusEncoder, SingleWindowOrthrusEncoder
 
 from provnet_utils import *
 from config import *
@@ -234,8 +234,57 @@ def encoder_factory(cfg, msg_dim, in_dim, edge_dim, graph_reindexer, device, max
             fusion=str(ms_cfg.fusion).strip().lower() if hasattr(ms_cfg, "fusion") else "gated",
         )
 
+    elif mode == "single_window":
+        # Single-window mode: uses Q99 as upper bound, max 24 neighbors
+        # This is for ablation experiments, not the canonical multi-scale
+        if not multiscale_enabled:
+            raise ValueError("context.mode=single_window requires multiscale.enabled=True")
+        ms_cfg = context_mode.multiscale
+
+        # Get Q99 from scale_boundaries_seconds (third quantile)
+        scale_bounds = getattr(time_gap_statistics, "scale_boundaries_seconds", None)
+        if scale_bounds is None:
+            scale_bounds = getattr(time_gap_statistics, "scale_boundaries", None)
+        if not scale_bounds:
+            raise ValueError(
+                "context.mode=single_window requires fitted TimeGapStatistics "
+                "from the training split"
+            )
+        # Q99 is the third boundary (index 2)
+        if len(scale_bounds) < 3:
+            raise ValueError(
+                "context.mode=single_window requires scale_quantiles with at least 3 values (Q50, Q90, Q99)"
+            )
+        tau_window_ns = round(scale_bounds[2] * 1_000_000_000)  # Q99 in ns
+
+        # Get budget from neighbor_budgets[0] (short budget for single window)
+        budget = int(ms_cfg.neighbor_budgets[0]) if ms_cfg.neighbor_budgets else 24
+
+        history_store = HistoryStore(
+            num_nodes=max_node_num,
+            candidate_capacity=int(ms_cfg.candidate_capacity),
+            device=str(ms_cfg.history_device),
+        )
+        neighbor_loader = SingleWindowNeighborLoader(
+            history_store=history_store,
+            tau_window_ns=tau_window_ns,
+            budget=budget,
+        )
+        return SingleWindowOrthrusEncoder(
+            shared_graph_encoder=graph_encoder,
+            neighbor_loader=neighbor_loader,
+            in_dim=original_in_dim,
+            temporal_dim=temporal_dim,
+            node_out_dim=node_out_dim,
+            use_node_feats_in_gnn=use_node_feats_in_gnn,
+            edge_features=edge_features,
+            device=device,
+            gate_hidden_dim=int(ms_cfg.gate_hidden_dim),
+            fusion="equal",  # Single-window uses equal fusion
+        )
+
     else:
-        raise ValueError(f"Unknown context.mode: {mode!r}. Expected 'recent' or 'multiscale'.")
+        raise ValueError(f"Unknown context.mode: {mode!r}. Expected 'recent', 'multiscale', or 'single_window'.")
 
 def decoder_factory(cfg, in_dim, device, max_node_num):
     node_out_dim = cfg.detection.gnn_training.node_out_dim
@@ -291,8 +340,9 @@ def requires_time_gap_statistics(cfg) -> bool:
 
     encoder_cfg = getattr(training_cfg, "encoder", None)
     context_cfg = getattr(encoder_cfg, "context", None)
+    context_mode = getattr(context_cfg, "mode", None)
     multiscale_enabled = (
-        getattr(context_cfg, "mode", None) == "multiscale"
+        context_mode in ("multiscale", "single_window")
         and bool(getattr(getattr(context_cfg, "multiscale", None), "enabled", False))
     )
     return time_gap_enabled or multiscale_enabled

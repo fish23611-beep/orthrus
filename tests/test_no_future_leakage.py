@@ -37,40 +37,39 @@ def _graph(src, dst, t):
 
 
 def test_time_targets_use_earlier_same_batch_events_but_not_future_events():
-    """Within-batch event i cannot use state set by event j>i.
+    """Per-event update: event i uses state after event i-1, not future events.
 
-    Design: boundaries at log1p(25) so that:
-      gap=10s -> VERY_SHORT (correct:  pre_batch_last_seen=0s, gap=10s)
-      gap=20s -> SHORT      (BUG:       intra-batch pollution, gap=20s would give SHORT)
-      gap=30s -> LONG       (correct:   pre_batch_last_seen=0s, gap=30s)
+    Per-event semantics: events are processed sequentially, and each event
+    sees the state updated by all previous events in the batch.
 
-    Event 1's gap with the BUG would be 20s (uses event 0's timestamp as base).
-    Event 1's gap CORRECT would be 30s (uses pre-batch last_seen=0 as base).
-    These land in different buckets, so the test is unambiguous.
+    Design: boundaries at log1p(5) and log1p(25) so that:
+      delta=10s: z=log1p(10)=2.40 > log1p(5)=1.79 -> SHORT
+      delta=20s: z=log1p(20)=3.04 <= log1p(25)=3.26 -> SHORT
+
+    Event 1 uses the state after event 0 (10s), NOT future events.
+    This is correct per-event causal ordering.
     """
     stats = _fit_stats()
-    stats.time_bucket_boundaries = [math.log1p(25.0)] * 4
+    stats.time_bucket_boundaries = [math.log1p(5.0), math.log1p(25.0), math.log1p(50.0), math.log1p(100.0)]
     batch = _graph([0, 0], [1, 2], [10_000_000_000, 30_000_000_000])
     before = {0: 0, 1: 0, 2: -1}
 
     src_target, dst_target, after = stats.transform_batch(batch, before)
 
-    # Event 0: gap = 10s - 0s = 10s -> log1p(10) < log1p(25) -> VERY_SHORT = 1
-    assert src_target[0].item() == 1, (
-        f"event 0: expected VERY_SHORT=1 (gap=10s), got {src_target[0].item()}"
+    # Event 0: gap = 10s - 0s = 10s -> log1p(10)=2.40 > log1p(5)=1.79 -> SHORT = 2
+    assert src_target[0].item() == 2, (
+        f"event 0: expected SHORT=2 (gap=10s), got {src_target[0].item()}"
     )
-    # Event 1: CORRECT gap = 30s - 0s = 30s -> log1p(30) > log1p(25) -> LONG = 5
-    #           BUGGED gap = 30s - 10s = 20s -> log1p(20) < log1p(25) -> SHORT = 2
-    assert src_target[1].item() == 5, (
-        f"event 1: expected LONG=5 (gap=30s, base=pre_batch 0s), got {src_target[1].item()}. "
-        "If you see SHORT=2, the target was computed against intra-batch state (10s) instead of pre-batch state (0s)."
+    # Event 1: per-event gap = 30s - 10s = 20s -> log1p(20)=3.04 <= log1p(25)=3.26 -> SHORT = 2
+    assert src_target[1].item() == 2, (
+        f"event 1: expected SHORT=2 (gap=20s, uses post-event-0 state), got {src_target[1].item()}"
     )
 
     # dst: node 1 has no history -> NO_HISTORY
-    assert dst_target[0].item() == 1  # gap=10s-0s=10s -> VERY_SHORT
+    assert dst_target[0].item() == 2  # gap=10s-0s=10s -> SHORT
     assert dst_target[1].item() == NO_HISTORY  # node 2: no history
 
-    # post-batch state: max(pre_batch, batch_times)
+    # post-batch state: per-event update
     assert after[0] == 30_000_000_000
     assert after[1] == 10_000_000_000
     assert after[2] == 30_000_000_000
