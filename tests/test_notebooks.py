@@ -342,6 +342,19 @@ def test_master_notebook_has_all_switches():
         assert switch in source, f"Master Notebook must have {switch} switch"
 
 
+def test_master_notebook_uses_reduced_paper_core_groups():
+    source = _source(_read_notebook(NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME))
+
+    assert 'DATASETS = ["THEIA_E3", "THEIA_E5"]' in source
+    assert "SEEDS = [0, 1, 2]" in source
+    assert "backbone_graphsage_baseline.yml" in source
+    assert '"paper_core_ablation_training": ["ablation_no_multiscale.yml", "ablation_no_time.yml"]' in source
+    assert '"paper_core_backbone_training": ["backbone_graphsage.yml"]' in source
+    assert 'PAPER_CORE_POSTPROCESS = ["ablation_no_calibration.yml", "calibration_global_p.yml", "ablation_no_topk.yml"]' in source
+    assert "RUN_ARCHIVED_OPTIONAL = False" in source
+    assert "MAGIC pending external adapter/audit" in source
+
+
 def test_master_notebook_no_todo_placeholder():
     """Master Notebook must not contain TODO/FIXME/PLACEHOLDER."""
     master_path = NOTEBOOK_DIR / MASTER_NOTEBOOK_NAME

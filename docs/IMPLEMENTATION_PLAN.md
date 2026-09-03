@@ -11,15 +11,16 @@
 
 ## 0. 总览：修订后的 8 个逻辑阶段
 
-本规划已按最终论文减负方案统一：
+本规划已按最终论文减负方案统一。状态分类固定为：`paper_core`（当前主实验、核心消融、最小跨骨干）、`archived_optional`（能力保留但默认不运行）、`compatibility_only`（仅官方行为兼容）和 `future_extension`（当前范围外后续研究）：
 
-- 主结果：THEIA_E3 + THEIA_E5，4 个模型，3 seeds；
-- 完整消融：THEIA_E3，3 seeds；
-- 专项分析主要只在 THEIA_E3；
-- 删除 Host-network 三视图、跨 E3/E5 zero-shot/type_only、history device 对比、Top-k Sum 论文实验；
+- `paper_core` 主结果：THEIA_E3 + THEIA_E5，MAGIC / GraphSAGE / ORTHRUS-ano / MSTC-PIDS，3 seeds；
+- `paper_core` 核心消融：THEIA_E3，Full / w/o Multi-scale / w/o Time Prediction / w/o Calibration / Global Calibration / w/o Top-k，3 seeds；
+- `paper_core` 最小跨骨干：THEIA_E3，GraphTransformer + MSTC vs GraphSAGE + MSTC，3 seeds；
+- Semantic MLP、w/o Gate、详细 multi-scale/time/calibration/node-decision、Top-k sensitivity 与 efficiency 专项统一为 `archived_optional`，能力保留、默认不运行；
+- Host-network 三视图、跨 E3/E5 zero-shot/type_only、history device 对比、Top-k Sum 等退出当前论文默认矩阵，不据此删除已有能力；
 - `official_full_dataset` 与 `legacy_test_selection` 只保留兼容能力，不进入论文结果；
 - 6 个 Notebook 收敛为一个 All-in-One Notebook；
-- Top-k K 敏感性改成纯后处理，不再制造新的训练 config-id/checkpoint。
+- Top-k K 敏感性设计为纯后处理，不再制造新的训练 config-id/checkpoint；当前专用 runner/config 尚未实现，归为 `archived_optional` 待办。
 
 依赖：
 
@@ -36,7 +37,7 @@ C5 Multi-scale shared graph backbone
   ↓
 C6 Calibration + node aggregation
   ↓
-C7 GraphSAGE + Semantic MLP
+C7 GraphSAGE + Semantic MLP（后者保留为 archived_optional）
   ↓
 C8 Reduced matrix + All-in-One + analysis/export
 ```
@@ -173,12 +174,11 @@ experiment_identity:
 
 ```text
 ORTHRUS-ano
-Semantic MLP
 GraphSAGE
 MSTC-PIDS
 ```
 
-全部统一 `corpus_scope=train_only`。
+上述仓库内模型全部统一 `corpus_scope=train_only`。MAGIC 是第四个正式主表模型，但保留自身合理特征表示；它必须遵守相同数据范围、split、ground truth、信息使用边界和评价协议，不强制使用 ORTHRUS Word2Vec。
 
 不做 `official_full_dataset vs train_only` 论文对比实验。
 
@@ -316,7 +316,7 @@ Q99 不截断 long。
 ```text
 Recent-20       = latest 20, no time cutoff
 Recent-24       = latest 24, fair-budget control
-Single-window-24= delta <= Q99, latest 24
+Single-window-24= 0 < delta <= Q99, latest 24
 Equal-24        = 8+8+8, equal non-empty scale fusion
 Gated-24        = 8+8+8, learned masked gate
 ```
@@ -375,7 +375,7 @@ triplet(src_type, edge_type, dst_type)
 
 `min_triplet_samples=100 / min_type_pair_samples=200` 是预固定支持下限；报告 fallback rate，不做额外网格搜索。
 
-独立 `Relation Triplet Calibration` 对照固定为 `triplet support >=100 → triplet，否则 → global`，不使用 type-pair 回退；`Hierarchical` 才使用 `triplet → type_pair → global`。
+独立 `Relation Triplet Calibration` 对照固定为 `triplet support >=100 → triplet，否则 → global`，不使用 type-pair 回退；`Hierarchical` 才使用 `triplet → type_pair → global`。Relation Triplet 详细对照保留为 `archived_optional`；当前核心消融只保留 Global Calibration 与 Hierarchical Calibration 的最小对照。
 
 真实 `edge_type` 只用于模型输出后的 post-hoc conditioning，不作为当前事件模型输入。
 
@@ -388,9 +388,9 @@ aggregate(node_to_event_scores, method, topk)
 
 避免把 `include_dst` 放在映射已经完成之后。
 
-代码支持：`max / mean / topk_mean / topk_sum`；论文只比较前三者。
+代码支持：`max / mean / topk_mean / topk_sum`；当前核心消融仅比较 Full 的 `topk_mean` 与 `w/o Top-k` 的 `mean`，其他能力不删除。
 
-### Node decision
+### Node decision（详细研究为 `archived_optional`）
 
 ```text
 validation_quantile(0.999)
@@ -422,6 +422,17 @@ raw event score
 
 只去掉 calibration，不同时改变 threshold strategy；数值阈值必须基于该 ablation 自己的正常 validation node scores 重新计算。
 
+`Global Calibration`：
+
+```text
+复用 Full 的 raw event scores
+→ global empirical calibration
+→ node aggregation
+→ validation-based decision
+```
+
+不重新训练；用于回答性能提升是否只是来自任意 calibration，还是 hierarchical relation conditioning 本身有贡献。
+
 `w/o Top-k` 同理：聚合改为 `mean` 后，validation quantile 方法保持不变，但数值阈值必须基于 mean 聚合后的 validation node scores 重算，禁止复用 Full/K=5 阈值。
 
 ### 训练 checkpoint 边界
@@ -450,7 +461,7 @@ training checkpoint 只保存训练状态；calibrator/threshold/node prediction
 - 不读 edge_index/history；
 - 不进入 MultiScaleOrthrusEncoder；
 - 不使用 gate；
-- 主结果 `backbone_mlp.yml` 为 plain Semantic MLP：`decoder.time_gap.enabled=false`，只走 edge-type anomaly path；如启用 time head 只能作为额外诊断，不得替代主 baseline。
+- `backbone_mlp.yml` 为 plain Semantic MLP：`decoder.time_gap.enabled=false`，只走 edge-type anomaly path；实现、factory 路由、测试、runner/parser/exporter 支持和已有 artifacts 全部保留，但当前分类为 `archived_optional`，不进入主表。如启用 time head 只能作为额外诊断。
 
 因此删除旧计划“Semantic MLP 需要调整 gate 输入维度”的描述。
 
@@ -474,7 +485,7 @@ training checkpoint 只保存训练状态；calibrator/threshold/node prediction
 
 - `run_experiment.py`
 - `run_matrix.py`
-- `run_topk_sensitivity.py`
+- `run_topk_sensitivity.py`（`archived_optional` 设计合同；当前工作树不存在，本轮不重建）
 - `collect_results.py`
 - `export_tables.py`
 
@@ -482,54 +493,51 @@ training checkpoint 只保存训练状态；calibrator/threshold/node prediction
 
 ```text
 Datasets: THEIA_E3, THEIA_E5
-Models: Semantic MLP, GraphSAGE, ORTHRUS-ano (统一论文协议), MSTC-PIDS Full
+Models: MAGIC, GraphSAGE, ORTHRUS-ano (统一论文协议), MSTC-PIDS Full
 Seeds: 0,1,2
 ```
 
-全部 `corpus_scope=train_only`。其中 `ORTHRUS-ano` 指保持官方模型结构但采用统一论文协议的版本；官方整库语料/旧 test-based selection 仅为 compatibility-only。
+正式规模为 `2 datasets × 4 models × 3 seeds = 24 runs`。仓库内 GraphSAGE、ORTHRUS-ano、MSTC-PIDS 全部 `corpus_scope=train_only`；其中 `ORTHRUS-ano` 指保持官方模型结构但采用统一论文协议的版本。官方整库语料/旧 test-based selection 仅为 `compatibility_only`。
 
-主结果配置固定映射：
+当前仓库内配置固定映射：
 
 ```text
-Semantic MLP    → backbone_mlp.yml
 GraphSAGE       → backbone_graphsage_baseline.yml
 ORTHRUS-ano     → baseline.yml
 MSTC-PIDS Full  → mstc_full.yml
 ```
 
-`backbone_graphsage.yml` 仅用于 GraphSAGE + MSTC 跨骨干实验。
+`backbone_graphsage.yml` 仅用于 GraphSAGE + MSTC 跨骨干实验。`backbone_mlp.yml` 与 Semantic MLP 全链路能力保留为 `archived_optional`。
 
-### E3-only 实验
+MAGIC 已进入 `paper_core` 规划，但当前尚未真正接入、尚未运行、没有结果。本轮不下载、不实现临时 adapter、不生成占位结果。后续必须单独完成 source/dependency audit、data adapter、unified protocol adapter、leakage audit、evaluation integration、smoke test 和 formal runs。接入时统一数据范围、split、信息使用边界、ground truth 与评价协议，同时尽可能保留 MAGIC 自身模型结构、特征表示、训练目标和官方合理超参数；若官方流程依赖 test label 或 ground-truth threshold selection，必须显式适配。
 
-- 完整消融：3 seeds；
-- multi-scale detailed study：seed 0；
-- time-task detailed study：seed 0；
-- calibration / node-decision：3 seeds，复用事件分数；
-- GraphTransformer+MSTC vs GraphSAGE+MSTC：3 seeds；
-- efficiency：复用现有 runtime，不重新训练；
-- Top-k sensitivity：3 seeds，纯后处理。
+### `paper_core` E3-only 实验
+
+- 核心消融：Full / w/o Multi-scale / w/o Time Prediction / w/o Calibration / Global Calibration / w/o Top-k，3 seeds；
+- 最小跨骨干：GraphTransformer + MSTC vs GraphSAGE + MSTC，3 seeds。
+
+Multi-scale detailed、time-task detailed、完整 calibration/node-decision study、Top-k sensitivity 与 efficiency 专项保留为 `archived_optional`，默认不运行。Global Calibration 只进入核心消融，不另建庞大 calibration study。
 
 ### 训练/后处理复用映射
 
 ```text
-A0 ORTHRUS-ano             ← E3 主结果 ORTHRUS seeds 0/1/2
-A6 Full                     ← E3 主结果 MSTC Full seeds 0/1/2
-Recent-24                   ← A1 w/o Multi-scale seed 0（训练语义完全一致时）
-Equal-24                    ← A2 w/o Gate seed 0（训练语义完全一致时）
-Type-only                   ← A3 w/o Time seed 0（训练语义完全一致时）
-Gated-24 / Joint            ← A6 seed 0
-GraphTransformer + MSTC    ← 默认 Full 为 GraphTransformer 时复用 A6 seeds 0/1/2
+Full                        ← E3 主结果 MSTC Full seeds 0/1/2
+w/o Multi-scale             ← E3 独立训练 seeds 0/1/2
+w/o Time Prediction         ← E3 独立训练 seeds 0/1/2
+w/o Calibration             ← Full raw event scores，postprocess only
+Global Calibration          ← Full raw event scores；global calibration → aggregation → validation-based decision
+w/o Top-k                   ← Full calibrated event scores；mean aggregation → 基于自身 validation 分布重算 threshold
+GraphTransformer + MSTC    ← 复用 E3 Full seeds 0/1/2
 GraphSAGE + MSTC            ← 使用 backbone_graphsage.yml，独立 3 seeds（不能复用 plain GraphSAGE baseline）
-A4 w/o Calibration         ← A6 raw event scores，postprocess only
-A5 w/o Top-k               ← A6 calibrated event scores，postprocess only
-Calibration/Node Decision  ← A6 event scores；No Calibration=A4，Hierarchical/Validation-Quantile=A6，其余只重跑后处理
-Top-k sensitivity          ← A6 calibrated event scores；K=5 直接对应 Full
-Efficiency                 ← 对应已有 runtime.json
+Top-k sensitivity（optional）← Full calibrated event scores；每个 K 重算 validation threshold
+Efficiency（optional）      ← 对应已有 runtime.json
 ```
 
 如果训练语义存在额外差异则不得强行复用；先对齐配置或明确独立训练。运行器不得仅因 YAML 文件名不同就重复训练。
 
-### 删除的正式实验
+正式运行量必须按性质统计：主实验训练 24 runs；E3 Full 3 个源训练同时复用于消融 Full 和 GraphTransformer + MSTC；新增核心消融训练 6 runs；新增跨骨干训练 3 runs；纯后处理 9 runs（w/o Calibration、Global Calibration、w/o Top-k 各 3）。主实验之外真正新增训练为 9 runs。MAGIC 的 6 个计划 run 只有在后续真实接入并执行后才算完成。
+
+### 非 `paper_core` 实验
 
 ```text
 Host-network 3 views
@@ -538,11 +546,20 @@ history_device CPU vs CUDA
 Top-k Sum
 legacy_test_selection comparison
 official_full_dataset vs train_only
+Semantic MLP main result
+w/o Gate
+Recent-20 / Recent-24 / Single-window-24 / Equal-24 / Gated-24
+Type-only / Time-only / Joint detailed study
+validation quantile / max validation / KMeans detailed study
+Top-k sensitivity
+efficiency-only retraining
 ```
 
-### Top-k dedicated postprocess
+已有实现、配置、测试和 artifacts 不删除。上述详细能力属于 `archived_optional`；`legacy_test_selection` / `official_full_dataset` 属于 `compatibility_only`；auditd + Zeek、CALDERA、自建靶场、zero-shot、LLM 等属于 `future_extension`。
 
-`run_topk_sensitivity.py`：
+### Top-k dedicated postprocess（`archived_optional`，已设计未实现）
+
+当前工作树不存在 `src/experiments/run_topk_sensitivity.py` 和 `config/analysis/topk_sensitivity.yml`，因此不得声称该能力可运行或已有输出。后续若实现，`run_topk_sensitivity.py` 合同为：
 
 ```text
 source = existing mstc_full run
@@ -563,18 +580,13 @@ seeds = 0,1,2
 `export_tables.py` 分组：
 
 ```text
-main
-ablation
-multiscale_diagnostic
-time_diagnostic
-score_calibration
-node_decision
-backbone_generalization
-efficiency
-topk_sensitivity
+paper_core: main / ablation / backbone_generalization
+archived_optional: archived_experiments（Semantic MLP / w/o Gate） /
+                   multiscale_diagnostic / time_diagnostic / score_calibration /
+                   node_decision / efficiency
 ```
 
-论文表只用 mean±std；`best` 若保留只能标记 `debug_only`。
+正式论文表只用 mean±std；`best` 若保留只能标记 `debug_only`。Optional exporter 能力保留，但不得让默认 paper export 隐式触发 archived 实验。Top-k sensitivity 输出属于未来专用 runner，不由当前 `export_tables.py` 生成；Notebook 只能显示已经存在的对应 CSV。
 
 ### All-in-One Notebook
 
@@ -593,9 +605,9 @@ Sections：
 3 preprocess(optional)
 4 smoke
 5 main E3+E5
-6 ablation E3
-7 diagnostics E3
-8 topk postprocess
+6 core ablation E3
+7 backbone generalization E3
+8 archived optional experiments（默认不运行）
 9 evaluate/recovery
 10 collect
 11 paper export
@@ -635,6 +647,8 @@ number of layers
 | C5 | Q99 丢掉极长历史 | long 为 >Q90，Q99 不截断 |
 | C5 | GraphTransformer 硬编码 | shared configurable graph backbone |
 | C7/C8 | plain GraphSAGE 与 GraphSAGE+MSTC 配置混用 | baseline 与 MSTC config 分离：`backbone_graphsage_baseline.yml` / `backbone_graphsage.yml` |
+| C8 | 把 MAGIC 的规划误写成已接入/已有结果 | 适配、审计、smoke、正式运行逐项完成前必须标为 pending |
+| C8 | archived 实验被默认矩阵或导出隐式触发 | 默认只选择 main / ablation / backbone_generalization |
 | C6 | calibration/threshold 同时变化 | 分层实验，一次只改一层 |
 | C6 | include_dst 时机错误 | event→node 映射阶段生效 |
 | C8 | Top-k 变成重复训练 | dedicated postprocess，missing source 就 fail |
@@ -645,27 +659,28 @@ number of layers
 
 ## 验收对照
 
-1. E3/E5 主结果均完成，4 模型 × 3 seeds；
-2. 所有论文主模型统一 train-only semantic corpus；
+1. E3/E5 主结果固定为 MAGIC、GraphSAGE、ORTHRUS-ano、MSTC-PIDS，各 3 seeds；MAGIC 未完成后续适配前不得声称 24 runs 已完成；
+2. 仓库内主模型统一 train-only semantic corpus；MAGIC 统一数据/信息/评价边界但保留自身合理特征；
 3. baseline compatibility mode 与论文正式协议明确分离；
 4. exact time targets 与 encoder history 无状态混淆；
 5. score_raw 公式唯一；
 6. multi-scale long 不被 Q99 硬截断；
 7. GraphSAGE 能接 MSTC multi-scale/time/calibration；
-8. Semantic MLP 不进入 multi-scale/gate；
+8. Semantic MLP 不进入 multi-scale/gate，其实现和全链路支持保留为 `archived_optional`；
 9. calibration I/O 单一 owner；
-10. `w/o Calibration` 是单变量消融；
-11. Top-k sensitivity 不重新训练；
-12. per-K threshold 由各自 validation 分布计算；
-13. `topk_event_count_summary.csv` 可解释 K 退化；
+10. `w/o Calibration` 与 `Global Calibration` 均复用 Full raw scores，形成正确的单变量消融；
+11. Top-k sensitivity 设计合同保留为 `archived_optional`，限定为不重新训练；专用入口仍待实现；
+12. 若启用 Top-k sensitivity，per-K threshold 由各自 validation 分布计算；
+13. Top-k sensitivity 输出合同保留；当前 runner/config 缺失，不能声称 `topk_event_count_summary.csv` 生成能力已实现；
 14. 只保留一个 All-in-One Notebook；
-15. 不存在 Host-network/zero-shot 等已删除实验的正式配置；
+15. Host-network/zero-shot 等不进入正式默认矩阵；已有配置/能力不因本轮分类而删除；
 16. 正式 OOM 策略不静默改变模型语义；
 17. paper tables 只使用 mean±std，不挑 best seed；
 18. `global_event_index` 正式数据链唯一、稳定、batching 后保留；
 19. 新正式 run 的 config-id 能区分 temporal semantics，不与 legacy path-hash artifacts 静默碰撞；
 20. Single-window-24 使用 Q99 时间窗，正式 Long 不被 Q99 截断；
-21. `pytest -q` 全部通过。
+21. 核心消融与跨骨干严格复用 E3 Full，新增训练和纯后处理数量与本节统计一致；
+22. `pytest -q` 全部通过。
 
 ---
 
@@ -675,5 +690,7 @@ number of layers
 - 不研究跨 Engagement zero-shot；
 - 不研究网络语义三视图贡献；
 - 不做 calibration support threshold / node quantile 的大规模超参搜索；
-- multi-scale 和 time-task 的详细变体使用 E3 seed 0 作为诊断性分析，核心模块效应由 E3 3-seed 完整消融提供统计支撑；
-- E5 主要承担第二数据集主结果验证，不重复完整专项矩阵。
+- multi-scale、time-task、node-decision、Top-k sensitivity 等详细变体保留为 `archived_optional`，当前默认不运行；
+- 不为 efficiency 专门重训，只保留随正式 run 记录 runtime 的能力；
+- 跨骨干只做 E3 的 GraphTransformer + MSTC vs GraphSAGE + MSTC，不扩展 E5、更多骨干或超参数扫描；
+- E5 只承担第二数据集主结果验证，不重复核心消融或专项矩阵。

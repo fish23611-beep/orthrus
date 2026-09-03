@@ -17,8 +17,10 @@
 - 分层关系条件校准；
 - Top-k 节点聚合；
 - GraphTransformer 与 GraphSAGE 跨骨干验证；
-- Semantic MLP 简单语义基线；
+- MAGIC 外部完整 provenance-based intrusion detection baseline；
 - All-in-One Notebook 下的训练、测试、恢复、评估和结果汇总。
+
+当前论文定位为 SCI 三区规模小论文，正式证据链只保留三类 `paper_core` 实验：主实验、核心消融和最小跨骨干验证。Semantic MLP、详细专项分析及其他已经实现或设计的能力不删除，统一转为 `archived_optional`，默认不运行。
 
 本篇论文明确不实现、也不纳入实验矩阵：
 
@@ -37,18 +39,20 @@
 
 主要比较对象是：
 
-1. 统一论文协议下的 ORTHRUS-ano；
-2. Semantic MLP；
-3. GraphSAGE；
+1. MAGIC；
+2. GraphSAGE；
+3. 统一论文协议下的 ORTHRUS-ano；
 4. 完整 MSTC-PIDS。
+
+四者定位分别为：MAGIC 是外部完整 provenance-based intrusion detection baseline；GraphSAGE 是通用 GNN baseline；ORTHRUS-ano 是保持 ORTHRUS 主要模型结构和异常检测思想、但采用统一公平论文协议的最直接基础方法；MSTC-PIDS 是包含 Multi-scale temporal context、Time-gap auxiliary prediction、hierarchical relation-conditional calibration 和 Top-k node aggregation 的本文完整方法。
 
 为避免术语歧义：下文若简写为 `ORTHRUS-ano`，除非明确标注 `compatibility-only`，均指**保持官方 ORTHRUS 模型结构/异常检测逻辑，但统一采用本论文的数据与选择协议**（尤其是 `semantic_features.corpus_scope=train_only`、validation-based checkpoint selection 和统一 artifact contract）的版本。原仓库整库语料/旧 test-based selection 仅属于官方兼容复现，不得与论文主表中的 ORTHRUS-ano 混用。
 
 论文实验遵循以下总原则：
 
 - **主结果：THEIA_E3 与 THEIA_E5 都运行**；
-- **完整消融和专项分析：主要集中在 THEIA_E3**；
-- 主结果与完整消融默认使用 3 个随机种子 `0,1,2`，报告 `mean ± standard deviation`；
+- **核心消融和最小跨骨干：仅在 THEIA_E3 运行**；
+- 主结果、核心消融和最小跨骨干默认使用 3 个随机种子 `0,1,2`，报告 `mean ± standard deviation`；
 - 可直接复用已有事件级产物的后处理实验不得重新训练模型。
 
 ## 2. 总体开发原则
@@ -92,14 +96,16 @@ model:
 - 正常验证集；
 - 预先固定的配置。
 
-论文正式主结果中，所有模型必须统一使用：
+论文正式主结果中的仓库内模型必须统一使用：
 
 ```yaml
 semantic_features:
   corpus_scope: train_only
 ```
 
-包括 ORTHRUS-ano、Semantic MLP、GraphSAGE 和 MSTC-PIDS。不得让 baseline 使用 `official_full_dataset` 而 MSTC-PIDS 使用 `train_only`，否则比较不公平。
+包括 ORTHRUS-ano、GraphSAGE 和 MSTC-PIDS。不得让仓库内 baseline 使用 `official_full_dataset` 而 MSTC-PIDS 使用 `train_only`，否则比较不公平。
+
+MAGIC 后续接入时必须使用相同数据范围、train/validation/test split、ground truth 和最终评价协议，但应尽可能保留其自身模型结构、特征表示、训练目标与官方合理超参数；公平不等于强制 MAGIC 使用 ORTHRUS Word2Vec。
 
 `official_full_dataset` 仅作为官方 ORTHRUS 兼容/复现模式保留，必须明确标记为 compatibility-only，不得与 `train_only` 的论文主结果混入同一主表。
 
@@ -197,7 +203,6 @@ src/experiments/
     __init__.py
     run_experiment.py
     run_matrix.py
-    run_topk_sensitivity.py
     collect_results.py
     export_tables.py
 
@@ -217,20 +222,16 @@ config/experiments/
     time_type_only.yml
     time_time_only.yml
     time_joint.yml
-    calibration_none.yml
     calibration_global_p.yml
     calibration_relation.yml
     calibration_hierarchical.yml
-    threshold_quantile.yml
-    threshold_max_validation.yml
-    threshold_kmeans.yml
+    calibration_quantile.yml
+    calibration_max.yml
+    calibration_kmeans.yml
     backbone_graphtransformer.yml
     backbone_graphsage_baseline.yml
     backbone_graphsage.yml
     backbone_mlp.yml
-
-config/analysis/
-    topk_sensitivity.yml
 
 notebooks/
     ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb
@@ -251,6 +252,7 @@ tests/
 说明：
 
 - 不再为 `K=1/3/10/20` 创建独立训练配置；Top-k 敏感性通过专用后处理入口完成。
+- 截至本轮审计，`src/experiments/run_topk_sensitivity.py` 与 `config/analysis/topk_sensitivity.yml` 在当前工作树中不存在。它们作为 `archived_optional` 设计合同保留，但本轮不越界重建，也不得声称已有可运行入口。
 - 不再创建 `host_only.yml / host_network_structure.yml / host_network_full.yml`。
 - 不再维护 6 个互相独立的 Colab Notebook；All-in-One Notebook 是唯一正式 Notebook 入口。
 - `calibration_runner.py` 是校准 I/O 的唯一 owner；`calibration.py` 只保存算法类。
@@ -664,7 +666,7 @@ x_src[:, -3:]
 
 # 8. 阶段四：训练数据时间统计
 
-新增：
+原设计合同要求：
 
 ```text
 src/mstc/time_gap.py
@@ -1047,7 +1049,7 @@ long:
 
 每个尺度只保留该尺度中最近的 K 条边；不足 K 不重复填充；为空提供显式 mask。
 
-## 10.5 公平邻居预算
+## 10.5 公平邻居预算（`archived_optional` 详细研究能力）
 
 完整模型默认最大预算：
 
@@ -1055,7 +1057,7 @@ long:
 8 + 8 + 8 = 24
 ```
 
-专项比较定义固定为：
+以下详细比较能力完整保留，但当前小论文默认不运行：
 
 ```text
 Recent-20:
@@ -1258,14 +1260,14 @@ calibration:
 
 `100/200` 是预先固定的最小支持数，不依据 test 搜索最优值。本篇论文不额外增加这两个参数的网格扫描，但必须报告各层 fallback rate 和样本数分布。
 
-为了让 §17.5 的 `Relation Triplet Calibration` 与 `Hierarchical Relation Calibration` 成为单变量、可解释的对照，单独的 Relation Triplet 模式固定为：
+为保留后续补充实验能力，单独的 Relation Triplet 模式固定为：
 
 ```text
 triplet 支持数 >= 100 → triplet reference
 否则 → global reference
 ```
 
-Relation Triplet 模式**不使用 type-pair 中间回退层**；Hierarchical 模式相对于它的新增机制正是 `triplet → type_pair → global` 的分层回退。测试遇到 unseen triplet 时同样回退到 global，不允许报错或临时用 test 分布建参考。
+Relation Triplet 模式**不使用 type-pair 中间回退层**；Hierarchical 模式相对于它的新增机制正是 `triplet → type_pair → global` 的分层回退。测试遇到 unseen triplet 时同样回退到 global，不允许报错或临时用 test 分布建参考。Relation Triplet 详细对照归为 `archived_optional`；当前 `paper_core` 只在核心消融中保留 Global Calibration 与 Hierarchical Calibration 的最小对照。
 
 ## 11.2 经验 p 值
 
@@ -1354,7 +1356,7 @@ topk_mean
 topk_sum
 ```
 
-但本篇论文的聚合对照只比较：
+实现保留以下聚合能力：
 
 ```text
 mean
@@ -1362,9 +1364,9 @@ max
 topk_mean
 ```
 
-`topk_sum` 不进入论文实验矩阵。
+当前 `paper_core` 仅通过 `w/o Top-k` 比较 `mean` 与 Full 的 `topk_mean`；`max` 进入 `archived_optional` node-decision detailed study，`topk_sum` 不进入当前论文实验矩阵。
 
-## 12.1 Top-k 参数约束与敏感性分析
+## 12.1 Top-k 参数约束与敏感性分析（`archived_optional`）
 
 论文主模型预先固定：
 
@@ -1372,7 +1374,7 @@ topk_mean
 K = 5
 ```
 
-敏感性：
+敏感性能力完整保留、当前论文默认不运行：
 
 ```text
 K ∈ {1, 3, 5, 10, 20}
@@ -1386,6 +1388,8 @@ K ∈ {1, 3, 5, 10, 20}
 src/experiments/run_topk_sensitivity.py
 config/analysis/topk_sensitivity.yml
 ```
+
+当前工作树尚无上述两个文件，因此本节属于“已设计、未实现”的 `archived_optional` 能力；本轮只保留合同与已有 exporter/display 兼容，不新增入口或伪造产物。
 
 配置示例：
 
@@ -1448,7 +1452,7 @@ node_threshold:
 
 `0.999` 是预先固定的保守正常验证分位数，用于极端类别不平衡下控制告警量。本篇论文不再为该 quantile 做大规模参数搜索；正文应把它声明为 fixed operating point，而不是声称其为 test-optimal threshold。
 
-另外保留：
+另外保留以下 `archived_optional` 节点决策详细对照：
 
 ```text
 max_validation
@@ -1581,7 +1585,7 @@ backbone_graphsage.yml          = GraphSAGE + MSTC modules；用于 §17.6 跨�
 
 论文主结果中的“GraphSAGE”必须使用 `backbone_graphsage_baseline.yml`；不得拿 `GraphSAGE + MSTC` 配置冒充 plain GraphSAGE baseline。
 
-## 14.3 Semantic MLP
+## 14.3 Semantic MLP（`archived_optional`）
 
 新增简单基线：
 
@@ -1598,7 +1602,7 @@ concat(x_src, x_dst)
 
 不读取历史图，不进入 `MultiScaleOrthrusEncoder`，不使用 gate。
 
-论文主结果中的 `backbone_mlp.yml` 定义为 **plain Semantic MLP baseline**：只预测 edge type，`decoder.time_gap.enabled=false`，不启用 MSTC multi-scale/gate/time-task。若另做诊断可按配置启用 time head，但不得把该诊断配置当成主结果里的 Semantic MLP。
+`backbone_mlp.yml` 定义为 **plain Semantic MLP baseline**：只预测 edge type，`decoder.time_gap.enabled=false`，不启用 MSTC multi-scale/gate/time-task。Semantic MLP 已退出当前正式主表，但实现、配置、factory 路由、测试、runner/result parser/exporter 支持及已有 artifacts 必须保留；它仍可作为轻量语义诊断基线和后续补充实验能力。若另做诊断可按配置启用 time head，但不得把该诊断配置写成当前 `paper_core` 结果。
 
 MLP 只回答：
 
@@ -1658,14 +1662,23 @@ cross_domain:
 
 # 17. 精简后的实验配置矩阵
 
-总体原则：**两个数据集都做主实验；完整消融和专项分析主要集中在 THEIA_E3。**
+总体原则：**当前论文只用最少必要实验构成完整证据链。**统一使用以下状态：
+
+```text
+paper_core          = 当前 SCI 小论文的主实验、核心消融、最小跨骨干验证
+archived_optional   = 已实现或已设计，能力保留，但当前论文默认不运行
+compatibility_only  = 仅用于官方 ORTHRUS 行为兼容，不进入正式论文结果
+future_extension    = 当前论文范围外的后续研究方向
+```
+
+若代码暂时没有 `paper_status` 字段，先在文档、默认矩阵与导出分组明确状态，不为增加字段而重写 runner。
 
 ## 17.1 主结果：THEIA_E3 + THEIA_E5
 
 两个数据集都运行：
 
 ```text
-Semantic MLP
+MAGIC
 GraphSAGE
 ORTHRUS-ano
 MSTC-PIDS Full
@@ -1685,38 +1698,49 @@ MSTC-PIDS Full
 mean ± standard deviation
 ```
 
-所有模型统一：
+仓库内三个模型统一：
 
 ```yaml
 semantic_features:
   corpus_scope: train_only
 ```
 
-主结果配置映射固定为：
+当前仓库内配置映射固定为：
 
 ```text
-Semantic MLP    → backbone_mlp.yml
 GraphSAGE       → backbone_graphsage_baseline.yml
 ORTHRUS-ano     → baseline.yml
 MSTC-PIDS Full  → mstc_full.yml
 ```
 
-`backbone_graphsage.yml` 专用于 GraphSAGE + MSTC 的跨骨干实验，不属于主结果中的 plain GraphSAGE baseline。
+`backbone_graphsage.yml` 专用于 GraphSAGE + MSTC 的跨骨干实验，不属于主结果中的 plain GraphSAGE baseline；`backbone_mlp.yml` 继续保留，但属于 `archived_optional`，不进入当前主表。
 
 因此主结果共 `2 datasets × 4 models × 3 seeds = 24` 个模型运行，不再使用 5 seeds 扩大主矩阵。
 
-## 17.2 完整消融：仅 THEIA_E3
+### 17.1.1 MAGIC 外部基线适配状态与公平协议
+
+MAGIC 已进入 `paper_core` 主实验规划，但**本阶段仅规划，尚未接入、尚未运行、没有结果**。不得下载、clone、安装或修改 MAGIC，不得编写未经审计的临时 adapter，也不得构造或填写假结果。
+
+后续必须单独完成：source audit、dependency audit、data adapter、unified protocol adapter、leakage audit、evaluation integration、smoke test 和 formal runs。正式接入时必须满足：
+
+- THEIA_E3 / THEIA_E5 使用与其他模型相同的数据范围和 train/validation/test split；
+- Test 只做最终评价，不得使用 test label 选择 threshold、调参或选择模型；
+- 不得使用攻击标签训练 anomaly detector；
+- 使用本论文统一 ground truth 与最终评价指标；
+- 尽可能保留 MAGIC 自身模型结构、特征表示、训练目标与官方合理超参数，不强制使用 ORTHRUS Word2Vec；
+- 若官方实现依赖 ground-truth threshold selection 或其他违反协议的行为，必须显式审计和适配，不得静默沿用。
+
+## 17.2 `paper_core` 核心消融：仅 THEIA_E3
 
 运行 3 seeds：
 
 ```text
-A0 ORTHRUS-ano
-A1 Full w/o Multi-scale
-A2 Full w/o Adaptive Gate
-A3 Full w/o Time Prediction
-A4 Full w/o Conditional Calibration
-A5 Full w/o Top-k Aggregation
-A6 Full
+Full
+w/o Multi-scale
+w/o Time Prediction
+w/o Calibration
+Global Calibration
+w/o Top-k
 ```
 
 定义：
@@ -1725,30 +1749,37 @@ A6 Full
 w/o Multi-scale:
     使用 Recent-24，其他模块保持不变
 
-w/o Gate:
-    保留三尺度，对非空尺度等权平均
-
 w/o Time Prediction:
     关闭 `decoder.time_gap.enabled`（不实例化/不优化 TimeGap 预测头），
     lambda_time = 0，score_raw = loss_type；
     参数量统计也不得包含被关闭的 TimeGapDecoder
 
 w/o Calibration:
+    不重新训练，复用 Full 的 validation/test raw event scores；
     保留同一 topk_mean 与 validation_quantile 决策规则，
     仅把 score_calibrated 替换为 score_raw，避免同时改变校准和阈值策略
 
+Global Calibration:
+    不重新训练，复用 Full 的 validation/test raw event scores；
+    重新执行 global empirical calibration → node aggregation
+    → validation-based decision，与 Full 的 hierarchical relation conditioning
+    构成最小对照
+
 w/o Top-k:
+    不重新训练，复用 Full 的 calibrated event scores；
     保留同一 calibrated event score 和 validation_quantile 方法，
     节点聚合由 topk_mean(K=5) 改为 mean；
     数值阈值必须根据 mean 聚合后的正常 validation node scores 重新计算，
     禁止复用 Full/K=5 的数值阈值
 ```
 
-E5 不重复完整消融，E5 的作用是验证完整方法的跨数据集稳定性。
+E5 不重复核心消融，E5 的作用是验证完整方法的跨数据集稳定性。
 
-## 17.3 多尺度专项：仅 THEIA_E3，诊断性 1 seed
+`w/o Gate` 不再是当前小论文必须以 3 seeds 独立证明的核心创新点，归为 `archived_optional`。`ablation_no_gate.yml`、gate 实现、gate mask 逻辑、测试、result parser 与已有 artifacts 必须保留；Gate 仍可作为 Multi-scale fusion implementation 存在。
 
-使用 seed 0：
+## 17.3 多尺度详细研究（`archived_optional`）
+
+以下能力保留，当前论文默认不运行：
 
 ```text
 Recent-20
@@ -1758,7 +1789,7 @@ Multi-scale Equal-24
 Multi-scale Gated-24
 ```
 
-由于 §17.2 已用 3 seeds 验证“有/无多尺度”和“有/无门控”，本专项主要解释具体时间组织方式，不再对每个变体重复 3–5 seeds。
+未来若用于审稿补实验、rebuttal、supplementary、后续扩展论文或硕士论文，可在 THEIA_E3 使用预先声明的 seed；不得进入当前默认 `paper_core` 矩阵。
 
 报告：
 
@@ -1769,9 +1800,9 @@ Multi-scale Gated-24
 - short/medium/long empty ratio；
 - 仅对 Gated-24 报 gate weight distribution。
 
-## 17.4 时间任务专项：仅 THEIA_E3，诊断性 1 seed
+## 17.4 时间任务详细研究（`archived_optional`）
 
-使用 seed 0：
+以下能力保留，当前论文默认不运行：
 
 ```text
 Type-only
@@ -1785,7 +1816,7 @@ Joint
 lambda_time: 0.3
 ```
 
-仅做稳健性曲线：
+如后续需要，可做预先声明的稳健性曲线：
 
 ```text
 lambda_time ∈ {0.1, 0.3, 0.5, 1.0}
@@ -1793,9 +1824,9 @@ lambda_time ∈ {0.1, 0.3, 0.5, 1.0}
 
 该曲线不用于根据 test 重新选择 lambda，也不要求把曲线最佳值替换主模型的 0.3。
 
-## 17.5 校准与节点决策专项：仅 THEIA_E3
+## 17.5 校准与节点决策详细研究（`archived_optional`）
 
-不要把不同层次的方法混成一个榜单，拆成两组。
+以下完整专项能力保留，但当前论文默认不运行；Global Calibration 只通过 §17.2 的核心消融进入 `paper_core`，不再建立庞大的独立 calibration study。若以后启用，仍须把不同层次的方法拆成两组。
 
 ### A. Score Calibration（3 seeds，可复用 raw event scores）
 
@@ -1824,44 +1855,56 @@ ORTHRUS K-means
 
 这样每组实验只改变一层，避免把“校准”和“阈值”同时变化。
 
-## 17.6 跨骨干：仅 THEIA_E3
+## 17.6 `paper_core` 最小跨骨干：仅 THEIA_E3
 
 3 seeds：
 
 ```text
-GraphTransformer + MSTC modules
-GraphSAGE + MSTC modules
+GraphTransformer + MSTC
+GraphSAGE + MSTC
 ```
 
 Plain ORTHRUS-ano 和 plain GraphSAGE 已出现在主结果，不再另建重复专项运行。
 
-该实验回答：MSTC 的多尺度/时间/校准模块是否能跨图骨干工作。
+该实验回答：MSTC 的有效性是否只绑定于默认 GraphTransformer backbone。GraphTransformer + MSTC 的 3 seeds 必须直接复用 E3 主实验 Full；真正新增训练仅为 GraphSAGE + MSTC 的 seeds `0,1,2`，不得扩展到 E5、更多 backbone 或超参数扫描。
 
 ## 17.7 训练/后处理复用映射（硬约束）
 
 为避免同一配置重复训练，实验运行器必须优先复用以下已有 run；只有配置的训练语义实际不同才允许新增训练：
 
 ```text
-A0 ORTHRUS-ano                 ← 复用 E3 主结果 ORTHRUS-ano seeds 0/1/2
-A6 Full                         ← 复用 E3 主结果 MSTC-PIDS Full seeds 0/1/2
-A1 w/o Multi-scale             ← 与 Recent-24 训练语义一致时，Recent-24 复用 A1 seed 0
-A2 w/o Adaptive Gate           ← 与 Multi-scale Equal-24 训练语义一致时，Equal-24 复用 A2 seed 0
-A3 w/o Time Prediction         ← 与 Type-only 训练语义一致时，Type-only 复用 A3 seed 0
-Multi-scale Gated-24           ← 复用 A6 seed 0
-Joint                          ← 复用 A6 seed 0
-GraphTransformer + MSTC        ← 默认 Full backbone 为 GraphTransformer 时复用 A6 seeds 0/1/2
-A4 w/o Calibration             ← 不重新训练；复用 A6 raw event scores，仅重跑后处理
-A5 w/o Top-k                   ← 不重新训练；复用 A6 calibrated event scores，仅重跑节点聚合/阈值
-Calibration / Node Decision    ← 复用 A6 各 seed 的事件级产物；No Calibration=A4，Hierarchical/Validation-Quantile=A6，其他方法仅重跑后处理
-Top-k sensitivity              ← 复用 A6 各 seed 的 calibrated event scores；K=5 直接对应 Full 主配置
-Efficiency                     ← 复用对应 run 的 runtime.json
+Full                           ← 复用 E3 主结果 MSTC-PIDS Full seeds 0/1/2
+w/o Multi-scale                ← E3 独立训练 seeds 0/1/2
+w/o Time Prediction            ← E3 独立训练 seeds 0/1/2
+w/o Calibration                ← 复用 Full raw event scores，仅重跑后处理
+Global Calibration             ← 复用 Full raw event scores，仅重跑 global calibration、聚合与 validation-based decision
+w/o Top-k                      ← 复用 Full calibrated event scores，仅重跑 mean 聚合与该消融自己的 validation threshold
+GraphTransformer + MSTC        ← 复用 E3 Full seeds 0/1/2
+GraphSAGE + MSTC               ← 使用 backbone_graphsage.yml，E3 独立训练 seeds 0/1/2
+Top-k sensitivity（optional）  ← 复用 Full calibrated event scores；每个 K 单独重算 validation threshold
+Efficiency（optional）         ← 复用对应 run 的 runtime.json
 ```
 
 如果某一对配置除目标变量外仍存在其他训练差异，则不得强行复用；必须先报告差异并把它们对齐，或明确作为独立训练。运行器不得因为文件名不同就自动重复训练。
 
-## 17.8 效率
+## 17.8 正式训练量与后处理量
 
-不为了效率表重新训练。直接复用主结果和消融 run 的 `runtime.json`，汇总：
+必须区分表格实例与真正训练：
+
+```text
+主实验训练                    = 24 runs（2 datasets × 4 models × 3 seeds）
+从主实验复用的源训练          = E3 Full 3 runs
+复用产生的正式表格实例        = 消融 Full 3 + GraphTransformer+MSTC 3
+新增核心消融训练              = 6 runs（w/o Multi-scale 3 + w/o Time Prediction 3）
+新增跨骨干训练                = 3 runs（GraphSAGE+MSTC 3）
+纯后处理                      = 9 runs（w/o Calibration 3 + Global Calibration 3 + w/o Top-k 3）
+```
+
+因此主实验之外真正新增训练为 9 runs，而不是按消融/跨骨干表格行数乘 seeds。这里的 24 是正式规划规模；其中 MAGIC 相关 run 只有在后续适配、审计和真实执行后才算完成。
+
+## 17.9 效率（`archived_optional`）
+
+取消“为了 efficiency 专门重新训练”。正式实验运行时继续顺手记录 `runtime.json`、parameter count、training/test time、peak GPU/CPU memory 和 events/s；论文后续若需要再从已有 run 提取。
 
 ```text
 ORTHRUS-ano
@@ -1871,9 +1914,9 @@ MSTC-PIDS Full
 
 报告 parameter_count、train time、test time、peak memory、events/s。
 
-## 17.9 Top-k 参数敏感性：仅 THEIA_E3，纯后处理
+## 17.10 Top-k 参数敏感性（`archived_optional`，纯后处理）
 
-使用主结果中 MSTC-PIDS Full 的 seeds：
+设计保留、当前论文默认不运行；当前工作树没有专用 runner/config，若后续实现并启用，使用主结果中 MSTC-PIDS Full 的 seeds：
 
 ```text
 0, 1, 2
@@ -1901,9 +1944,9 @@ Attack Detection Rate
 
 同时输出 `num_events < K` 节点比例。
 
-## 17.10 明确删除的实验
+## 17.11 非 `paper_core` 实验分类
 
-本篇论文不再运行：
+下列能力不进入当前论文默认矩阵；若配置或代码已存在则保留，若不存在则不为本轮重建：
 
 ```text
 Host-only / Host + Network Structure / Host + Network Full
@@ -1912,9 +1955,19 @@ CPU vs CUDA history_device 对比
 Top-k Sum 对照
 legacy_test_selection 对照
 full-dataset Word2Vec vs train-only Word2Vec 对照
+Semantic MLP 主结果
+w/o Gate
+Recent-20 / Recent-24 / Single-window-24 / Equal-24 / Gated-24
+Type-only / Time-only / Joint 详细研究
+validation quantile / max validation / KMeans 节点决策详细研究
+Top-k sensitivity
+efficiency 专项
+attack reconstruction experiments
 ```
 
-其中 `legacy_test_selection` 和 `official_full_dataset` 只作为代码兼容模式保留，不进入论文表格。
+上述已实现或已设计的详细实验统一为 `archived_optional`。其中 `legacy_test_selection` 和 `official_full_dataset` 属于 `compatibility_only`，只保留官方 ORTHRUS 行为兼容，不能进入论文正式结果。
+
+`auditd + Zeek`、CALDERA、自建靶场、日志缺失实验、zero-shot/cross-engagement、LLM、对比学习和复杂图增强属于 `future_extension`。这些分类表示当前论文边界，不授权删除任何 YAML、Python、Notebook、测试、artifact 或已有实验能力。
 
 # 18. 案例分析输出
 
@@ -2083,19 +2136,20 @@ python src/experiments/run_experiment.py \
   --artifact-root "$ORTHRUS_ARTIFACT_ROOT"
 ```
 
-主实验矩阵：
+当前仓库内可执行的 `paper_core` 主实验子矩阵（不含尚未接入的 MAGIC）：
 
 ```bash
 python src/experiments/run_matrix.py \
   --datasets THEIA_E3,THEIA_E5 \
   --configs \
-    config/experiments/backbone_mlp.yml,\
     config/experiments/backbone_graphsage_baseline.yml,\
     config/experiments/baseline.yml,\
     config/experiments/mstc_full.yml \
   --seeds 0,1,2 \
   --artifact-root "$ORTHRUS_ARTIFACT_ROOT"
 ```
+
+这条命令只覆盖 18 个仓库内 run，不能被描述成完整 24-run 主实验已经完成。MAGIC 必须等后续独立适配通过审计后再接入默认 `paper_core` orchestration；当前不得创建占位结果或未经审计的配置/adapter。
 
 只训练：
 
@@ -2118,7 +2172,7 @@ python src/experiments/run_experiment.py \
   --checkpoint path/to/checkpoint
 ```
 
-Top-k 敏感性使用专用后处理入口，不通过训练矩阵：
+`archived_optional` Top-k 敏感性若后续完成专用入口，命令合同如下，不通过默认训练矩阵：
 
 ```bash
 python src/experiments/run_topk_sensitivity.py \
@@ -2129,7 +2183,7 @@ python src/experiments/run_topk_sensitivity.py \
   --artifact-root "$ORTHRUS_ARTIFACT_ROOT"
 ```
 
-该命令必须读取已有 `mstc_full` validation/test 事件级校准结果；若源产物不存在则明确报错，不允许静默启动重新训练。
+当前工作树尚不能执行该命令。未来入口必须读取已有 `mstc_full` validation/test 事件级校准结果；若源产物不存在则明确报错，不允许静默启动重新训练。
 
 # 21. All-in-One Notebook 要求
 
@@ -2150,9 +2204,9 @@ Section 2   数据与缓存完整性检查
 Section 3   Preprocess（可跳过）
 Section 4   Baseline smoke test
 Section 5   Main experiments：E3 + E5
-Section 6   Ablation：E3 only
-Section 7   Diagnostic studies：multi-scale / time / calibration / backbone
-Section 8   Top-k sensitivity：postprocess only
+Section 6   Core ablation：E3 only
+Section 7   Backbone generalization：E3 only
+Section 8   Archived optional experiments（默认不运行）
 Section 9   Evaluate-only / Recovery
 Section 10  Result collection
 Section 11  Paper artifact export
@@ -2166,7 +2220,7 @@ Section 11  Paper artifact export
 - evaluate-only；
 - 结果汇总；
 - 输出 `config_resolved.yml` 与环境信息；
-- Section 10/11 至少汇总 `main_results.csv`、`ablation_results.csv`、`score_calibration_results.csv`、`node_decision_results.csv`、`efficiency_results.csv`、`topk_sensitivity_results.csv` 和 `topk_event_count_summary.csv`。
+- Section 10/11 的正式导出重点为 `main_results.csv`、`ablation_results.csv` 和 `backbone_generalization_results.csv`；显式 optional 导出继续支持 `archived_optional_results.csv`（Semantic MLP / w/o Gate）、`multiscale_diagnostic`、`time_diagnostic`、`score_calibration`、`node_decision` 和 `efficiency`。若既有 artifacts 中已有 `topk_sensitivity_results.csv` / `topk_event_count_summary.csv`，Notebook 可显示，但当前 exporter 不生成它们，也不得默认触发相应实验。
 
 唯一正式 Notebook 固定为 `notebooks/ORTHRUS_MSTC_PIDS_AllInOne_Colab.ipynb`；不因为文档修订再复制或重命名出第二个“官方 Notebook”。
 
@@ -2291,25 +2345,25 @@ torch.testing.assert_close(..., atol=1e-6, rtol=1e-5)
 整个项目完成后必须满足：
 
 1. 原 ORTHRUS baseline 仍可运行；
-2. THEIA_E3 和 THEIA_E5 都能完成论文主结果流程；
-3. 主结果统一使用 `semantic_features.corpus_scope=train_only`；
+2. `paper_core` 主结果固定为 MAGIC、GraphSAGE、ORTHRUS-ano、MSTC-PIDS 在 THEIA_E3/E5 各 3 seeds；MAGIC 未完成外部适配前必须明确标为待实现，不能伪称流程已完成；
+3. 仓库内主结果统一使用 `semantic_features.corpus_scope=train_only`，MAGIC 遵守相同数据/信息/评价边界但保留自身合理特征；
 4. `official_full_dataset` 仅用于兼容复现并带 compatibility-only 标记；
 5. 已有 artifacts 时 train/test/evaluate 不强制需要 PostgreSQL；
 6. 时间 target 与 encoder history 使用分离状态，均无未来输入泄漏；
 7. `score_raw` 在所有代码路径中遵循 §9.2 唯一定义；
 8. 完整模型可在 GraphTransformer 上运行；
 9. MSTC 模块可在 GraphSAGE 上运行；
-10. Semantic MLP 不进入多尺度/门控路径；
+10. Semantic MLP 不进入多尺度/门控路径，其实现与配置完整保留为 `archived_optional`；
 11. 时间分位数仅由训练集生成，数据域明确；
 12. 校准分布仅由正常 validation 建立；
-13. calibration 与 threshold 对照实验分层，不混为同一变量；
-14. Top-k 敏感性只做后处理，不创建新的训练 checkpoint；
-15. 每个 K 根据自己的 validation node-score 重算 threshold；
-16. 输出 `topk_sensitivity_results.csv` 和 `topk_event_count_summary.csv`；
+13. 核心消融中的 Global Calibration 与 Full 的 Hierarchical Calibration 构成最小单变量对照；其他 calibration/threshold 详细研究为 `archived_optional`；
+14. Top-k 敏感性设计合同保留且限定为只做后处理、不创建新的训练 checkpoint；当前论文默认不运行，专用入口仍待实现；
+15. 若运行 Top-k 敏感性，每个 K 根据自己的 validation node-score 重算 threshold；
+16. Top-k sensitivity 的输出合同保留；当前专用 runner/config 缺失，不能声称已具备 `topk_sensitivity_results.csv` 和 `topk_event_count_summary.csv` 的生成能力；
 17. 输出事件级和节点级结果及完整 runtime/environment；
 18. All-in-One Notebook 是唯一正式 Notebook 入口；
 19. 正式 OOM 恢复不得静默改变 candidate capacity / neighbor budget / model dimension；
-20. 主结果和完整消融均可汇总 3 seeds 的 mean±std；
+20. 主结果、核心消融和最小跨骨干均可汇总 3 seeds 的 mean±std，并执行 §17.7 的训练复用；
 21. 不运行 Host-network 三视图、跨 E3/E5 zero-shot、history device 对比、Top-k Sum 对照；
 22. 不运行攻击重建也不会报错；
 23. `--run_from_training` 不会报未定义变量；
@@ -2381,7 +2435,7 @@ HierarchicalRelationCalibrator
 calibration_runner 独占 I/O
 经验 p 值 + leave-one-out
 NodeScoreAggregator
-mean/max/topk_mean 论文对照
+mean/max/topk_mean 能力保留；当前核心对照为 topk_mean vs mean
 validation threshold
 ```
 
@@ -2392,19 +2446,19 @@ validation threshold
 ```text
 GraphSAGE 接入 shared multi-scale backbone
 Semantic MLP 独立非图路径
+Semantic MLP 作为 archived_optional 保留
 跨骨干兼容测试
 ```
 
 ## Commit 8：精简实验矩阵 + All-in-One + 后处理分析
 
 ```text
-主结果：E3+E5，3 seeds
-完整消融：E3，3 seeds
-专项：E3
-run_topk_sensitivity.py
-结果汇总与 topk_event_count_summary
+paper_core 主结果：MAGIC/GraphSAGE/ORTHRUS-ano/MSTC-PIDS，E3+E5，3 seeds
+paper_core 核心消融：六项，E3，3 seeds，按复用规则避免重复训练
+paper_core 最小跨骨干：GraphTransformer+MSTC vs GraphSAGE+MSTC，E3，3 seeds
+详细专项保留为 archived_optional；run_topk_sensitivity.py 尚未实现，不在本轮重建
 单一 All-in-One Notebook
-paper artifacts 导出
+main/ablation/backbone_generalization paper artifacts 导出
 ```
 
 每个阶段完成后运行：

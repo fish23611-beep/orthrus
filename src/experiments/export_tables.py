@@ -6,11 +6,20 @@ from typing import Sequence
 SRC_ROOT=Path(__file__).resolve().parents[1]
 if str(SRC_ROOT) not in sys.path: sys.path.insert(0,str(SRC_ROOT))
 METRIC_DIRECTION={"Precision":"higher","Recall":"higher","F1":"higher","MCC":"higher","AUPRC":"higher","AUROC":"higher","Attack_Detection_Rate":"higher","Inspected_Nodes_per_Attack":"lower","train_events_per_second":"higher","test_events_per_second":"higher","TP":"higher","TN":"higher","FP":"lower","FN":"lower","FPR":"lower","FP_per_million":"lower","parameter_count":"lower","trainable_parameter_count":"lower","train_seconds_per_epoch_mean":"lower","total_train_seconds":"lower","test_seconds":"lower","train_peak_gpu_memory_mb":"lower","test_peak_gpu_memory_mb":"lower","train_peak_cpu_memory_mb":"lower","test_peak_cpu_memory_mb":"lower","peak_gpu_memory_mb":"lower","peak_cpu_memory_mb":"lower"}
-# C8-E authoritative matrix: main, A0--A6 ablations, calibration, and efficiency.
-MAIN={"backbone_mlp":"Semantic MLP","backbone_graphsage_baseline":"GraphSAGE","baseline":"ORTHRUS-ano / orthrus_baseline","mstc_full":"MSTC-PIDS Full"}
-ABLATION={"baseline":"A0 ORTHRUS","ablation_no_multiscale":"A1 w/o Multi-scale","ablation_no_gate":"A2 w/o Gate","ablation_no_time":"A3 w/o Time","ablation_no_calibration":"A4 w/o Calibration","ablation_no_topk":"A5 w/o Top-k","mstc_full":"A6 Full"}
-CALIBRATION={"calibration_max":"calibration_max","calibration_quantile":"calibration_quantile","calibration_kmeans":"calibration_kmeans","calibration_global_p":"calibration_global_p","calibration_relation":"calibration_relation","calibration_hierarchical":"calibration_hierarchical"}
-EFFICIENCY={"baseline":"ORTHRUS-ano / orthrus_baseline","efficiency_multiscale":"ORTHRUS + Multi-scale","efficiency_multiscale_time":"ORTHRUS + Multi-scale + Time-task","mstc_full":"MSTC-PIDS Full"}
+# The default paper export is deliberately limited to the three paper_core
+# groups.  MAGIC remains a planned external baseline: this mapping only
+# classifies a future audited ``magic`` result and never fabricates a row.
+MAIN={"magic":"MAGIC","backbone_graphsage_baseline":"GraphSAGE","baseline":"ORTHRUS-ano","mstc_full":"MSTC-PIDS Full"}
+ABLATION={"mstc_full":"Full","ablation_no_multiscale":"w/o Multi-scale","ablation_no_time":"w/o Time Prediction","ablation_no_calibration":"w/o Calibration","calibration_global_p":"Global Calibration","ablation_no_topk":"w/o Top-k"}
+BACKBONE_GENERALIZATION={"mstc_full":"GraphTransformer + MSTC","backbone_graphsage":"GraphSAGE + MSTC"}
+
+# Archived capabilities remain exportable only through an explicit flag.
+ARCHIVED_EXPERIMENTS={"backbone_mlp":"Semantic MLP","ablation_no_gate":"w/o Gate"}
+MULTISCALE_DIAGNOSTIC={"multiscale_recent20":"Recent-20","multiscale_recent24":"Recent-24","multiscale_single_window":"Single-window-24","multiscale_equal":"Equal-24","multiscale_gate":"Gated-24"}
+TIME_DIAGNOSTIC={"time_type_only":"Type-only","time_time_only":"Time-only","time_joint":"Joint"}
+SCORE_CALIBRATION={"ablation_no_calibration":"No Calibration","calibration_global_p":"Global Calibration","calibration_relation":"Relation Triplet Calibration","calibration_hierarchical":"Hierarchical Relation Calibration"}
+NODE_DECISION={"calibration_quantile":"Validation Quantile","calibration_max":"Max Validation","calibration_kmeans":"KMeans"}
+EFFICIENCY={"baseline":"ORTHRUS-ano","efficiency_multiscale":"ORTHRUS + Multi-scale","efficiency_multiscale_time":"ORTHRUS + Multi-scale + Time-task","mstc_full":"MSTC-PIDS Full"}
 BASE_FIELDS=["dataset","experiment","successful_seeds","failed_seeds","successful_seed_count","failed_seed_count"]
 OUT_FIELDS=BASE_FIELDS+[f"{m}_{s}" for m in METRIC_DIRECTION for s in ("mean","std","median","best","valid_n")]
 def num(value):
@@ -84,7 +93,10 @@ def write(path,rows):
   w=csv.DictWriter(f,fieldnames=OUT_FIELDS); w.writeheader(); w.writerows(rows); temp=Path(f.name)
  os.replace(temp,path)
 def main(argv:Sequence[str]|None=None):
- p=argparse.ArgumentParser(description="Export paper tables from all_runs.csv."); p.add_argument("--artifact-root",required=True); p.add_argument("--input",default=None); a=p.parse_args(argv); root=Path(a.artifact_root).expanduser().resolve(); rows=read_csv(Path(a.input).expanduser().resolve() if a.input else root/"results"/"all_runs.csv"); outputs={"main_results.csv":MAIN,"ablation_results.csv":ABLATION,"calibration_results.csv":CALIBRATION,"efficiency_results.csv":EFFICIENCY}
+ p=argparse.ArgumentParser(description="Export paper_core tables from all_runs.csv."); p.add_argument("--artifact-root",required=True); p.add_argument("--input",default=None); p.add_argument("--include-archived-optional",action="store_true",help="Also export archived diagnostic tables without running experiments."); a=p.parse_args(argv); root=Path(a.artifact_root).expanduser().resolve(); rows=read_csv(Path(a.input).expanduser().resolve() if a.input else root/"results"/"all_runs.csv")
+ outputs={"main_results.csv":MAIN,"ablation_results.csv":ABLATION,"backbone_generalization_results.csv":BACKBONE_GENERALIZATION}
+ if a.include_archived_optional:
+  outputs.update({"archived_optional_results.csv":ARCHIVED_EXPERIMENTS,"multiscale_diagnostic_results.csv":MULTISCALE_DIAGNOSTIC,"time_diagnostic_results.csv":TIME_DIAGNOSTIC,"score_calibration_results.csv":SCORE_CALIBRATION,"node_decision_results.csv":NODE_DECISION,"efficiency_results.csv":EFFICIENCY})
  for name,mapping in outputs.items(): write(root/"results"/name,aggregate(rows,mapping))
  return [root/"results"/name for name in outputs]
 if __name__=="__main__":
