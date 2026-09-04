@@ -1,9 +1,10 @@
 # MAGIC 外部基线统一协议实施计划
 
-状态：**PLAN ONLY / NOT IMPLEMENTED**
+状态：**PLAN ONLY / NOT IMPLEMENTED；M1/M2 CONTRACT FROZEN**
 前置审计：`docs/MAGIC_BASELINE_INTEGRATION_AUDIT.md`
 审计结论：**CONDITIONAL GO**
 锁定 upstream 候选：`FDUDSDE/MAGIC@aa0b647eea74b6faa0e52eb444370c4411a32cbe`
+M1/M2 冻结合同：`docs/MAGIC_BASELINE_ENVIRONMENT_CONTRACT.md`
 
 ## 0. 范围与硬边界
 
@@ -19,9 +20,9 @@
 
 依据：审计文档；这些是实施门禁。
 
-## 1. 待用户冻结的两个协议选择
+## 1. 已冻结的两个协议选择
 
-推荐默认值如下；未确认前不得进入 M9：
+以下选择已由 `docs/MAGIC_BASELINE_ENVIRONMENT_CONTRACT.md` 正式冻结；后续实现不得依据 test 结果改动：
 
 1. **Threshold**：`validation_quantile(q=0.999)`，只用 normal validation node scores，test 不参与；比较规则复用当前统一 threshold helper。
 2. **Causal graph/output**：以 canonical time window end 为推理 cutoff，snapshot 只含该 cutoff 以前允许的信息；每个 `(node_id, window)` 保存 raw MAGIC score；同一 node 跨窗口的正式 node score 用预注册、无标签的 `max` 归并。`max` 表示“一次显著异常即把该 entity 列为可疑”，但它是外围 output policy，不是 MAGIC 模型核心。
@@ -132,25 +133,29 @@ magic:
 
 该 YAML 不能伪装成 `baseline.yml`，不能继承出一个实际上由 ORTHRUS model factory 运行的模型。config-id 必须覆盖 upstream SHA、graph/input semantics、threshold、node merge 与重要 MAGIC hyperparameters；更改其中任一项应生成不同 artifact identity。上述只是计划示意，本轮未创建 YAML。依据：current `_config_id` contract + audit。
 
-## Phase M1 — source freeze
+## Phase M1 — source freeze（合同已冻结；实现未开始）
+
+**冻结状态**：M1 source contract 已冻结，见 `docs/MAGIC_BASELINE_ENVIRONMENT_CONTRACT.md`。这表示 official repository、完整 SHA、MIT license、非 paper-exact 边界和禁止浮动 upstream ref 已定稿；不表示 machine-readable manifest 或 backend 校验已经实现。
 
 - **修改什么**：实现 source manifest 校验；锁定 repository URL、full SHA、MIT license hash；构建阶段只接受该 SHA。
 - **不修改什么**：不 fork、不改 upstream GAT/GMAE/KNN 代码，不 vendor data/checkpoints。
 - **输入**：官方 URL、`aa0b647...`、LICENSE、README、requirements。
 - **输出**：machine-readable `source_manifest.json`；可复现的 read-only checkout/image layer。
 - **测试**：错误 URL/SHA/license hash fail-fast；dirty upstream checkout fail-fast；无 tag 时不得退回 `main` 浮动 ref。
-- **风险**：当前 SHA 晚于会议且无 paper tag；只能称“audited official HEAD”，不能称 paper-exact snapshot。
+- **风险**：当前 SHA 晚于会议且无 paper tag；只能称“audited official repository snapshot”，不能称 paper-exact snapshot。
 - **完成条件**：离线查看 artifact 即能确认 upstream 与 wrapper 身份，且项目工作树不含第三方源码。
 
-## Phase M2 — environment isolation
+## Phase M2 — environment isolation（合同已冻结；环境未创建）
 
-- **修改什么**：建立单独 container（推荐）或严格隔离 venv；锁 Python 3.8、Torch 1.12.1+cu116、DGL 1.0.0、sklearn 1.2.2，并补齐 NumPy/NetworkX/tqdm 的实际可运行锁版本。
+**冻结状态**：M2 environment/runtime contract 已冻结，见 `docs/MAGIC_BASELINE_ENVIRONMENT_CONTRACT.md`。本地仅用于 development/static/synthetic/CPU/artifact-contract tests；正式 MAGIC 目标为 user-owned Linux GPU server 上的 isolated Docker。当前未创建 Python 3.8 环境、未安装依赖、未构建容器，也未完成 import/GPU smoke。
+
+- **修改什么**：在 user-owned Linux GPU server 上建立独立 Docker container；锁 Python 3.8、Torch 1.12.1+cu116、DGL 1.0.0、sklearn 1.2.2，并补齐 NumPy/NetworkX/tqdm 的实际可运行锁版本。
 - **不修改什么**：不升级/降级 `/home` 当前 Python、Torch、PyG、sklearn；不改变 ORTHRUS image。
 - **输入**：M1 source manifest、upstream requirements、可用 CUDA/CPU runtime。
 - **输出**：image digest/lockfile、dependency inventory、import-only health report。
 - **测试**：CPU import smoke；若用 GPU，做 CUDA/DGL import 与 tiny tensor smoke；不加载 THEIA、不训练。
 - **风险**：旧 cu116 wheel 与 host driver、DGL wheel availability；requirements 漏依赖。
-- **完成条件**：隔离环境可导入所有 upstream modules，退出后当前 ORTHRUS 环境版本完全未变。
+- **完成条件**：独立 Docker 环境可导入所有 upstream modules，退出后当前 ORTHRUS/MSTC 环境版本完全未变。
 
 ## Phase M3 — THEIA input adapter
 
@@ -261,4 +266,4 @@ M1 → M2
 
 ## 7. 当前最近下一步
 
-先由用户审阅并确认两项协议选择：`validation_quantile(q=0.999)`，以及 `canonical window-end causal snapshot + max node merge`。确认后，后续独立任务只从 M1 source freeze 与 M2 environment isolation 开始；不得直接跳到 M9/M10。
+M1/M2 合同已冻结为 `validation_quantile(q=0.999)`、`canonical window-end causal snapshot + max node merge`，以及独立 Docker runtime 合同。经本分支人工审计后，下一步新建 `feat/magic-unified-adapter`，只进入 M3-M8 的本地适配实现；不得直接跳到 M9/M10。M3-M10 当前均未标记为完成。
