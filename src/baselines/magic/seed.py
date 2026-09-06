@@ -21,7 +21,7 @@ MAGIC Seed Control / Reproducibility Contract
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 import random
 import numpy as np
 
@@ -289,6 +289,7 @@ def set_deterministic_flags(
 def set_dgl_seed(
     seed: int,
     require_dgl: bool = True,
+    dgl_module: Optional[Any] = None,
 ) -> dict:
     """
     Set DGL RNG seed.
@@ -301,6 +302,8 @@ def set_dgl_seed(
         seed: Integer seed for DGL
         require_dgl: If True, raise ImportError when DGL unavailable;
                      If False, return degraded status
+        dgl_module: Optional already-loaded DGL module for a caller-owned
+                    lazy import boundary.
 
     Returns:
         Dict with DGL seed status
@@ -308,7 +311,8 @@ def set_dgl_seed(
     Raises:
         ImportError: If require_dgl=True and DGL is not available
     """
-    if not _DGL_AVAILABLE:
+    active_dgl = dgl_module if dgl_module is not None else dgl
+    if active_dgl is None:
         if require_dgl:
             raise ImportError(
                 "DGL is required for DGL seed setting but is not available. "
@@ -322,18 +326,18 @@ def set_dgl_seed(
         }
 
     # DGL 1.0.0+ has dgl.seed() function
-    if hasattr(dgl, "seed"):
-        dgl.seed(seed)
+    if hasattr(active_dgl, "seed"):
+        active_dgl.seed(seed)
 
     # Also try dgl.random.seed() which may be available
     dgl_random_seeded = False
-    if hasattr(dgl, "random") and hasattr(dgl.random, "seed"):
-        dgl.random.seed(seed)
+    if hasattr(active_dgl, "random") and hasattr(active_dgl.random, "seed"):
+        active_dgl.random.seed(seed)
         dgl_random_seeded = True
 
     return {
         "dgl_available": True,
-        "dgl_version": _DGL_VERSION,
+        "dgl_version": getattr(active_dgl, "__version__", _DGL_VERSION),
         "dgl_seed_set": True,
         "dgl_random_seed_set": dgl_random_seeded,
         "degraded": False,
@@ -513,14 +517,20 @@ class MagicSeedController:
         self.require_dgl = require_dgl
         self._manifest: Optional[ReproducibilityManifest] = None
 
-    def set_all_seeds(self) -> ReproducibilityManifest:
+    def set_all_seeds(
+        self,
+        dgl_module: Optional[Any] = None,
+    ) -> ReproducibilityManifest:
         """
         Set all RNG seeds and deterministic flags.
 
         Returns:
             ReproducibilityManifest with all seed states
         """
-        manifest = ReproducibilityManifest(seed=self.seed)
+        manifest = ReproducibilityManifest(
+            seed=self.seed,
+            require_dgl=self.require_dgl,
+        )
 
         # Python random
         set_python_random_seed(self.seed)
@@ -552,8 +562,15 @@ class MagicSeedController:
             manifest.add_warning("PyTorch not available - torch RNG not seeded")
 
         # DGL (optional)
-        if _DGL_AVAILABLE:
-            dgl_result = set_dgl_seed(self.seed, require_dgl=False)
+        active_dgl = dgl_module if dgl_module is not None else dgl
+        if active_dgl is not None:
+            dgl_result = set_dgl_seed(
+                self.seed,
+                require_dgl=False,
+                dgl_module=active_dgl,
+            )
+            manifest.dgl_available = True
+            manifest.dgl_version = dgl_result.get("dgl_version")
             manifest.dgl_seed_set = dgl_result["dgl_seed_set"]
             manifest.dgl_random_seed_set = dgl_result["dgl_random_seed_set"]
         elif self.require_dgl:

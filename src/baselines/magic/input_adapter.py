@@ -121,8 +121,8 @@ class MAGICInputAdapter:
                 node_types[dst] = dst_type
 
             # Collect edge types
-            if src and dst:
-                edge_types[(src, dst)] = edge_type
+            if src and dst and edge_type is not None:
+                edge_types[edge_type] = edge_type
 
         # Build vocabulary from training data
         self._vocabulary = TypeVocabulary()
@@ -156,10 +156,14 @@ class MAGICInputAdapter:
 
         contract = NeutralGraphContract()
 
+        # Upstream sorts events before applying its NetworkX DiGraph
+        # first-edge policy. The global index is the canonical tie-break.
+        ordered_records = sorted(records, key=self._record_order_key)
+
         # Track seen (src, dst) pairs for simple graph policy
         seen_pairs: Set[Tuple[str, str]] = set()
 
-        for record in records:
+        for record in ordered_records:
             # Extract fields from canonical artifact
             src = record.get("src")
             dst = record.get("dst")
@@ -176,6 +180,11 @@ class MAGICInputAdapter:
             adjusted_src, adjusted_dst = self._apply_direction_rule(
                 src, dst, edge_type
             )
+            is_reversed = (adjusted_src, adjusted_dst) == (dst, src) and (
+                src != dst
+            )
+            adjusted_src_type = dst_type if is_reversed else src_type
+            adjusted_dst_type = src_type if is_reversed else dst_type
 
             pair = (adjusted_src, adjusted_dst)
 
@@ -186,8 +195,8 @@ class MAGICInputAdapter:
                 seen_pairs.add(pair)
 
             # Add nodes
-            contract.add_node(adjusted_src, src_type, split)
-            contract.add_node(adjusted_dst, dst_type, split)
+            contract.add_node(adjusted_src, adjusted_src_type, split)
+            contract.add_node(adjusted_dst, adjusted_dst_type, split)
 
             # Create edge record - preserve original global_event_index
             edge = EdgeRecord(
@@ -252,6 +261,15 @@ class MAGICInputAdapter:
         test_contract = self.transform(self.test_records, SplitType.TEST)
 
         return train_contract, val_contract, test_contract
+
+    def _record_order_key(self, record: Mapping) -> Tuple[int, int]:
+        timestamp = record.get("t")
+        if timestamp is None:
+            timestamp = record.get("timestamp", 0)
+        return (
+            int(timestamp or 0),
+            int(record.get("global_event_index", 0)),
+        )
 
     def _apply_direction_rule(
         self,

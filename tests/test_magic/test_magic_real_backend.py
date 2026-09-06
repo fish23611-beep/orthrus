@@ -1,0 +1,691 @@
+"""Contract tests for the pinned MAGIC real-backend bridge."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+import inspect
+from pathlib import Path
+import random
+import sys
+from types import ModuleType
+from typing import Any, Dict, List
+
+import numpy as np
+import pytest
+
+real_backend = importlib.import_module("src.baselines.magic.real_backend")
+
+import torch
+
+from src.baselines.magic.contracts import SplitType
+from src.baselines.magic.evaluator import MagicEvaluator
+from src.baselines.magic.input_adapter import MAGICInputAdapter
+from src.baselines.magic.scoring import MAGICEntityScorer
+from src.baselines.magic.seed import FakeDGLModule
+from src.baselines.magic.real_backend import (
+    ALGORITHM_IDENTITY,
+    CheckpointIdentityError,
+    FROZEN_FILE_SHA256,
+    MAGICModelConfig,
+    MAGICRealBackend,
+    MAGICUpstreamRuntime,
+    RealMAGICDependencyError,
+    UPSTREAM_COMMIT,
+    WRAPPER_IDENTITY,
+    UpstreamIntegrityError,
+    verify_upstream_identity,
+)
+
+
+UPSTREAM_PATH = Path("/opt/magic-upstream")
+
+
+class FakeGraph:
+    def __init__(self, edges: Any, num_nodes: int) -> None:
+        self.sources, self.destinations = edges
+        self._num_nodes = num_nodes
+        self.ndata: Dict[str, Any] = {}
+        self.edata: Dict[str, Any] = {}
+        self.device = "cpu"
+
+    def to(self, device: Any) -> "FakeGraph":
+        self.device = device
+        return self
+
+    def num_nodes(self) -> int:
+        return self._num_nodes
+
+    def number_of_nodes(self) -> int:
+        return self._num_nodes
+
+    def number_of_edges(self) -> int:
+        return len(self.sources)
+
+
+class RecordingDGL(FakeDGLModule):
+    __version__ = "fake-dgl-1.0"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.graph_calls: List[Any] = []
+
+    def graph(self, edges: Any, num_nodes: int) -> FakeGraph:
+        result = FakeGraph(edges, num_nodes)
+        self.graph_calls.append(result)
+        return result
+
+
+class RecordingModel:
+    def __init__(self, stochastic_trace: Any) -> None:
+        self.stochastic_trace = tuple(stochastic_trace)
+        self.to_calls: List[Any] = []
+        self.train_calls = 0
+        self.eval_calls = 0
+        self.embed_calls: List[FakeGraph] = []
+        self.loaded_state = False
+
+    def to(self, device: Any) -> "RecordingModel":
+        self.to_calls.append(device)
+        return self
+
+    def train(self) -> None:
+        self.train_calls += 1
+
+    def eval(self) -> None:
+        self.eval_calls += 1
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {"trace": torch.tensor(self.stochastic_trace)}
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        self.stochastic_trace = tuple(state["trace"].tolist())
+        self.loaded_state = True
+
+    def embed(self, graph: FakeGraph) -> Any:
+        self.embed_calls.append(graph)
+        index = torch.arange(graph.num_nodes(), dtype=torch.float32)
+        offset = float(self.stochastic_trace[0])
+        return torch.stack(
+            (
+                index + offset,
+                index.square() + 1.0,
+                torch.sin(index + offset),
+                torch.cos(index + offset),
+            ),
+            dim=1,
+        )
+
+
+class RuntimeHarness:
+    def __init__(self) -> None:
+        self.dgl = RecordingDGL()
+        self.build_calls: List[Any] = []
+        self.optimizer_calls: List[Any] = []
+        self.training_calls: List[Dict[str, Any]] = []
+        self.models: List[RecordingModel] = []
+
+    def build_model(self, args: Any) -> RecordingModel:
+        self.build_calls.append(args)
+        trace = (
+            random.random(),
+            float(np.random.random()),
+            float(torch.rand(1).item()),
+        )
+        model = RecordingModel(trace)
+        self.models.append(model)
+        return model
+
+    def create_optimizer(
+        self,
+        name: str,
+        model: RecordingModel,
+        learning_rate: float,
+        weight_decay: float,
+    ) -> object:
+        self.optimizer_calls.append(
+            (name, model, learning_rate, weight_decay)
+        )
+        return object()
+
+    def train_entity_level(self, **kwargs: Any) -> RecordingModel:
+        self.training_calls.append(kwargs)
+        return kwargs["model"]
+
+    def runtime(self) -> MAGICUpstreamRuntime:
+        return MAGICUpstreamRuntime(
+            torch=torch,
+            dgl=self.dgl,
+            build_model=self.build_model,
+            create_optimizer=self.create_optimizer,
+            train_entity_level=self.train_entity_level,
+        )
+
+
+def make_records(
+    prefix: str,
+    count: int,
+    timestamp_base: int,
+    edge_type: str = "EVENT_WRITE",
+) -> List[Dict[str, Any]]:
+    records = []
+    for index in range(count - 1):
+        records.append(
+            {
+                "src": "{}_{}".format(prefix, index),
+                "dst": "{}_{}".format(prefix, index + 1),
+                "src_type": "subject" if index % 2 == 0 else "file",
+                "dst_type": "subject" if (index + 1) % 2 == 0 else "file",
+                "edge_type": edge_type,
+                "timestamp": timestamp_base + index,
+                "global_event_index": timestamp_base * 10 + index,
+            }
+        )
+    return records
+
+
+@pytest.fixture
+def contracts():
+    adapter = MAGICInputAdapter(
+        dataset="TINY",
+        train_records=make_records("train", 12, 100),
+        val_records=make_records("validation", 6, 200),
+        test_records=make_records("test", 7, 300),
+    )
+    return adapter.fit_transform()
+
+
+def make_backend(
+    seed: int = 0,
+    config: MAGICModelConfig = None,
+):
+    harness = RuntimeHarness()
+    backend = MAGICRealBackend(
+        seed=seed,
+        upstream_path=UPSTREAM_PATH,
+        config=config or MAGICModelConfig(max_epoch=1),
+        _runtime_factory=lambda _: harness.runtime(),
+    )
+    return backend, harness
+
+
+def prepare_all(backend: MAGICRealBackend, contracts):
+    train_contract, val_contract, test_contract = contracts
+    return (
+        backend.prepare_graph(
+            train_contract,
+            SplitType.TRAIN,
+            "train-snapshot",
+        ),
+        backend.prepare_graph(
+            val_contract,
+            SplitType.VALIDATION,
+            "validation-snapshot",
+        ),
+        backend.prepare_graph(
+            test_contract,
+            SplitType.TEST,
+            "test-snapshot",
+        ),
+    )
+
+
+def file_hashes() -> Dict[str, str]:
+    result = {}
+    for relative_path in FROZEN_FILE_SHA256:
+        content = (UPSTREAM_PATH / relative_path).read_bytes()
+        result[relative_path] = hashlib.sha256(content).hexdigest()
+    return result
+
+
+def test_module_import_succeeds_without_dgl() -> None:
+    assert real_backend.MAGICRealBackend is MAGICRealBackend
+    assert importlib.util.find_spec("dgl") is None
+
+
+def test_real_execution_without_dgl_fails_clearly(contracts) -> None:
+    backend = MAGICRealBackend(seed=0, upstream_path=UPSTREAM_PATH)
+    with pytest.raises(
+        RealMAGICDependencyError,
+        match="real MAGIC runtime dependency missing.*DGL",
+    ):
+        backend.prepare_graph(
+            contracts[0],
+            SplitType.TRAIN,
+            "train-snapshot",
+        )
+
+
+def test_missing_upstream_path_fails(tmp_path: Path) -> None:
+    with pytest.raises(UpstreamIntegrityError, match="missing MAGIC upstream"):
+        MAGICRealBackend(seed=0, upstream_path=tmp_path / "absent")
+
+
+def test_wrong_upstream_file_sha_fails(tmp_path: Path) -> None:
+    (tmp_path / "train.py").write_text("tampered", encoding="utf-8")
+    with pytest.raises(UpstreamIntegrityError, match="wrong upstream SHA256"):
+        verify_upstream_identity(tmp_path)
+
+
+def test_wrong_expected_commit_fails() -> None:
+    with pytest.raises(UpstreamIntegrityError, match="wrong upstream SHA"):
+        verify_upstream_identity(UPSTREAM_PATH, expected_commit="0" * 40)
+
+
+def test_upstream_identity_verification_works() -> None:
+    identity = verify_upstream_identity(UPSTREAM_PATH)
+    assert identity.repository.endswith("FDUDSDE/MAGIC")
+    assert identity.commit == UPSTREAM_COMMIT
+    assert identity.verification == "frozen-file-sha256"
+    assert identity.file_sha256 == FROZEN_FILE_SHA256
+
+
+def test_reversed_edge_keeps_node_types_attached_to_ids() -> None:
+    records = [
+        {
+            "src": "file-id",
+            "dst": "process-id",
+            "src_type": "file",
+            "dst_type": "subject",
+            "edge_type": "EVENT_READ",
+            "timestamp": 10,
+            "global_event_index": 1,
+        }
+    ]
+    contract = MAGICInputAdapter("TINY", records).fit().transform(
+        records,
+        SplitType.TRAIN,
+    )
+    assert contract.edges[0].src == "process-id"
+    assert contract.edges[0].dst == "file-id"
+    assert contract.nodes["process-id"].node_type == "subject"
+    assert contract.nodes["file-id"].node_type == "file"
+
+
+def test_prepare_graph_builds_upstream_dgl_fields(contracts) -> None:
+    backend, harness = make_backend()
+    prepared = backend.prepare_graph(
+        contracts[0],
+        SplitType.TRAIN,
+        "train-snapshot",
+    )
+    graph = prepared.graph
+    assert len(harness.dgl.graph_calls) == 1
+    assert graph.ndata["type"].dtype == torch.long
+    assert graph.edata["type"].dtype == torch.long
+    assert graph.ndata["attr"].shape == (
+        len(prepared.node_ids),
+        prepared.node_feature_dim,
+    )
+    assert graph.edata["attr"].shape == (
+        prepared.edge_count,
+        prepared.edge_feature_dim,
+    )
+    assert torch.all(graph.ndata["attr"].sum(dim=1) == 1)
+    assert torch.all(graph.edata["attr"].sum(dim=1) == 1)
+
+
+def test_embedding_node_mapping_is_stable(contracts) -> None:
+    backend_a, _ = make_backend()
+    backend_b, _ = make_backend()
+    graph_a = backend_a.prepare_graph(
+        contracts[0], SplitType.TRAIN, "same"
+    )
+    graph_b = backend_b.prepare_graph(
+        contracts[0], SplitType.TRAIN, "same"
+    )
+    assert graph_a.node_ids == graph_b.node_ids
+    assert graph_a.canonical_to_local == graph_b.canonical_to_local
+    assert graph_a.graph_fingerprint == graph_b.graph_fingerprint
+    for local_id, canonical_id in enumerate(graph_a.local_to_canonical):
+        assert graph_a.canonical_to_local[canonical_id] == local_id
+
+
+def test_unknown_types_use_frozen_unknown_bucket() -> None:
+    train = make_records("train", 4, 10)
+    validation = [
+        {
+            "src": "unknown-a",
+            "dst": "unknown-b",
+            "src_type": "new-node-type",
+            "dst_type": "file",
+            "edge_type": "EVENT_NEW",
+            "timestamp": 50,
+            "global_event_index": 50,
+        }
+    ]
+    train_contract, val_contract, _ = MAGICInputAdapter(
+        "TINY", train, validation
+    ).fit_transform()
+    backend, _ = make_backend()
+    prepared_train = backend.prepare_graph(
+        train_contract, SplitType.TRAIN, "train"
+    )
+    prepared_val = backend.prepare_graph(
+        val_contract, SplitType.VALIDATION, "validation"
+    )
+    assert prepared_val.node_feature_dim == prepared_train.node_feature_dim
+    assert prepared_val.edge_feature_dim == prepared_train.edge_feature_dim
+    assert int(prepared_val.graph.ndata["type"][0]) == (
+        prepared_val.node_feature_dim - 1
+    )
+    assert int(prepared_val.graph.edata["type"][0]) == (
+        prepared_val.edge_feature_dim - 1
+    )
+
+
+def test_fake_upstream_construction_and_training_are_called(contracts) -> None:
+    backend, harness = make_backend()
+    train_graph, _, _ = prepare_all(backend, contracts)
+    backend.fit(train_graph)
+    assert len(harness.build_calls) == 1
+    assert harness.build_calls[0].n_dim == train_graph.node_feature_dim
+    assert harness.build_calls[0].e_dim == train_graph.edge_feature_dim
+    assert len(harness.optimizer_calls) == 1
+    assert len(harness.training_calls) == 1
+    call = harness.training_calls[0]
+    assert call["graphs"] == [train_graph.graph]
+    assert call["max_epoch"] == 1
+    assert call["device"] == "cpu"
+
+
+@pytest.mark.parametrize(
+    "split,index",
+    [
+        (SplitType.VALIDATION, 1),
+        (SplitType.TEST, 2),
+    ],
+)
+def test_fit_rejects_non_train_graphs(contracts, split, index) -> None:
+    backend, harness = make_backend()
+    graphs = prepare_all(backend, contracts)
+    with pytest.raises(ValueError, match="train graphs only"):
+        backend.fit(graphs[index])
+    assert split == graphs[index].split
+    assert harness.build_calls == []
+    assert harness.training_calls == []
+
+
+def test_checkpoint_save_and_load_lifecycle(
+    contracts,
+    tmp_path: Path,
+) -> None:
+    backend, _ = make_backend(seed=1)
+    train_graph, _, test_graph = prepare_all(backend, contracts)
+    backend.fit(train_graph)
+    fingerprint = backend.training_input_fingerprint
+    checkpoint = backend.save_checkpoint(
+        tmp_path / "checkpoints" / "magic_final.pt"
+    )
+    assert checkpoint.is_file()
+
+    restored, restored_harness = make_backend(seed=1)
+    restored.load_checkpoint(checkpoint, fingerprint)
+    assert restored.training_input_fingerprint == fingerprint
+    assert restored_harness.models[-1].loaded_state is True
+    output = restored.embed(test_graph)
+    assert output.snapshot_id == "test-snapshot"
+
+
+def test_checkpoint_metadata_contains_complete_identity(
+    contracts,
+    tmp_path: Path,
+) -> None:
+    backend, _ = make_backend(seed=2)
+    train_graph, _, _ = prepare_all(backend, contracts)
+    backend.fit(train_graph)
+    checkpoint = backend.save_checkpoint(tmp_path / "magic_final.pt")
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    metadata = payload["metadata"]
+    assert metadata["upstream"]["commit"] == UPSTREAM_COMMIT
+    assert metadata["upstream"]["file_sha256"] == dict(FROZEN_FILE_SHA256)
+    assert metadata["wrapper_identity"] == WRAPPER_IDENTITY
+    assert metadata["algorithm_identity"] == ALGORITHM_IDENTITY
+    assert metadata["experiment_seed"] == 2
+    assert metadata["graph_input_fingerprint"]
+    assert metadata["config_identity"] == backend.config.identity
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["seed", "fingerprint", "config"],
+)
+def test_checkpoint_wrong_identity_is_rejected(
+    contracts,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    backend, _ = make_backend(seed=0)
+    train_graph, _, _ = prepare_all(backend, contracts)
+    backend.fit(train_graph)
+    fingerprint = backend.training_input_fingerprint
+    checkpoint = backend.save_checkpoint(tmp_path / "magic_final.pt")
+
+    if mutation == "seed":
+        restored, _ = make_backend(seed=1)
+        expected = fingerprint
+    elif mutation == "config":
+        restored, _ = make_backend(
+            seed=0,
+            config=MAGICModelConfig(max_epoch=2),
+        )
+        expected = fingerprint
+    else:
+        restored, _ = make_backend(seed=0)
+        expected = "wrong-" + fingerprint
+
+    with pytest.raises(CheckpointIdentityError, match="identity mismatch"):
+        restored.load_checkpoint(checkpoint, expected)
+
+
+def test_checkpoint_without_metadata_is_rejected(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "legacy.pt"
+    torch.save({"state_dict": {}}, checkpoint)
+    backend, _ = make_backend()
+    with pytest.raises(
+        CheckpointIdentityError,
+        match="no identity metadata",
+    ):
+        backend.load_checkpoint(checkpoint, "required-fingerprint")
+
+
+def test_embedding_extraction_preserves_snapshot_mapping(contracts) -> None:
+    backend, harness = make_backend()
+    train_graph, val_graph, _ = prepare_all(backend, contracts)
+    backend.fit(train_graph)
+    output = backend.embed(val_graph)
+    assert len(harness.models[-1].embed_calls) == 1
+    assert output.embeddings.shape[0] == len(val_graph.node_ids)
+    assert output.node_ids == val_graph.node_ids
+    assert output.canonical_to_local == val_graph.canonical_to_local
+    assert output.local_to_canonical == val_graph.local_to_canonical
+    assert output.split == SplitType.VALIDATION
+    assert output.graph_fingerprint == val_graph.graph_fingerprint
+
+
+def test_backend_public_api_has_no_label_argument() -> None:
+    forbidden = {
+        "y_test",
+        "ground_truth",
+        "malicious_nodes",
+        "malicious_ids",
+        "test_labels",
+        "test_y",
+    }
+    methods = (
+        MAGICRealBackend.__init__,
+        MAGICRealBackend.prepare_graph,
+        MAGICRealBackend.fit,
+        MAGICRealBackend.save_checkpoint,
+        MAGICRealBackend.load_checkpoint,
+        MAGICRealBackend.embed,
+    )
+    for method in methods:
+        parameters = set(inspect.signature(method).parameters)
+        assert parameters.isdisjoint(forbidden)
+
+
+def test_ground_truth_loader_is_not_accessed_before_embeddings(
+    contracts,
+    monkeypatch,
+) -> None:
+    accesses: List[str] = []
+    poison = ModuleType("utils.loaddata")
+
+    def fail_access(name: str) -> Any:
+        accesses.append(name)
+        raise AssertionError("ground-truth loader accessed")
+
+    poison.__getattr__ = fail_access
+    monkeypatch.setitem(sys.modules, "utils.loaddata", poison)
+
+    backend, _ = make_backend()
+    train_graph, _, test_graph = prepare_all(backend, contracts)
+    backend.fit(train_graph)
+    backend.embed(test_graph)
+    assert accesses == []
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_official_seed_reaches_model_and_dgl(seed: int, contracts) -> None:
+    backend, harness = make_backend(seed=seed)
+    train_graph = backend.prepare_graph(
+        contracts[0], SplitType.TRAIN, "train"
+    )
+    backend.fit(train_graph)
+    calls = harness.dgl.get_calls()
+    assert calls["seed_calls"] == [seed]
+    assert calls["random_seed_calls"] == [seed]
+    assert backend.seed_manifest.seed == seed
+    assert backend.seed_manifest.dgl_seed_set is True
+    assert backend.seed_manifest.dgl_random_seed_set is True
+
+
+def run_stochastic_trace(seed: int, contract) -> Any:
+    backend, harness = make_backend(seed=seed)
+    train_graph = backend.prepare_graph(
+        contract, SplitType.TRAIN, "train"
+    )
+    backend.fit(train_graph)
+    return harness.models[0].stochastic_trace
+
+
+def test_repeated_seed_produces_stable_mocked_trace(contracts) -> None:
+    assert run_stochastic_trace(1, contracts[0]) == run_stochastic_trace(
+        1, contracts[0]
+    )
+
+
+def test_different_seed_changes_mocked_trace(contracts) -> None:
+    assert run_stochastic_trace(1, contracts[0]) != run_stochastic_trace(
+        2, contracts[0]
+    )
+
+
+def test_real_backend_has_no_smoke_or_word_embedding_dependency() -> None:
+    source = inspect.getsource(real_backend)
+    disallowed = (
+        "synthetic_" + "smoke",
+        "Word" + "2Vec",
+        "x_" + "src",
+        "x_" + "dst",
+    )
+    for token in disallowed:
+        assert token not in source
+
+
+def test_upstream_sources_are_not_modified_by_bridge(contracts) -> None:
+    before = file_hashes()
+    backend, _ = make_backend()
+    train_graph, _, test_graph = prepare_all(backend, contracts)
+    backend.fit(train_graph)
+    backend.embed(test_graph)
+    after = file_hashes()
+    assert after == before == dict(FROZEN_FILE_SHA256)
+
+
+def test_backend_embeddings_feed_existing_m5_and_m6(contracts) -> None:
+    backend, _ = make_backend()
+    train_graph, val_graph, test_graph = prepare_all(backend, contracts)
+    backend.fit(train_graph)
+    train_batch = backend.embed(train_graph)
+    val_batch = backend.embed(val_graph)
+    test_batch = backend.embed(test_graph)
+
+    scorer = MAGICEntityScorer(k=3, seed=0)
+    scorer.fit(train_batch.embeddings, list(train_batch.node_ids))
+    val_records = scorer.score(
+        val_batch.embeddings,
+        list(val_batch.node_ids),
+    )
+    test_records = scorer.score(
+        test_batch.embeddings,
+        list(test_batch.node_ids),
+    )
+    validation_scores = {
+        record.canonical_node_id: record.score_raw
+        for record in val_records
+    }
+    test_scores = {
+        record.canonical_node_id: record.score_raw
+        for record in test_records
+    }
+
+    evaluator = MagicEvaluator(k=3, threshold_quantile=0.999)
+    threshold = evaluator.fit_threshold(validation_scores)
+    predictions = evaluator.predict(test_scores)
+    assert threshold.provenance == "validation_only"
+    assert set(predictions) == set(test_batch.node_ids)
+    assert all(np.isfinite(list(test_scores.values())))
+
+
+def test_failed_real_import_does_not_pollute_generic_namespaces(
+    contracts,
+) -> None:
+    path_before = list(sys.path)
+    generic_before = {
+        name: module
+        for name, module in sys.modules.items()
+        if name.split(".", 1)[0] in {"model", "utils"}
+    }
+    backend = MAGICRealBackend(seed=0, upstream_path=UPSTREAM_PATH)
+    with pytest.raises(RealMAGICDependencyError):
+        backend.prepare_graph(
+            contracts[0], SplitType.TRAIN, "train"
+        )
+    generic_after = {
+        name: module
+        for name, module in sys.modules.items()
+        if name.split(".", 1)[0] in {"model", "utils"}
+    }
+    assert sys.path == path_before
+    assert generic_after == generic_before
+
+def test_simple_graph_first_edge_uses_canonical_order() -> None:
+    records = [
+        {
+            "src": "a",
+            "dst": "b",
+            "src_type": "subject",
+            "dst_type": "file",
+            "edge_type": "EVENT_LATE",
+            "timestamp": 200,
+            "global_event_index": 2,
+        },
+        {
+            "src": "a",
+            "dst": "b",
+            "src_type": "subject",
+            "dst_type": "file",
+            "edge_type": "EVENT_EARLY",
+            "timestamp": 100,
+            "global_event_index": 1,
+        },
+    ]
+    adapter = MAGICInputAdapter("TINY", records).fit()
+    contract = adapter.transform(records, SplitType.TRAIN)
+    assert len(contract.edges) == 1
+    assert contract.edges[0].timestamp == 100
+    assert contract.edges[0].edge_type == "EVENT_EARLY"
+    assert adapter.vocabulary.transform_edge_type("EVENT_EARLY")[1] is True
+    assert adapter.vocabulary.transform_edge_type("EVENT_LATE")[1] is True

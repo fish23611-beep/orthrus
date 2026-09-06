@@ -77,6 +77,15 @@ from .evaluator import (
     verify_label_independence,
 )
 
+# M9-P1: pinned upstream real-backend bridge (DGL remains lazy)
+from .real_backend import (
+    MAGICEmbeddingBatch,
+    MAGICModelConfig,
+    MAGICPreparedGraph,
+    MAGICRealBackend,
+    verify_upstream_identity,
+)
+
 __all__ = [
     # Contracts
     "SplitType",
@@ -116,4 +125,10 @@ __all__ = [
     "write_metrics_json",
     "VALIDATION_BENIGN_STATUS",
     "verify_label_independence",
+    # M9-P1 Real Backend
+    "MAGICEmbeddingBatch",
+    "MAGICModelConfig",
+    "MAGICPreparedGraph",
+    "MAGICRealBackend",
+    "verify_upstream_identity",
 ]
