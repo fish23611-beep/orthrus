@@ -1,0 +1,19 @@
+# MAGIC Synthetic Smoke Test Configuration
+# This config enables synthetic smoke mode for testing M3-M7 data flow
+# without requiring real THEIA data or GAT/GMAE backend
+
+# Smoke mode: only synthetic fixtures, no real data
+is_smoke: true
+backend: synthetic_smoke
+dataset: SYNTHETIC_MAGIC
+
+# MAGIC parameters
+k: 10
+q: 0.999
+
+# Train node count for synthetic fixture
+# Must be >= 50 to support k=10 scoring
+train_node_count: 50
+
+# Upstream SHA (frozen, not used in synthetic mode)
+upstream_sha: "9003a2ec19632073d55a1d689b828272bc53496685175fa4c88dbb63fdf028ad"
