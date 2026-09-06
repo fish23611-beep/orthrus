@@ -83,7 +83,7 @@ class TestTrainOnlyFit:
 
     def test_fit_creates_fitted_state(self, train_embeddings, train_node_ids):
         """Test fit() creates fitted state."""
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
         scorer.fit(train_embeddings, train_node_ids)
 
         assert scorer.is_fitted
@@ -92,7 +92,7 @@ class TestTrainOnlyFit:
 
     def test_fit_sets_reference_distance(self, train_embeddings, train_node_ids):
         """Test fit() computes reference distance."""
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
         scorer.fit(train_embeddings, train_node_ids)
 
         assert scorer.reference_distance > 0
@@ -100,14 +100,14 @@ class TestTrainOnlyFit:
 
     def test_fit_rejects_empty_embeddings(self):
         """Test fit() rejects empty embeddings."""
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
 
         with pytest.raises(ValueError, match="cannot be empty"):
             scorer.fit(np.array([]).reshape(0, 4), [])
 
     def test_fit_rejects_mismatched_lengths(self, train_embeddings, train_node_ids):
         """Test fit() rejects mismatched lengths."""
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
 
         with pytest.raises(ValueError, match="same length"):
             scorer.fit(train_embeddings, ["a", "b"])  # 5 embeddings, 2 IDs
@@ -236,7 +236,7 @@ class TestCanonicalIdentity:
 
     def test_score_records_preserve_node_id(self, train_embeddings, train_node_ids, test_embeddings, test_node_ids):
         """Test score records preserve canonical node IDs."""
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
         scorer.fit(train_embeddings, train_node_ids)
 
         scores = scorer.score(test_embeddings, test_node_ids)
@@ -254,7 +254,7 @@ class TestIdentityMapping:
 
     def test_identity_map_provides_bidirectional_mapping(self, train_embeddings, train_node_ids):
         """Test identity map provides reversible mapping."""
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
         scorer.fit(train_embeddings, train_node_ids)
 
         identity_map = scorer.identity_map
@@ -269,7 +269,7 @@ class TestIdentityMapping:
 
     def test_local_index_not_in_score_record(self, train_embeddings, train_node_ids, test_embeddings, test_node_ids):
         """Test that local index doesn't leak into score records."""
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
         scorer.fit(train_embeddings, train_node_ids)
 
         scores = scorer.score(test_embeddings, test_node_ids)
@@ -293,7 +293,7 @@ class TestNonFiniteHandling:
         bad_embeddings = train_embeddings.copy()
         bad_embeddings[0, 0] = float("nan")
 
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
 
         with pytest.raises(ValueError, match="non-finite"):
             scorer.fit(bad_embeddings, train_node_ids)
@@ -303,14 +303,14 @@ class TestNonFiniteHandling:
         bad_embeddings = train_embeddings.copy()
         bad_embeddings[0, 0] = float("inf")
 
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
 
         with pytest.raises(ValueError, match="non-finite"):
             scorer.fit(bad_embeddings, train_node_ids)
 
     def test_score_with_nan_rejected(self, train_embeddings, train_node_ids):
         """Test that scoring NaN embeddings raises error."""
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
         scorer.fit(train_embeddings, train_node_ids)
 
         bad_embeddings = np.array([[float("nan"), 0.0, 0.0, 0.0]], dtype=np.float32)
@@ -331,7 +331,7 @@ class TestReferenceDenominator:
         embeddings = np.ones((5, 4), dtype=np.float32)
         node_ids = ["n0", "n1", "n2", "n3", "n4"]
 
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
 
         with pytest.raises(ValueError, match="zero variance"):
             scorer.fit(embeddings, node_ids)
@@ -356,7 +356,7 @@ class TestReferenceDenominator:
         ], dtype=np.float32)
         node_ids = [f"n{i}" for i in range(10)]
 
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
 
         with pytest.raises(ValueError, match="non-positive"):
             scorer.fit(embeddings, node_ids)
@@ -474,7 +474,7 @@ class TestLabelRejection:
 
     def test_score_signature_no_labels(self, train_embeddings, train_node_ids, test_embeddings, test_node_ids):
         """Test that score() signature doesn't accept labels."""
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
         scorer.fit(train_embeddings, train_node_ids)
 
         # Call score without labels
@@ -485,7 +485,7 @@ class TestLabelRejection:
 
     def test_fit_signature_no_labels(self, train_embeddings, train_node_ids):
         """Test that fit() signature doesn't accept labels."""
-        scorer = MAGICEntityScorer(k=5)
+        scorer = MAGICEntityScorer(k=5, seed=0)
 
         # Fit without labels
         scorer.fit(train_embeddings, train_node_ids)

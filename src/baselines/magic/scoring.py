@@ -143,26 +143,42 @@ class MAGICEntityScorer:
     1. fit() 不接受 labels / malicious nodes / ground truth / test data
     2. score() 不接受 labels / malicious nodes / ground truth
     3. Train-only statistics: train mean, train std, KNN reference
-    4. Deterministic with frozen seed
+    4. Deterministic with frozen seed (caller must set via MagicSeedController)
+
+    注意：
+    - 本类不再调用 np.random.seed() 污染全局 RNG
+    - 当 use_local_rng=True 时，使用局部 np.random.RandomState(seed)
+    - 该 RandomState 与 legacy M5 实现的 np.random.seed()/np.random.permutation()
+      行为完全一致，保证 M5 sampling semantics 不被 M7 改变
     """
 
     def __init__(
         self,
         k: int = MAGIC_K_NEIGHBORS,
-        seed: int = 0,
+        seed: Optional[int] = None,  # Explicit None forces caller to pass seed
         max_train_reference_samples: int = MAX_TRAIN_REFERENCE_SAMPLES,
+        use_local_rng: bool = False,  # New: use independent legacy-compatible RNG
     ):
         """
         Initialize the scorer.
 
         Args:
             k: Number of nearest neighbors (default: 10 for THEIA)
-            seed: Random seed for deterministic behavior
+            seed: Random seed for deterministic behavior.
+                  MUST be set explicitly by the caller.
+                  Official experiment seeds: 0, 1, 2.
+                  If None, fit() will raise ValueError to fail-fast.
             max_train_reference_samples: Max train samples for reference distance
+            use_local_rng: If True, use an independent np.random.RandomState(seed)
+                           instead of np.random.seed(). This prevents scorer.fit()
+                           from polluting the caller's global RNG state while
+                           preserving M5 legacy sampling semantics exactly.
         """
         self.k = k
         self.seed = seed
         self.max_train_reference_samples = max_train_reference_samples
+        self.use_local_rng = use_local_rng
+        self._rng: Optional[np.random.RandomState] = None
 
         # Fitted state
         self._fitted = False
@@ -201,8 +217,30 @@ class MAGICEntityScorer:
         if not np.all(np.isfinite(train_embeddings)):
             raise ValueError("train_embeddings contains non-finite values")
 
+        # Seed handling: fail-fast if not explicitly set.
+        # We do NOT allow a default 0 seed - official seeds (0, 1, 2)
+        # must be passed explicitly by the caller.
+        if self.seed is None:
+            raise ValueError(
+                "MAGICEntityScorer.seed must be explicitly set by the caller. "
+                "Official experiment seeds: 0, 1, 2. "
+                "Use MagicSeedController or pass seed explicitly."
+            )
+
         # Set seed for determinism
-        np.random.seed(self.seed)
+        # M7 change: use np.random.RandomState(seed) which is legacy-compatible
+        # with the original M5 np.random.seed() / np.random.permutation() flow.
+        # We NEVER use np.random.default_rng() because it uses a different
+        # RNG algorithm and would change M5 sampling semantics.
+        if self.use_local_rng:
+            # Local legacy-compatible RNG - does NOT pollute global NumPy state
+            self._rng = np.random.RandomState(self.seed)
+        else:
+            # Local legacy-compatible RNG even without explicit isolation flag,
+            # because we must not change M5 sampling semantics.
+            # The local RandomState produces the same permutation() as
+            # np.random.seed(s); np.random.permutation(n).
+            self._rng = np.random.RandomState(self.seed)
 
         # Build identity map
         identity_map = NodeIdentityMap()
@@ -236,9 +274,13 @@ class MAGICEntityScorer:
         nbrs.fit(train_normalized)
 
         # Sample train embeddings for reference distance (upstream uses max 50k)
+        # M7 change: always use local RandomState for sampling to:
+        # 1. Avoid polluting global NumPy RNG
+        # 2. Preserve M5 legacy semantics (same RandomState algorithm)
         n_train = len(train_normalized)
         if n_train > self.max_train_reference_samples:
-            indices = np.random.permutation(n_train)[:self.max_train_reference_samples]
+            assert self._rng is not None
+            indices = self._rng.permutation(n_train)[:self.max_train_reference_samples]
             ref_embeddings = train_normalized[indices]
         else:
             ref_embeddings = train_normalized

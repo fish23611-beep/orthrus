@@ -233,6 +233,7 @@ class TestTestLabelsDoNotChangeThreshold:
             ground_truth_a=labels_a,
             ground_truth_b=labels_b,
             k=5,
+            seed=0,
         )
 
         assert result["threshold_equal"]
@@ -264,13 +265,12 @@ class TestTestLabelsDoNotChangeScores:
             ground_truth_a=labels_a,
             ground_truth_b=labels_b,
             k=5,
+            seed=0,
         )
 
         assert result["scores_a_equal_scores_b"]
 
 
-# =============================================================================
-# Test 6: Test Labels Do Not Change Predictions
 # =============================================================================
 
 class TestTestLabelsDoNotChangePredictions:
@@ -295,6 +295,7 @@ class TestTestLabelsDoNotChangePredictions:
             ground_truth_a=labels_a,
             ground_truth_b=labels_b,
             k=5,
+            seed=0,
         )
 
         assert result["predictions_a_equal_predictions_b"]
@@ -326,6 +327,7 @@ class TestLabelsOnlyAffectMetrics:
             ground_truth_a=labels_a,
             ground_truth_b=labels_b,
             k=5,
+            seed=0,
         )
 
         # Metrics should differ when labels differ
@@ -699,6 +701,7 @@ class TestAdversarialLeakage:
             ground_truth_a=labels_a,
             ground_truth_b=labels_b,
             k=5,
+            seed=0,
         )
 
         # Threshold and scores must be identical
@@ -725,6 +728,7 @@ class TestAdversarialLeakage:
             ground_truth_a=labels_a,
             ground_truth_b=labels_b,
             k=5,
+            seed=0,
         )
 
         # Scores/threshold/predictions must be unchanged

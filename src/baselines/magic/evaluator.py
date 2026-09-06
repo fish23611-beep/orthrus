@@ -408,6 +408,7 @@ def verify_label_independence(
     ground_truth_a: Mapping[str, int],
     ground_truth_b: Mapping[str, int],
     k: int = 10,
+    seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Verify that changing ground truth labels does not affect scores/predictions.
@@ -424,12 +425,18 @@ def verify_label_independence(
         ground_truth_a: First ground truth mapping
         ground_truth_b: Second ground truth mapping
         k: K for KNN
+        seed: Explicit seed for the scorer (required: 0, 1, or 2)
 
     Returns:
         Dict with verification results
     """
+    if seed is None:
+        raise ValueError(
+            "verify_label_independence requires an explicit seed "
+            "(official seeds: 0, 1, 2)."
+        )
     # Fit scorer
-    scorer = MAGICEntityScorer(k=k)
+    scorer = MAGICEntityScorer(k=k, seed=seed)
     scorer.fit(train_embeddings, train_node_ids)
 
     # Score validation
