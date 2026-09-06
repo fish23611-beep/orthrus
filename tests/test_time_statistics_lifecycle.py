@@ -3,6 +3,7 @@
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -195,3 +196,31 @@ def test_run_dir_takes_priority_over_shared_metadata_dir(tmp_path):
     # Must be saved to run_dir/metadata/, not shared_metadata/
     assert (run_dir / "metadata" / "time_statistics.json").exists()
     assert not (shared_metadata / "time_statistics.json").exists()
+
+
+@pytest.mark.parametrize(
+    "resolver",
+    [
+        orthrus_gnn_training._run_scoped_metadata_dir,
+        orthrus_gnn_testing._run_scoped_metadata_dir,
+    ],
+)
+def test_metadata_dir_resolvers_accept_real_string_and_path(resolver, tmp_path):
+    path_value = tmp_path / "shared_metadata"
+
+    assert resolver(SimpleNamespace(_run_dir=None, _metadata_dir=str(path_value))) == str(path_value)
+    assert resolver(SimpleNamespace(_run_dir=None, _metadata_dir=path_value)) == path_value
+
+
+@pytest.mark.parametrize(
+    "resolver",
+    [
+        orthrus_gnn_training._run_scoped_metadata_dir,
+        orthrus_gnn_testing._run_scoped_metadata_dir,
+    ],
+)
+@pytest.mark.parametrize("invalid_path", [MagicMock(), None, ""])
+def test_metadata_dir_resolvers_reject_invalid_paths(resolver, invalid_path):
+    cfg = SimpleNamespace(_run_dir=invalid_path, _metadata_dir=invalid_path)
+
+    assert resolver(cfg) is None

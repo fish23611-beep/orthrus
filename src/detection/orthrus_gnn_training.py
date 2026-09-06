@@ -10,6 +10,7 @@ from data_utils import *
 from factory import *
 from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime, update_runtime_nested
 from wandb_control import wandb_log
+from run_metadata import _is_valid_path
 
 
 def train(data,
@@ -47,7 +48,7 @@ def train(data,
 
 def _runtime_dir(cfg, fallback_dir):
     run_dir = getattr(cfg, "_run_dir", None)
-    return run_dir if isinstance(run_dir, (str, os.PathLike)) and os.fspath(run_dir) else os.path.dirname(fallback_dir)
+    return run_dir if _is_valid_path(run_dir) else os.path.dirname(fallback_dir)
 
 
 def _event_count(data):
@@ -70,11 +71,11 @@ def _run_scoped_metadata_dir(cfg):
     experiments with different train_data views must not share one artifact.
     """
     run_dir = getattr(cfg, "_run_dir", None)
-    if isinstance(run_dir, (str, os.PathLike)) and os.fspath(run_dir):
+    if _is_valid_path(run_dir):
         return os.path.join(os.fspath(run_dir), "metadata")
     # Legacy fallback: use shared preprocessing metadata dir
     metadata_dir = getattr(cfg, "_metadata_dir", None)
-    if metadata_dir:
+    if _is_valid_path(metadata_dir):
         return metadata_dir
     return None
 

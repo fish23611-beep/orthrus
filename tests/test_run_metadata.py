@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import pytest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 from pathlib import Path
 
 
@@ -401,6 +401,18 @@ class TestIsValidPath:
     def test_valid_path_is_valid(self, tmp_path):
         """Valid path string is valid."""
         assert _is_valid_path(str(tmp_path)) is True
+
+    def test_path_object_is_valid(self, tmp_path):
+        """A concrete pathlib.Path is valid."""
+        assert _is_valid_path(tmp_path) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [Mock(), "   ", True, 1, 1.5, object()],
+    )
+    def test_non_path_values_are_invalid(self, value):
+        """Mocks, blank strings, scalars, and arbitrary objects are invalid."""
+        assert _is_valid_path(value) is False
 
 
 class TestRedactDatabasePassword:

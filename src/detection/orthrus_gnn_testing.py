@@ -12,6 +12,7 @@ from factory import *
 import torch
 
 from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime, update_runtime_nested
+from run_metadata import _is_valid_path
 
 
 def _cleanup_checkpoint_cuda(model, device):
@@ -240,10 +241,10 @@ def _run_scoped_metadata_dir(cfg):
     2. cfg._metadata_dir       (legacy fallback: shared preprocessing path)
     """
     run_dir = getattr(cfg, "_run_dir", None)
-    if isinstance(run_dir, (str, os.PathLike)) and os.fspath(run_dir):
+    if _is_valid_path(run_dir):
         return os.path.join(os.fspath(run_dir), "metadata")
     metadata_dir = getattr(cfg, "_metadata_dir", None)
-    if metadata_dir:
+    if _is_valid_path(metadata_dir):
         return metadata_dir
     return None
 
@@ -277,10 +278,11 @@ def _load_or_fit_time_gap_statistics(cfg, train_data):
 
 def _get_metadata_cache(cfg):
     """Get or create MetadataCache instance from cfg."""
-    if not hasattr(cfg, "_metadata_dir") or not cfg._metadata_dir:
+    metadata_dir = getattr(cfg, "_metadata_dir", None)
+    if not _is_valid_path(metadata_dir):
         return None
     from mstc.metadata_cache import MetadataCache
-    return MetadataCache(cfg._metadata_dir)
+    return MetadataCache(metadata_dir)
 
 
 def _load_nodeid2msg(cfg) -> dict:
@@ -357,7 +359,7 @@ def main(cfg):
     else:
         all_trained_models = [(name, os.path.join(gnn_models_dir, name)) for name in listdir_sorted(gnn_models_dir)]
     runtime_dir = getattr(cfg, "_run_dir", None)
-    if not isinstance(runtime_dir, (str, os.PathLike)) or not os.fspath(runtime_dir):
+    if not _is_valid_path(runtime_dir):
         runtime_dir = os.path.dirname(gnn_models_dir)
     dump_environment(cfg, runtime_dir)
     if hasattr(full_data, "loader_telemetry"):

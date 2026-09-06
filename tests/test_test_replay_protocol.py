@@ -160,6 +160,8 @@ def test_replay_protocol_calls_reset_then_replay_then_val_then_test():
     assert len(replay_calls) == 1, f"Expected 1 replay call, got {len(replay_calls)}"
     assert len(val_calls)   == len(val_data),  f"Expected {len(val_data)} val calls, got {len(val_calls)}"
     assert len(test_calls)  == len(test_data), f"Expected {len(test_data)} test calls, got {len(test_calls)}"
+    assert not os.path.exists("/home/MagicMock"), \
+        "unset MagicMock metadata attributes must not create filesystem paths"
 
 
 @requires_torch

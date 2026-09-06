@@ -43,6 +43,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 # --------------------------------------------------------------------------- #
 # YAML dumping (no external yaml dependency required)
@@ -396,13 +397,18 @@ def _is_valid_path(path: Path | str | None) -> bool:
     This guard makes every dump function a no-op in unit tests that pass
     MagicMock objects as ``run_dir``.
     """
-    if path is None:
+    # Validate the object before invoking its filesystem protocol.  Mock and
+    # MagicMock synthesize ``__fspath__`` dynamically, so calling os.fspath()
+    # first can turn an unset config attribute into a plausible junk path.
+    if path is None or isinstance(path, Mock):
+        return False
+    if not isinstance(path, (str, os.PathLike)):
         return False
     try:
         s = os.fspath(path)
     except Exception:
         return False
-    if not s or "mock" in s.lower() or "magicmock" in type(path).__name__.lower():
+    if not isinstance(s, str) or not s.strip():
         return False
     return True
 
