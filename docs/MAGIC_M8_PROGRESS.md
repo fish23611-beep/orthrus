@@ -144,7 +144,7 @@ dataset = THEIA_E5
 
 ---
 
-## Test Coverage (29 tests)
+## Test Coverage (29 coverage requirements / 40 pytest cases)
 
 1. ✅ synthetic fixture validity
 2. ✅ enough nodes for k=10
@@ -187,6 +187,7 @@ dataset = THEIA_E5
 - `src/baselines/magic/smoke.py` - Smoke harness
 - `src/baselines/magic/run_magic_smoke.py` - CLI entry point
 - `config/smoke/magic.yml` - Smoke config
+- `tests/test_magic/test_magic_smoke.py` - M8 synthetic smoke test suite
 - `docs/MAGIC_M8_PROGRESS.md` - This document
 
 ### Modified Files
@@ -227,14 +228,18 @@ SHA256 of /opt/magic-upstream files (unchanged):
 
 ## Pending Work
 
-### M9: Full Backend Integration
-- Real GAT/GMAE backend integration
-- Real THEIA_E3/E5 data
-- Full paper matrix
+### M9: E3 seed0 pilot
+- Only after explicit user authorization and all runtime/data prerequisites pass.
+- Run only THEIA_E3 x MAGIC x seed0.
+- Use the frozen M8 code/protocol, isolated MAGIC runtime, and canonical E3 artifacts.
+- Produce one pilot run with full raw/canonical artifacts and a GO/NO-GO report.
+- Do not run E5 or seeds 1/2 in M9.
 
-### M10: Docker/CI Integration
-- Docker build for reproducible environment
-- CI pipeline for automated testing
+### M10: formal E3/E5 3-seed runs
+- Only after M9 is explicitly approved.
+- Run THEIA_E3 and THEIA_E5 with seeds 0, 1, 2: six independent MAGIC runs.
+- Use the frozen M9-approved code/config/image without test-driven tuning.
+- Report complete per-run status and mean+-std; do not select a best seed.
 
 ---
 
