@@ -689,3 +689,64 @@ def test_simple_graph_first_edge_uses_canonical_order() -> None:
     assert contract.edges[0].edge_type == "EVENT_EARLY"
     assert adapter.vocabulary.transform_edge_type("EVENT_EARLY")[1] is True
     assert adapter.vocabulary.transform_edge_type("EVENT_LATE")[1] is True
+
+
+def test_multi_epoch_training_with_normal_backward(contracts) -> None:
+    """Regression test: multi-epoch training must work without retain_graph=True.
+
+    This was the core bug fixed in P2D.1. The wrapper now deep-copies
+    the input graph each iteration so that DGL's in-place ndata modification
+    in encoding_mask_noise() does not corrupt the original graph's tensors.
+    """
+    backend, harness = make_backend(config=MAGICModelConfig(max_epoch=2))
+    train_graph, _, _ = prepare_all(backend, contracts)
+    backend.fit(train_graph)
+
+    # Verify training was called with the correct number of epochs
+    assert len(harness.training_calls) == 1
+    call = harness.training_calls[0]
+    assert call["max_epoch"] == 2
+    # Verify the model was returned from training
+    assert harness.training_calls[0]["model"] is not None
+
+
+def test_training_loop_uses_normal_backward(contracts) -> None:
+    """Verify the training lifecycle does NOT use retain_graph=True.
+
+    This ensures the fix uses proper graph isolation rather than autograd hacks.
+    """
+    import inspect
+    from src.baselines.magic.real_backend import _run_original_entity_training_lifecycle
+    source = inspect.getsource(_run_original_entity_training_lifecycle)
+    assert "retain_graph" not in source, (
+        "Training lifecycle must not use retain_graph=True"
+    )
+
+
+def test_fit_returns_trained_model(contracts) -> None:
+    """Regression test: fit() returns the model after training (chainable)."""
+    backend, _ = make_backend(seed=0, config=MAGICModelConfig(max_epoch=1))
+    train_graph, _, _ = prepare_all(backend, contracts)
+    result = backend.fit(train_graph)
+    # fit() must return self for chainability
+    assert result is backend
+    # Model must be set
+    assert backend._model is not None
+
+
+def test_prepared_graph_ndata_is_detached(contracts) -> None:
+    """Regression test: prepared graph ndata/edata tensors have requires_grad=False.
+
+    This prevents accidental autograd connections between the prepared graph
+    and the training computation graph.
+    """
+    backend, _ = make_backend()
+    train_graph, _, _ = prepare_all(backend, contracts)
+    graph = train_graph.graph
+
+    for key in graph.ndata:
+        assert not graph.ndata[key].requires_grad, \
+            f"ndata['{key}'] should not require grad"
+    for key in graph.edata:
+        assert not graph.edata[key].requires_grad, \
+            f"edata['{key}'] should not require grad"

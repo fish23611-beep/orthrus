@@ -332,13 +332,32 @@ def _run_original_entity_training_lifecycle(
     optimizer: Any,
     max_epoch: int,
     device: Any,
+    dgl_module: Any,
 ) -> Any:
     """Mirror the entity-level loop in upstream train.py without its CLI seed."""
 
     n_train = len(graphs)
     for _ in range(max_epoch):
         for graph in graphs:
-            runtime_graph = graph.to(device)
+            # DGL 1.0.0's g.clone() creates a shallow copy that shares
+            # ndata/edata tensor objects with the original. Upstream's
+            # encoding_mask_noise() modifies ndata["attr"] in-place on the
+            # cloned graph, which corrupts the shared tensor, breaking
+            # autograd on the next epoch.
+            # We must create a truly independent copy of the graph to match
+            # the upstream per-epoch loading lifecycle.
+            copied_graph = dgl_module.graph(
+                (
+                    graph.edges()[0].clone(),
+                    graph.edges()[1].clone(),
+                ),
+                num_nodes=graph.num_nodes(),
+            )
+            for key, tensor in graph.ndata.items():
+                copied_graph.ndata[key] = tensor.clone()
+            for key, tensor in graph.edata.items():
+                copied_graph.edata[key] = tensor.clone()
+            runtime_graph = copied_graph.to(device)
             model.train()
             loss = model(runtime_graph)
             loss /= n_train
@@ -527,16 +546,20 @@ class MAGICRealBackend:
             edge_type_ids,
             dtype=torch_module.long,
         )
-        graph.ndata["type"] = node_types
-        graph.edata["type"] = edge_types
-        graph.ndata["attr"] = torch_module.nn.functional.one_hot(
-            node_types,
-            num_classes=vocabulary.node_feature_dim,
-        ).float()
-        graph.edata["attr"] = torch_module.nn.functional.one_hot(
-            edge_types,
-            num_classes=vocabulary.edge_feature_dim,
-        ).float()
+        graph.ndata["type"] = node_types.detach()
+        graph.edata["type"] = edge_types.detach()
+        graph.ndata["attr"] = (
+            torch_module.nn.functional.one_hot(
+                node_types,
+                num_classes=vocabulary.node_feature_dim,
+            ).float().detach()
+        )
+        graph.edata["attr"] = (
+            torch_module.nn.functional.one_hot(
+                edge_types,
+                num_classes=vocabulary.edge_feature_dim,
+            ).float().detach()
+        )
 
         fingerprint_payload = {
             "split": split.value,
@@ -651,6 +674,7 @@ class MAGICRealBackend:
                 optimizer=optimizer,
                 max_epoch=self.config.max_epoch,
                 device=self.device,
+                dgl_module=runtime.dgl,
             )
         else:
             model = runtime.train_entity_level(
