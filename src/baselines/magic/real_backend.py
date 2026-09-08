@@ -21,7 +21,7 @@ import subprocess
 import sys
 import threading
 
-from .contracts import NeutralGraphContract, SplitType
+from .contracts import NeutralGraphContract, SplitType, DuplicateEdgePolicy
 
 
 UPSTREAM_REPOSITORY = "https://github.com/FDUDSDE/MAGIC"
@@ -486,6 +486,14 @@ class MAGICRealBackend:
         vocabulary = contract.type_vocabulary
         assert vocabulary is not None
 
+        # Check duplicate policy from contract
+        # This is the public contract field set by MAGICInputAdapter
+        if contract.duplicate_policy is None:
+            raise ValueError(
+                "contract.duplicate_policy must be set. "
+                "Use MAGICInputAdapter with a valid profile before preparing graph."
+            )
+
         node_ids: List[str] = []
         canonical_to_local: Dict[str, int] = {}
 
@@ -494,18 +502,35 @@ class MAGICRealBackend:
                 canonical_to_local[node_id] = len(node_ids)
                 node_ids.append(node_id)
 
-        kept_edges: List[Any] = []
-        seen_pairs = set()
-        for edge in contract.get_sorted_edges():
-            pair = (edge.src, edge.dst)
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            if edge.src not in contract.nodes or edge.dst not in contract.nodes:
-                raise ValueError("edge references a node missing from contract.nodes")
-            add_node(edge.src)
-            add_node(edge.dst)
-            kept_edges.append(edge)
+        # Select edges based on contract's duplicate policy
+        if contract.duplicate_policy == DuplicateEdgePolicy.DEDUP_FIRST:
+            # Legacy behavior: keep only first edge for each (src, dst) pair
+            kept_edges: List[Any] = []
+            seen_pairs: set = set()
+            for edge in contract.get_sorted_edges():
+                pair = (edge.src, edge.dst)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                if edge.src not in contract.nodes or edge.dst not in contract.nodes:
+                    raise ValueError("edge references a node missing from contract.nodes")
+                add_node(edge.src)
+                add_node(edge.dst)
+                kept_edges.append(edge)
+        elif contract.duplicate_policy == DuplicateEdgePolicy.PRESERVE_ALL:
+            # ORTHRUS unified behavior: preserve all parallel edges
+            kept_edges = []
+            for edge in contract.get_sorted_edges():
+                if edge.src not in contract.nodes or edge.dst not in contract.nodes:
+                    raise ValueError("edge references a node missing from contract.nodes")
+                add_node(edge.src)
+                add_node(edge.dst)
+                kept_edges.append(edge)
+        else:
+            raise ValueError(
+                f"Unknown duplicate policy: {contract.duplicate_policy}. "
+                f"Supported policies: DEDUP_FIRST, PRESERVE_ALL"
+            )
 
         for node_id in sorted(contract.nodes):
             add_node(node_id)

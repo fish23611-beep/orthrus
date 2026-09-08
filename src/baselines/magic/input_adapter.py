@@ -7,6 +7,7 @@ MAGIC Canonical Input Adapter
 - 冻结合同: docs/MAGIC_BASELINE_ENVIRONMENT_CONTRACT.md
 - 审计报告: docs/MAGIC_BASELINE_INTEGRATION_AUDIT.md
 - 当前项目 canonical artifacts: src/data_utils.py
+- M9-P3C.1R 审计报告
 
 关键设计原则：
 1. Neutral Graph Contract 与 DGL 解耦
@@ -14,6 +15,11 @@ MAGIC Canonical Input Adapter
 3. Deterministic ordering: (timestamp, global_event_index)
 4. Split isolation: train/val/test 显式分离
 5. E3/E5 共用同一个 adapter
+6. 支持多种 profile：legacy_upstream / orthrus_unified
+
+支持的 Profile：
+- legacy_upstream: 上游兼容行为，READ/RECV/LOAD 反转，first-edge dedup
+- orthrus_unified: ORTHRUS production graph 协议，保持因果方向，保留所有边
 
 Python 3.8 兼容性：
 - 不使用类型注解中的内置类型 (使用 typing)
@@ -38,8 +44,11 @@ from .contracts import (
     TypeVocabulary,
     GraphSnapshot,
     UNKNOWN_TYPE,
-    MAGIC_REVERSED_EDGE_PREFIXES,
-    MAGIC_SIMPLE_GRAPH_POLICY,
+    ProfileType,
+    ProfileConfig,
+    PROFILE_CONFIGS,
+    DirectionPolicy,
+    DuplicateEdgePolicy,
 )
 
 
@@ -50,12 +59,15 @@ class MAGICInputAdapter:
     将 canonical THEIA artifacts 转换为 neutral MAGIC graph specification。
     支持 THEIA_E3 和 THEIA_E5。
 
+    支持两种 profile：
+    - legacy_upstream: 上游兼容行为
+    - orthrus_unified: ORTHRUS production graph 协议
+
     核心职责：
     1. 读取 canonical artifacts
-    2. 应用 MAGIC 方向规则 (READ/RECV/LOAD 反转)
-    3. 应用 simple graph 策略 (去重)
-    4. 构建 train-only type vocabulary
-    5. 生成 neutral graph contract
+    2. 应用 profile 指定的 direction 和 dedup 策略
+    3. 构建 train-only type vocabulary
+    4. 生成 neutral graph contract
 
     禁止行为：
     - 不读取 ground truth labels
@@ -69,6 +81,7 @@ class MAGICInputAdapter:
         train_records: List[Dict],
         val_records: Optional[List[Dict]] = None,
         test_records: Optional[List[Dict]] = None,
+        profile: str = "legacy_upstream",
     ):
         """
         Initialize the adapter.
@@ -78,11 +91,22 @@ class MAGICInputAdapter:
             train_records: List of canonical edge records for training
             val_records: List of canonical edge records for validation
             test_records: List of canonical edge records for testing
+            profile: Adapter profile ("legacy_upstream" or "orthrus_unified")
         """
         self.dataset = dataset
         self.train_records = train_records or []
         self.val_records = val_records or []
         self.test_records = test_records or []
+
+        # Profile configuration
+        profile_type = ProfileType(profile) if isinstance(profile, str) else profile
+        if profile_type not in PROFILE_CONFIGS:
+            raise ValueError(
+                f"Unknown profile: {profile}. "
+                f"Valid profiles: {[p.value for p in PROFILE_CONFIGS.keys()]}"
+            )
+        self._profile = PROFILE_CONFIGS[profile_type]
+        self._profile_name = profile_type
 
         # Type vocabulary - fitted on train only
         self._vocabulary: Optional[TypeVocabulary] = None
@@ -92,6 +116,16 @@ class MAGICInputAdapter:
 
         # Split isolation check
         self._fitted = False
+
+    @property
+    def profile(self) -> ProfileConfig:
+        """Get the current profile configuration."""
+        return self._profile
+
+    @property
+    def profile_name(self) -> ProfileType:
+        """Get the current profile name."""
+        return self._profile_name
 
     def fit(self) -> "MAGICInputAdapter":
         """
@@ -156,12 +190,14 @@ class MAGICInputAdapter:
 
         contract = NeutralGraphContract()
 
-        # Upstream sorts events before applying its NetworkX DiGraph
-        # first-edge policy. The global index is the canonical tie-break.
+        # Sort by (timestamp, global_event_index)
         ordered_records = sorted(records, key=self._record_order_key)
 
-        # Track seen (src, dst) pairs for simple graph policy
+        # Track seen (src, dst) pairs for dedup if profile requires it
         seen_pairs: Set[Tuple[str, str]] = set()
+
+        # Count edges for conservation check
+        edge_count_before = len(ordered_records)
 
         for record in ordered_records:
             # Extract fields from canonical artifact
@@ -176,7 +212,7 @@ class MAGICInputAdapter:
             if not src or not dst:
                 continue
 
-            # Apply MAGIC direction rule
+            # Apply profile-specific direction rule
             adjusted_src, adjusted_dst = self._apply_direction_rule(
                 src, dst, edge_type
             )
@@ -188,8 +224,8 @@ class MAGICInputAdapter:
 
             pair = (adjusted_src, adjusted_dst)
 
-            # Apply simple graph policy
-            if MAGIC_SIMPLE_GRAPH_POLICY == "first":
+            # Apply profile-specific dedup policy
+            if self._profile.should_dedup():
                 if pair in seen_pairs:
                     continue
                 seen_pairs.add(pair)
@@ -198,7 +234,7 @@ class MAGICInputAdapter:
             contract.add_node(adjusted_src, adjusted_src_type, split)
             contract.add_node(adjusted_dst, adjusted_dst_type, split)
 
-            # Create edge record - preserve original global_event_index
+            # Create edge record
             edge = EdgeRecord(
                 src=adjusted_src,
                 dst=adjusted_dst,
@@ -241,6 +277,10 @@ class MAGICInputAdapter:
         # Attach vocabulary
         contract.type_vocabulary = self._vocabulary
 
+        # Set duplicate policy based on profile configuration
+        # This is the public contract field that backend will use
+        contract.duplicate_policy = self._profile.duplicate_policy
+
         return contract
 
     def fit_transform(self) -> Tuple[
@@ -263,6 +303,7 @@ class MAGICInputAdapter:
         return train_contract, val_contract, test_contract
 
     def _record_order_key(self, record: Mapping) -> Tuple[int, int]:
+        """Generate sort key for deterministic ordering."""
         timestamp = record.get("t")
         if timestamp is None:
             timestamp = record.get("timestamp", 0)
@@ -278,9 +319,7 @@ class MAGICInputAdapter:
         edge_type: str,
     ) -> Tuple[str, str]:
         """
-        Apply MAGIC direction rule.
-
-        Events with READ/RECV/LOAD are reversed for causal direction.
+        Apply profile-specific direction rule.
 
         Args:
             src: Source node
@@ -290,10 +329,7 @@ class MAGICInputAdapter:
         Returns:
             Tuple of (adjusted_src, adjusted_dst)
         """
-        if edge_type and any(
-            edge_type.startswith(prefix)
-            for prefix in MAGIC_REVERSED_EDGE_PREFIXES
-        ):
+        if self._profile.should_reverse(edge_type):
             # Reverse the direction
             return dst, src
         return src, dst
@@ -312,6 +348,7 @@ class MAGICInputAdapter:
 def build_magic_input(
     dataset: str,
     canonical_artifacts: Dict[str, List[Dict]],
+    profile: str = "legacy_upstream",
 ) -> Tuple[NeutralGraphContract, NeutralGraphContract, NeutralGraphContract]:
     """
     Build MAGIC input from canonical artifacts.
@@ -320,6 +357,7 @@ def build_magic_input(
         dataset: Dataset name (THEIA_E3 or THEIA_E5)
         canonical_artifacts: Dict with 'train', 'validation', 'test' keys
             containing lists of canonical edge records
+        profile: Adapter profile ("legacy_upstream" or "orthrus_unified")
 
     Returns:
         Tuple of (train_contract, val_contract, test_contract)
@@ -329,6 +367,7 @@ def build_magic_input(
         train_records=canonical_artifacts.get("train", []),
         val_records=canonical_artifacts.get("validation", []),
         test_records=canonical_artifacts.get("test", []),
+        profile=profile,
     )
     return adapter.fit_transform()
 

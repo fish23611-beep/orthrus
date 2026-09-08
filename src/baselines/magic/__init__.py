@@ -40,10 +40,24 @@ from .contracts import (
     UNKNOWN_TYPE,
     MAGIC_REVERSED_EDGE_PREFIXES,
     MAGIC_SIMPLE_GRAPH_POLICY,
+    ProfileType,
+    ProfileConfig,
+    DirectionPolicy,
+    DuplicateEdgePolicy,
+    LEGACY_UPSTREAM_CONFIG,
+    ORTHRUS_UNIFIED_CONFIG,
 )
 
 # M3: MAGIC Input Adapter
 from .input_adapter import MAGICInputAdapter, build_magic_input
+
+# M3.5: ORTHRUS Predecessor (M9-P3C.2)
+from .orthrus_predecessor import (
+    OrthrusPredecessor,
+    OrthrusPredecessorError,
+    MissingRequiredFieldError,
+    is_verified_empty_day_marker,
+)
 
 # M4: Unified Causal Protocol
 from .protocol import (
@@ -99,9 +113,20 @@ __all__ = [
     "UNKNOWN_TYPE",
     "MAGIC_REVERSED_EDGE_PREFIXES",
     "MAGIC_SIMPLE_GRAPH_POLICY",
+    "ProfileType",
+    "ProfileConfig",
+    "DirectionPolicy",
+    "DuplicateEdgePolicy",
+    "LEGACY_UPSTREAM_CONFIG",
+    "ORTHRUS_UNIFIED_CONFIG",
     # M3 Adapter
     "MAGICInputAdapter",
     "build_magic_input",
+    # M3.5 ORTHRUS Predecessor
+    "OrthrusPredecessor",
+    "OrthrusPredecessorError",
+    "MissingRequiredFieldError",
+    "is_verified_empty_day_marker",
     # M4 Protocol
     "compute_validation_quantile_threshold",
     "merge_snapshot_scores",

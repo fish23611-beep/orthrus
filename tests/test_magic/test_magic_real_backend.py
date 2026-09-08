@@ -750,3 +750,276 @@ def test_prepared_graph_ndata_is_detached(contracts) -> None:
     for key in graph.edata:
         assert not graph.edata[key].requires_grad, \
             f"edata['{key}'] should not require grad"
+
+
+# =============================================================================
+# Duplicate Policy Tests (P3C.2.1)
+# =============================================================================
+
+def test_real_backend_legacy_dedup_first() -> None:
+    """Test that legacy_upstream profile results in DEDUP_FIRST behavior in backend.
+
+    Note: legacy_upstream reverses READ/RECV/LOAD events, so we use WRITE
+    to test dedup behavior without direction changes affecting the pair.
+    """
+    from src.baselines.magic.contracts import DuplicateEdgePolicy
+
+    # Create records with same src/dst but different events
+    # Use EVENT_WRITE to avoid direction reversal in legacy profile
+    records = [
+        {
+            "src": "A",
+            "dst": "B",
+            "src_type": "subject",
+            "dst_type": "file",
+            "edge_type": "EVENT_WRITE",
+            "timestamp": 1000,
+            "global_event_index": 0,
+        },
+        {
+            "src": "A",
+            "dst": "B",
+            "src_type": "subject",
+            "dst_type": "file",
+            "edge_type": "EVENT_OPEN",
+            "timestamp": 1001,
+            "global_event_index": 1,
+        },
+        {
+            "src": "A",
+            "dst": "B",
+            "src_type": "subject",
+            "dst_type": "file",
+            "edge_type": "EVENT_EXECUTE",
+            "timestamp": 1002,
+            "global_event_index": 2,
+        },
+    ]
+
+    adapter = MAGICInputAdapter(
+        dataset="TINY",
+        train_records=records,
+        profile="legacy_upstream",
+    )
+    contract = adapter.fit().transform(records, SplitType.TRAIN)
+
+    # Adapter should have already deduped (keep first for same pair)
+    # All 3 events have same (src, dst) = (A, B), so only first is kept
+    assert len(contract.edges) == 1
+    assert contract.edges[0].timestamp == 1000
+
+    # Contract should have DEDUP_FIRST policy
+    assert contract.duplicate_policy == DuplicateEdgePolicy.DEDUP_FIRST
+
+    # Backend should respect the policy
+    backend, harness = make_backend()
+    prepared = backend.prepare_graph(contract, SplitType.TRAIN, "test-snapshot")
+
+    # Edge count should remain 1 (already deduped at adapter level)
+    assert prepared.edge_count == 1
+
+
+def test_real_backend_orthrus_unified_preserves_parallel_edges() -> None:
+    """Test that orthrus_unified profile results in PRESERVE_ALL behavior in backend."""
+    from src.baselines.magic.contracts import DuplicateEdgePolicy
+
+    # Create records with same src/dst but different events
+    records = [
+        {
+            "src": "A",
+            "dst": "B",
+            "src_type": "file",
+            "dst_type": "subject",
+            "edge_type": "EVENT_READ",
+            "timestamp": 1000,
+            "global_event_index": 0,
+        },
+        {
+            "src": "A",
+            "dst": "B",
+            "src_type": "file",
+            "dst_type": "subject",
+            "edge_type": "EVENT_WRITE",
+            "timestamp": 1001,
+            "global_event_index": 1,
+        },
+        {
+            "src": "A",
+            "dst": "B",
+            "src_type": "file",
+            "dst_type": "subject",
+            "edge_type": "EVENT_OPEN",
+            "timestamp": 1002,
+            "global_event_index": 2,
+        },
+    ]
+
+    adapter = MAGICInputAdapter(
+        dataset="TINY",
+        train_records=records,
+        profile="orthrus_unified",
+    )
+    contract = adapter.fit().transform(records, SplitType.TRAIN)
+
+    # Adapter should preserve all 3 edges
+    assert len(contract.edges) == 3
+
+    # Contract should have PRESERVE_ALL policy
+    assert contract.duplicate_policy == DuplicateEdgePolicy.PRESERVE_ALL
+
+    # Backend should respect the policy and keep all edges
+    backend, harness = make_backend()
+    prepared = backend.prepare_graph(contract, SplitType.TRAIN, "test-snapshot")
+
+    # Edge count should be 3 (all preserved)
+    assert prepared.edge_count == 3
+
+
+def test_real_backend_profile_policy_propagated_from_contract() -> None:
+    """Test that policy is correctly propagated from adapter to contract to backend."""
+    from src.baselines.magic.contracts import DuplicateEdgePolicy
+
+    records = [
+        {
+            "src": "X",
+            "dst": "Y",
+            "src_type": "file",
+            "dst_type": "subject",
+            "edge_type": "EVENT_EXECUTE",
+            "timestamp": 500,
+            "global_event_index": 0,
+        },
+        {
+            "src": "X",
+            "dst": "Y",
+            "src_type": "file",
+            "dst_type": "subject",
+            "edge_type": "EVENT_CONNECT",
+            "timestamp": 501,
+            "global_event_index": 1,
+        },
+    ]
+
+    # Test orthrus_unified propagation
+    adapter_orthrus = MAGICInputAdapter(
+        dataset="TINY",
+        train_records=records,
+        profile="orthrus_unified",
+    )
+    contract_orthrus = adapter_orthrus.fit().transform(records, SplitType.TRAIN)
+
+    assert contract_orthrus.duplicate_policy == DuplicateEdgePolicy.PRESERVE_ALL
+    assert contract_orthrus.should_dedup() is False
+
+    backend, _ = make_backend()
+    prepared_orthrus = backend.prepare_graph(
+        contract_orthrus, SplitType.TRAIN, "orthrus-snapshot"
+    )
+    assert prepared_orthrus.edge_count == 2
+
+    # Test legacy_upstream propagation
+    adapter_legacy = MAGICInputAdapter(
+        dataset="TINY",
+        train_records=records,
+        profile="legacy_upstream",
+    )
+    contract_legacy = adapter_legacy.fit().transform(records, SplitType.TRAIN)
+
+    assert contract_legacy.duplicate_policy == DuplicateEdgePolicy.DEDUP_FIRST
+    assert contract_legacy.should_dedup() is True
+
+    prepared_legacy = backend.prepare_graph(
+        contract_legacy, SplitType.TRAIN, "legacy-snapshot"
+    )
+    assert prepared_legacy.edge_count == 1
+
+
+def test_real_backend_unknown_duplicate_policy_fails() -> None:
+    """Test that backend raises error for contract with unknown/None duplicate_policy."""
+    from src.baselines.magic.contracts import (
+        NeutralGraphContract,
+        TypeVocabulary,
+    )
+
+    # Create a contract with vocabulary but duplicate_policy not set
+    vocab = TypeVocabulary().fit(
+        {"A": "file", "B": "subject"},
+        {"EVENT_EXECUTE": "EVENT_EXECUTE"}
+    )
+
+    contract = NeutralGraphContract()
+    contract.type_vocabulary = vocab
+    contract.duplicate_policy = None  # Explicitly set to None
+
+    backend, _ = make_backend()
+
+    with pytest.raises(ValueError, match="duplicate_policy must be set"):
+        backend.prepare_graph(contract, SplitType.TRAIN, "test-snapshot")
+
+
+def test_legacy_magic_backend_behavior_unchanged() -> None:
+    """Regression test: legacy behavior should be preserved.
+
+    Note: legacy_upstream reverses READ/RECV/LOAD events, so we use
+    non-reversed event types to test dedup behavior.
+    """
+    from src.baselines.magic.contracts import DuplicateEdgePolicy
+
+    # Create records with multiple pairs
+    # Use EVENT_WRITE and EVENT_CONNECT to avoid direction reversal
+    records = [
+        # Pair 1: 2 events (same src/dst)
+        {
+            "src": "A",
+            "dst": "B",
+            "src_type": "subject",
+            "dst_type": "file",
+            "edge_type": "EVENT_WRITE",
+            "timestamp": 100,
+            "global_event_index": 0,
+        },
+        {
+            "src": "A",
+            "dst": "B",
+            "src_type": "subject",
+            "dst_type": "file",
+            "edge_type": "EVENT_OPEN",
+            "timestamp": 101,
+            "global_event_index": 1,
+        },
+        # Pair 2: 1 event
+        {
+            "src": "C",
+            "dst": "D",
+            "src_type": "netflow",
+            "dst_type": "subject",
+            "edge_type": "EVENT_CONNECT",
+            "timestamp": 102,
+            "global_event_index": 2,
+        },
+    ]
+
+    adapter = MAGICInputAdapter(
+        dataset="TINY",
+        train_records=records,
+        profile="legacy_upstream",
+    )
+    contract = adapter.fit().transform(records, SplitType.TRAIN)
+
+    # Legacy adapter should dedup: keep first event for each pair
+    # Pair 1: keep event at timestamp 100 (WRITE)
+    # Pair 2: keep event at timestamp 102 (CONNECT)
+    assert len(contract.edges) == 2
+    assert contract.duplicate_policy == DuplicateEdgePolicy.DEDUP_FIRST
+
+    backend, _ = make_backend()
+    prepared = backend.prepare_graph(contract, SplitType.TRAIN, "legacy-snapshot")
+
+    # Backend should preserve the already-deduped edges
+    assert prepared.edge_count == 2
+
+    # Verify specific timestamps are preserved
+    edge_timestamps = [e.timestamp for e in contract.edges]
+    assert 100 in edge_timestamps  # First event of pair 1
+    assert 102 in edge_timestamps  # Event of pair 2
+    assert 101 not in edge_timestamps  # Second event of pair 1 (deduped)

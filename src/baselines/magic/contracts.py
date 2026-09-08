@@ -233,6 +233,7 @@ class NeutralGraphContract:
     - Type vocabulary
     - Split information
     - Node-ID to local-ID mapping
+    - Duplicate edge policy (set by adapter based on profile)
     """
     # Node and edge records
     nodes: Mapping = field(default_factory=dict)
@@ -240,6 +241,10 @@ class NeutralGraphContract:
 
     # Type vocabulary (fitted on train)
     type_vocabulary: Optional[TypeVocabulary] = field(default=None)
+
+    # Duplicate edge policy - determines backend dedup behavior
+    # Set by MAGICInputAdapter based on profile configuration
+    duplicate_policy: Optional[DuplicateEdgePolicy] = field(default=None)
 
     # Split statistics
     train_node_count: int = field(default=0, repr=False)
@@ -255,6 +260,23 @@ class NeutralGraphContract:
     # Unseen type statistics
     unseen_node_types: Dict = field(default_factory=dict, repr=False)
     unseen_edge_types: Dict = field(default_factory=dict, repr=False)
+
+    def should_dedup(self) -> bool:
+        """
+        Check if duplicate edges should be deduplicated based on policy.
+
+        Returns:
+            True if first-edge dedup should be applied
+
+        Raises:
+            ValueError: If duplicate_policy is not set
+        """
+        if self.duplicate_policy is None:
+            raise ValueError(
+                "NeutralGraphContract.duplicate_policy must be set. "
+                "Call MAGICInputAdapter with a valid profile before transform."
+            )
+        return self.duplicate_policy == DuplicateEdgePolicy.DEDUP_FIRST
 
     def add_node(self, node_id: str, node_type: str, split: SplitType) -> None:
         """Add a node record."""
@@ -394,9 +416,98 @@ class ThresholdConfig:
 # Unknown type token for unseen types
 UNKNOWN_TYPE = "__UNKNOWN__"
 
-# MAGIC official edge type direction rules
-# Events with READ/RECV/LOAD are reversed for causal direction
-MAGIC_REVERSED_EDGE_PREFIXES = ("EVENT_READ", "EVENT_RECV", "EVENT_LOAD")
+# =============================================================================
+# Profile Definitions
+# =============================================================================
 
-# MAGIC simple graph policy: only keep first edge for (src, dst) pair
+class ProfileType(Enum):
+    """MAGIC adapter profile types."""
+    LEGACY_UPSTREAM = "legacy_upstream"
+    ORTHRUS_UNIFIED = "orthrus_unified"
+
+
+class DirectionPolicy(Enum):
+    """Edge direction handling policy."""
+    # Apply reversal for READ/RECV/LOAD (upstream-compatible)
+    REVERSE_CAUSAL = "reverse_causal"
+    # Keep source direction as-is (ORTHRUS nx already causal)
+    KEEP_SOURCE = "keep_source"
+
+
+class DuplicateEdgePolicy(Enum):
+    """Duplicate edge handling policy."""
+    # Only keep first edge for (src, dst) pair (upstream-compatible)
+    DEDUP_FIRST = "dedup_first"
+    # Preserve all parallel edges (ORTHRUS nx preserves all)
+    PRESERVE_ALL = "preserve_all"
+
+
+@dataclass(frozen=True)
+class ProfileConfig:
+    """
+    Adapter profile configuration.
+
+    Defines how the adapter handles direction, duplicates, and other semantics.
+    """
+    name: ProfileType
+    direction_policy: DirectionPolicy
+    duplicate_policy: DuplicateEdgePolicy
+    description: str
+
+    def should_reverse(self, edge_type: str) -> bool:
+        """
+        Check if an edge type should be reversed based on profile.
+
+        Args:
+            edge_type: The edge type string
+
+        Returns:
+            True if direction should be reversed
+        """
+        if self.direction_policy == DirectionPolicy.KEEP_SOURCE:
+            return False
+        elif self.direction_policy == DirectionPolicy.REVERSE_CAUSAL:
+            return any(
+                edge_type.startswith(prefix)
+                for prefix in LEGACY_REVERSED_EDGE_PREFIXES
+            )
+        return False
+
+    def should_dedup(self) -> bool:
+        """
+        Check if duplicate edges should be deduplicated.
+
+        Returns:
+            True if first-edge dedup should be applied
+        """
+        return self.duplicate_policy == DuplicateEdgePolicy.DEDUP_FIRST
+
+
+# Profile configurations
+LEGACY_UPSTREAM_CONFIG = ProfileConfig(
+    name=ProfileType.LEGACY_UPSTREAM,
+    direction_policy=DirectionPolicy.REVERSE_CAUSAL,
+    duplicate_policy=DuplicateEdgePolicy.DEDUP_FIRST,
+    description="Upstream-compatible behavior: READ/RECV/LOAD reversed, first-edge dedup"
+)
+
+ORTHRUS_UNIFIED_CONFIG = ProfileConfig(
+    name=ProfileType.ORTHRUS_UNIFIED,
+    direction_policy=DirectionPolicy.KEEP_SOURCE,
+    duplicate_policy=DuplicateEdgePolicy.PRESERVE_ALL,
+    description="ORTHRUS production graph protocol: causal direction preserved, all edges kept"
+)
+
+PROFILE_CONFIGS = {
+    ProfileType.LEGACY_UPSTREAM: LEGACY_UPSTREAM_CONFIG,
+    ProfileType.ORTHRUS_UNIFIED: ORTHRUS_UNIFIED_CONFIG,
+}
+
+
+# Legacy constants (for backward compatibility)
+# Events with READ/RECV/LOAD are reversed for causal direction
+LEGACY_REVERSED_EDGE_PREFIXES = ("EVENT_READ", "EVENT_RECV", "EVENT_LOAD")
+MAGIC_REVERSED_EDGE_PREFIXES = LEGACY_REVERSED_EDGE_PREFIXES  # Alias for backward compat
+
+# Legacy simple graph policy: only keep first edge for (src, dst) pair
 MAGIC_SIMPLE_GRAPH_POLICY = "first"
