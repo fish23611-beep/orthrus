@@ -307,12 +307,15 @@ def run_synthetic_e2e(
     predictions = apply_threshold(test_node_scores, threshold_config)
 
     # Step 8: Compute metrics (if ground truth provided)
+    # FIXED (FORMAL-F1): use TEST_NODE_UNIVERSE as evaluation universe
     metrics = None
     if ground_truth is not None:
+        test_node_ids = sorted(test_node_scores.keys())
         metrics = compute_magic_metrics(
-            ground_truth=ground_truth,
+            test_node_ids=test_node_ids,
             predictions=predictions,
             scores=test_node_scores,
+            ground_truth=ground_truth,
         )
 
     # Step 9: Write artifacts

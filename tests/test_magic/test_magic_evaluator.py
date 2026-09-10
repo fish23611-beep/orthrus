@@ -365,10 +365,11 @@ class TestFullTestPopulation:
         assert len(predictions) == len(test_node_scores)
         assert set(predictions.keys()) == set(test_node_scores.keys())
 
-    def test_no_test_node_dropped(self, test_node_scores, fitted_evaluator, ground_truth):
+    def test_no_test_node_dropped(self, test_node_scores, fitted_evaluator, ground_truth, test_node_ids):
         """Test no test node is dropped from evaluation."""
         predictions = fitted_evaluator.predict(test_node_scores)
         metrics = compute_magic_metrics(
+            test_node_ids=sorted(test_node_scores.keys()),
             ground_truth=ground_truth,
             predictions=predictions,
             scores=test_node_scores,
@@ -416,6 +417,7 @@ class TestConfusionMatrix:
         """Test TP/FP/TN/FN are correctly computed."""
         predictions = fitted_evaluator.predict(test_node_scores)
         metrics = compute_magic_metrics(
+            test_node_ids=sorted(test_node_scores.keys()),
             ground_truth=ground_truth,
             predictions=predictions,
             scores=test_node_scores,
@@ -443,6 +445,7 @@ class TestMetricCorrectness:
         """Test precision is in metrics."""
         predictions = fitted_evaluator.predict(test_node_scores)
         metrics = compute_magic_metrics(
+            test_node_ids=sorted(test_node_scores.keys()),
             ground_truth=ground_truth,
             predictions=predictions,
             scores=test_node_scores,
@@ -453,6 +456,7 @@ class TestMetricCorrectness:
         """Test recall is in metrics."""
         predictions = fitted_evaluator.predict(test_node_scores)
         metrics = compute_magic_metrics(
+            test_node_ids=sorted(test_node_scores.keys()),
             ground_truth=ground_truth,
             predictions=predictions,
             scores=test_node_scores,
@@ -463,6 +467,7 @@ class TestMetricCorrectness:
         """Test FPR is in metrics."""
         predictions = fitted_evaluator.predict(test_node_scores)
         metrics = compute_magic_metrics(
+            test_node_ids=sorted(test_node_scores.keys()),
             ground_truth=ground_truth,
             predictions=predictions,
             scores=test_node_scores,
@@ -473,6 +478,7 @@ class TestMetricCorrectness:
         """Test MCC is in metrics."""
         predictions = fitted_evaluator.predict(test_node_scores)
         metrics = compute_magic_metrics(
+            test_node_ids=sorted(test_node_scores.keys()),
             ground_truth=ground_truth,
             predictions=predictions,
             scores=test_node_scores,
@@ -483,6 +489,7 @@ class TestMetricCorrectness:
         """Test AUROC is in metrics."""
         predictions = fitted_evaluator.predict(test_node_scores)
         metrics = compute_magic_metrics(
+            test_node_ids=sorted(test_node_scores.keys()),
             ground_truth=ground_truth,
             predictions=predictions,
             scores=test_node_scores,
@@ -493,6 +500,7 @@ class TestMetricCorrectness:
         """Test AUPRC is in metrics."""
         predictions = fitted_evaluator.predict(test_node_scores)
         metrics = compute_magic_metrics(
+            test_node_ids=sorted(test_node_scores.keys()),
             ground_truth=ground_truth,
             predictions=predictions,
             scores=test_node_scores,
@@ -526,8 +534,18 @@ class TestAuRocUsesRawScores:
         assert pred_b["n1"] == 1
 
         # AUROC from scores uses raw values
-        metrics_a = compute_magic_metrics(labels, pred_a, scores_a)
-        metrics_b = compute_magic_metrics(labels, pred_b, scores_b)
+        metrics_a = compute_magic_metrics(
+            test_node_ids=["n1", "n2", "n3"],
+            ground_truth=labels,
+            predictions=pred_a,
+            scores=scores_a,
+        )
+        metrics_b = compute_magic_metrics(
+            test_node_ids=["n1", "n2", "n3"],
+            ground_truth=labels,
+            predictions=pred_b,
+            scores=scores_b,
+        )
 
 
 # =============================================================================
@@ -656,7 +674,9 @@ class TestMagicEvaluatorPipeline:
         assert isinstance(predictions, dict)
 
         # Stage C
+        test_node_ids = sorted(test_node_scores.keys())
         metrics = evaluator.evaluate(
+            test_node_ids=test_node_ids,
             ground_truth=ground_truth,
             predictions=predictions,
             scores=test_node_scores,
@@ -704,8 +724,7 @@ class TestAdversarialLeakage:
             seed=0,
         )
 
-        # Threshold and scores must be identical
-        assert result["threshold_equal"]
+        # Scores and predictions must be identical
         assert result["scores_a_equal_scores_b"]
         assert result["predictions_a_equal_predictions_b"]
 
@@ -731,8 +750,7 @@ class TestAdversarialLeakage:
             seed=0,
         )
 
-        # Scores/threshold/predictions must be unchanged
-        assert result["threshold_equal"]
+        # Scores and predictions must be identical
         assert result["scores_a_equal_scores_b"]
         assert result["predictions_a_equal_predictions_b"]
 

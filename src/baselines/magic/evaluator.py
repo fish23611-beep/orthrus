@@ -25,13 +25,15 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import (
     Any,
     Dict,
     List,
     Mapping,
     Optional,
+    Set,
     Tuple,
 )
 
@@ -126,45 +128,204 @@ def predict_magic(
 
 
 # =============================================================================
-# Stage C: Compute Metrics
+# Ground Truth Loader
 # =============================================================================
 
+def load_magic_ground_truth(
+    gt_root: Path,
+) -> Tuple[Dict[str, int], Dict[str, str], List[str]]:
+    """
+    Load THEIA ground truth with authoritative UUID -> integer index_id mapping.
+
+    CSV format (from DARPA THEIA dataset):
+        node_uuid, "{'node_type': 'display_label'}", index_id
+
+    This function:
+    1. Reads node_uuid (col 1) and index_id (col 3) from each CSV
+    2. Maps each UUID to its integer index_id (the ORTHRUS graph node ID)
+    3. Returns ground_truth as {str(index_id): 1} for all anomaly nodes
+
+    Authoritative mapping source: Ground_Truth CSV files' third column (index_id),
+    which is the same field used by ORTHRUS graph construction
+    (src/graph_construction/build_orthrus_graphs.py: src_index_id/dst_index_id).
+
+    Args:
+        gt_root: Path to Ground_Truth/darpa/darpa/E3-THEIA/ or equivalent
+
+    Returns:
+        Tuple of:
+        - ground_truth: Dict[str(index_id)] = 1 for anomaly nodes
+        - uuid_to_index_id: Dict[uuid] = str(index_id)
+        - unmapped_uuids: List of UUIDs that had no index_id (should be empty)
+
+    Raises:
+        ValueError: If any UUID is missing its index_id column
+    """
+    ground_truth: Dict[str, int] = {}
+    uuid_to_index_id: Dict[str, str] = {}
+    unmapped_uuids: List[str] = []
+
+    if not gt_root.is_dir():
+        raise FileNotFoundError(
+            f"Ground truth root not found: {gt_root}. "
+            f"Expected directory containing E3-THEIA/ (or E5-THEIA/) subdirectory."
+        )
+
+    # Support both E3 and E5 naming
+    theia_dirs = [
+        gt_root / "E3-THEIA",
+        gt_root / "E5-THEIA",
+        gt_root,  # fallback: CSV files directly under gt_root
+    ]
+
+    csv_paths: List[Path] = []
+    for td in theia_dirs:
+        if td.is_dir():
+            csv_paths.extend(sorted(td.glob("node_*.csv")))
+        elif td == gt_root:
+            csv_paths.extend(sorted(gt_root.glob("node_*.csv")))
+
+    if not csv_paths:
+        raise FileNotFoundError(
+            f"No node_*.csv files found under {gt_root}. "
+            f"Searched: {[str(d) for d in theia_dirs]}"
+        )
+
+    for csv_path in csv_paths:
+        with open(csv_path, newline="") as fh:
+            for lineno, raw in enumerate(fh):
+                parts = raw.rstrip("\n").split(",", 2)
+                if not parts or not parts[0].strip():
+                    continue
+                first_col = parts[0].strip()
+                # Skip header row: if first column looks like a column name (no dashes)
+                # rather than a UUID (which always has dashes).
+                # The real GT files have no header; synthetic test files may.
+                # Conservative check: lines where first col has no '-' and is not a UUID
+                # are treated as headers.
+                if lineno == 0 and "-" not in first_col:
+                    # Likely a header row (column names)
+                    continue
+                uuid = first_col
+                if len(parts) < 3:
+                    raise ValueError(
+                        f"Ground truth CSV {csv_path} line has < 3 columns: "
+                        f"{raw!r}. Expected: uuid,label,index_id"
+                    )
+                index_id_str = parts[2].strip()
+                # index_id must be parseable as integer
+                try:
+                    int(index_id_str)
+                except ValueError:
+                    raise ValueError(
+                        f"Ground truth CSV {csv_path} line has non-integer index_id "
+                        f"in column 3: {parts!r}. Expected integer index_id "
+                        f"(the ORTHRUS graph node identifier)."
+                    )
+                uuid_to_index_id[uuid] = index_id_str
+                ground_truth[index_id_str] = 1
+
+    return ground_truth, uuid_to_index_id, unmapped_uuids
+
+
+# =============================================================================
+# Stage C: Compute Metrics — Fixed Universe Contract
+# =============================================================================
+
+class EvaluationUniverseError(ValueError):
+    """Raised when prediction/score universe does not match test node universe."""
+    pass
+
+
 def compute_magic_metrics(
-    ground_truth: Mapping[str, int],
+    test_node_ids: List[str],
     predictions: Mapping[str, int],
     scores: Mapping[str, float],
+    ground_truth: Optional[Mapping[str, int]] = None,
 ) -> Dict[str, Any]:
     """
     Stage C: Compute metrics using ground truth.
 
-    这是唯一接收 ground truth 的阶段。
-
-    复用 src/mstc/metrics.py 中的指标计算。
+    正式合同（FORMAL-F1）：
+    - EVALUATION_UNIVERSE = TEST_NODE_UNIVERSE（所有进入 test scoring 的 canonical integer node IDs）
+    - y_true = 1 if node_id in ground_truth else 0  （仅对 test universe 中的节点判定 true label）
+    - GT node 不在 TEST_NODE_UNIVERSE → 不加入 universe，不计为 FN（仅报告 GT_OUTSIDE_TEST_COUNT）
+    - predictions 和 scores 必须对每个 test node 都存在，不接受 .get(x, 0) 静默掩盖缺失
 
     Args:
-        ground_truth: Dict mapping canonical_node_id to 0/1
-        predictions: Dict mapping canonical_node_id to 0/1
-        scores: Dict mapping canonical_node_id to raw anomaly score
+        test_node_ids: Ordered list of all canonical integer node IDs in the test split.
+                       This is the EVALUATION_UNIVERSE.
+        predictions: Dict mapping canonical_node_id (str) to 0/1 prediction.
+                     Must contain ALL test_node_ids as keys.
+        scores: Dict mapping canonical_node_id (str) to raw anomaly score.
+                 Must contain ALL test_node_ids as keys.
+        ground_truth: Dict mapping str(index_id) to 1 for anomaly nodes.
+                       May be None (for diagnostic runs without GT).
 
     Returns:
-        Dict with metrics: precision, recall, f1, mcc, auprc, auroc, fpr, tp, fp, tn, fn
+        Dict with metrics: precision, recall, f1, mcc, auprc, auroc, fpr, tp, fp, tn, fn,
+        plus: gt_total, gt_in_test, gt_outside_test, test_node_count
+
+    Raises:
+        EvaluationUniverseError: If any test node is missing from predictions or scores.
     """
-    # Import and use project metrics
     from src.mstc.metrics import compute_classification_metrics
 
-    # Collect aligned arrays
-    node_ids = list(ground_truth.keys())
+    # ---- Universe enforcement: fail-fast on missing ----
+    test_node_set = set(test_node_ids)
+    pred_keys = set(predictions.keys())
+    score_keys = set(scores.keys())
 
-    y_true = [ground_truth[nid] for nid in node_ids]
-    y_pred = [predictions.get(nid, 0) for nid in node_ids]
-    score_values = [scores.get(nid, 0.0) for nid in node_ids]
+    missing_pred = sorted(test_node_set - pred_keys)
+    missing_score = sorted(test_node_set - score_keys)
 
-    # Compute metrics using project implementation
+    if missing_pred:
+        raise EvaluationUniverseError(
+            f"Missing predictions for {len(missing_pred)} test nodes: "
+            f"{missing_pred[:10]}{'...' if len(missing_pred) > 10 else ''}. "
+            f"Every test node must have a prediction."
+        )
+    if missing_score:
+        raise EvaluationUniverseError(
+            f"Missing scores for {len(missing_score)} test nodes: "
+            f"{missing_score[:10]}{'...' if len(missing_score) > 10 else ''}. "
+            f"Every test node must have a score."
+        )
+
+    # ---- Build aligned arrays from TEST_NODE_UNIVERSE ----
+    node_ids = test_node_ids  # ordered, canonical
+    y_pred = [predictions[nid] for nid in node_ids]
+
+    # ---- y_true: only for nodes in both test_universe AND ground_truth ----
+    if ground_truth is not None:
+        gt_keys = set(ground_truth.keys())
+        y_true = [1 if nid in gt_keys else 0 for nid in node_ids]
+    else:
+        # No GT: all labels = 0 (all benign diagnostic)
+        y_true = [0] * len(node_ids)
+
+    score_values = [scores[nid] for nid in node_ids]
+
+    # ---- Compute metrics ----
     metrics = compute_classification_metrics(
         y_true=y_true,
         y_pred=y_pred,
         scores=score_values,
     )
+
+    # ---- GT coverage diagnostics ----
+    if ground_truth is not None:
+        gt_in_test = sum(1 for nid in node_ids if nid in ground_truth)
+        gt_outside_test = len(ground_truth) - gt_in_test
+    else:
+        gt_in_test = 0
+        gt_outside_test = 0
+
+    # ---- Enrich with provenance ----
+    metrics["gt_total"] = len(ground_truth) if ground_truth is not None else 0
+    metrics["gt_in_test"] = gt_in_test
+    metrics["gt_outside_test"] = gt_outside_test
+    metrics["test_node_count"] = len(node_ids)
 
     return metrics
 
@@ -209,6 +370,11 @@ class MagicRunResult:
     fp: int = 0
     tn: int = 0
     fn: int = 0
+
+    # GT provenance
+    gt_total: int = 0
+    gt_in_test: int = 0
+    gt_outside_test: int = 0
 
     # Provenance
     dataset: str = ""
@@ -257,7 +423,8 @@ def write_metrics_json(
         method, score_method, k, merge_method, threshold_method,
         threshold_quantile, threshold, threshold_provenance,
         validation_score_count, precision, recall, f1, mcc,
-        auprc, auroc, fpr, tp, fp, tn, fn
+        auprc, auroc, fpr, tp, fp, tn, fn,
+        gt_total, gt_in_test, gt_outside_test, test_node_count
 
     Args:
         result: MagicRunResult
@@ -284,6 +451,10 @@ def write_metrics_json(
         "fp": result.fp,
         "tn": result.tn,
         "fn": result.fn,
+        "gt_total": result.gt_total,
+        "gt_in_test": result.gt_in_test,
+        "gt_outside_test": result.gt_outside_test,
+        "test_node_count": result.test_node_count if hasattr(result, "test_node_count") else 0,
     }
 
     with open(output_path, "w") as f:
@@ -350,53 +521,80 @@ class MagicEvaluator:
         test_node_scores: Mapping[str, float],
     ) -> Dict[str, int]:
         """
-        Stage B: Apply threshold to test scores.
+        Stage B: Apply frozen threshold to test scores.
 
         Args:
             test_node_scores: Merged test node scores
 
         Returns:
-            Dict mapping canonical_node_id to prediction
+            Dict mapping node_id to prediction (0 or 1)
         """
         if self._threshold_config is None:
-            raise RuntimeError(
-                "Threshold not fitted. Call fit_threshold first."
-            )
+            raise RuntimeError("Threshold not fitted. Call fit_threshold() first.")
         return predict_magic(test_node_scores, self._threshold_config)
 
-    def evaluate(
+    def compute_metrics(
         self,
-        ground_truth: Mapping[str, int],
+        test_node_ids: List[str],
         predictions: Mapping[str, int],
         scores: Mapping[str, float],
+        ground_truth: Optional[Mapping[str, int]] = None,
     ) -> Dict[str, Any]:
         """
         Stage C: Compute metrics.
 
         Args:
-            ground_truth: Dict mapping node_id to 0/1
+            test_node_ids: Ordered list of all test canonical node IDs (EVALUATION_UNIVERSE)
             predictions: Dict mapping node_id to 0/1
-            scores: Dict mapping node_id to raw score
+            scores: Dict mapping node_id to raw anomaly score
+            ground_truth: Dict mapping str(index_id) to 1, or None
 
         Returns:
             Metrics dict
         """
-        return compute_magic_metrics(ground_truth, predictions, scores)
+        return compute_magic_metrics(
+            test_node_ids=test_node_ids,
+            predictions=predictions,
+            scores=scores,
+            ground_truth=ground_truth,
+        )
 
     @property
     def threshold_config(self) -> Optional[ThresholdConfig]:
-        """Get frozen threshold config."""
+        """Get the fitted threshold config."""
         return self._threshold_config
 
     @property
     def is_threshold_fitted(self) -> bool:
-        """Check if threshold is fitted."""
+        """True if threshold has been fitted."""
         return self._threshold_config is not None
 
+    def evaluate(
+        self,
+        test_node_ids: List[str],
+        predictions: Mapping[str, int],
+        scores: Mapping[str, float],
+        ground_truth: Optional[Mapping[str, int]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Full evaluation pipeline (Stage C).
 
-# =============================================================================
-# Adversarial Test Helper
-# =============================================================================
+        Args:
+            test_node_ids: Ordered list of all test canonical node IDs
+            predictions: Dict mapping node_id to 0/1
+            scores: Dict mapping node_id to raw anomaly score
+            ground_truth: Dict mapping str(index_id) to 1, or None
+
+        Returns:
+            Metrics dict
+        """
+        return self.compute_metrics(
+            test_node_ids=test_node_ids,
+            predictions=predictions,
+            scores=scores,
+            ground_truth=ground_truth,
+        )
+
 
 def verify_label_independence(
     train_embeddings: np.ndarray,
@@ -408,12 +606,16 @@ def verify_label_independence(
     ground_truth_a: Mapping[str, int],
     ground_truth_b: Mapping[str, int],
     k: int = 10,
-    seed: Optional[int] = None,
+    seed: int = 0,
 ) -> Dict[str, Any]:
     """
-    Verify that changing ground truth labels does not affect scores/predictions.
+    Verify that changing ground truth labels does not affect model behavior.
 
-    This is an adversarial leakage test.
+    A: ground_truth_a
+    B: ground_truth_b
+
+    Model, scorer, and scores should be identical.
+    Only metrics should differ.
 
     Args:
         train_embeddings: Training embeddings
@@ -425,17 +627,11 @@ def verify_label_independence(
         ground_truth_a: First ground truth mapping
         ground_truth_b: Second ground truth mapping
         k: K for KNN
-        seed: Explicit seed for the scorer (required: 0, 1, or 2)
+        seed: Random seed
 
     Returns:
         Dict with verification results
     """
-    if seed is None:
-        raise ValueError(
-            "verify_label_independence requires an explicit seed "
-            "(official seeds: 0, 1, 2)."
-        )
-    # Fit scorer
     scorer = MAGICEntityScorer(k=k, seed=seed)
     scorer.fit(train_embeddings, train_node_ids)
 
@@ -445,9 +641,9 @@ def verify_label_independence(
 
     # Merge (simplified - no snapshots)
     val_node_scores_a = {r.canonical_node_id: r.score_raw for r in val_scores_a}
-    val_node_scores_b = val_node_scores_a
+    val_node_scores_b = {r.canonical_node_id: r.score_raw for r in val_scores_b}
 
-    # Fit threshold
+    # Threshold
     threshold_config_a = fit_magic_threshold(val_node_scores_a)
     threshold_config_b = fit_magic_threshold(val_node_scores_b)
 
@@ -457,20 +653,19 @@ def verify_label_independence(
 
     # Merge
     test_node_scores_a = {r.canonical_node_id: r.score_raw for r in test_scores_a}
-    test_node_scores_b = test_node_scores_a
+    test_node_scores_b = {r.canonical_node_id: r.score_raw for r in test_scores_b}
 
     # Predict
-    predictions_a = predict_magic(test_node_scores_a, threshold_config_a)
-    predictions_b = predict_magic(test_node_scores_b, threshold_config_b)
+    predictions_a = apply_threshold(test_node_scores_a, threshold_config_a)
+    predictions_b = apply_threshold(test_node_scores_b, threshold_config_b)
 
-    # Verify independence
     return {
-        "threshold_a": threshold_config_a.threshold_value,
-        "threshold_b": threshold_config_b.threshold_value,
-        "threshold_equal": threshold_config_a.threshold_value == threshold_config_b.threshold_value,
+        "val_scores_a_equal_val_scores_b": val_node_scores_a == val_node_scores_b,
+        "test_scores_a_equal_test_scores_b": test_node_scores_a == test_node_scores_b,
         "scores_a_equal_scores_b": test_node_scores_a == test_node_scores_b,
         "predictions_a_equal_predictions_b": predictions_a == predictions_b,
         "labels_changed": ground_truth_a != ground_truth_b,
-        "metrics_a": compute_magic_metrics(ground_truth_a, predictions_a, test_node_scores_a),
-        "metrics_b": compute_magic_metrics(ground_truth_b, predictions_b, test_node_scores_b),
+        "threshold_equal": threshold_config_a.threshold_value == threshold_config_b.threshold_value,
+        "metrics_a": compute_magic_metrics(test_node_ids, predictions_a, test_node_scores_a, ground_truth_a),
+        "metrics_b": compute_magic_metrics(test_node_ids, predictions_b, test_node_scores_b, ground_truth_b),
     }
