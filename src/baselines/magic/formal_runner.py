@@ -457,6 +457,54 @@ def embed_graph(model, graph, device: str) -> Tuple[Any, List[str]]:
     return emb_np, nids
 
 
+def _create_magic_backend(
+    *,
+    seed: int,
+    model_config: Optional[MAGICModelConfig],
+    device: str,
+    upstream_path: Optional[Path],
+) -> MAGICRealBackend:
+    """Create the backend without overriding its Docker-compatible default."""
+    backend_kwargs: Dict[str, Any] = {
+        "seed": seed,
+        "config": model_config,
+        "device": device,
+    }
+    if upstream_path is not None:
+        backend_kwargs["upstream_path"] = upstream_path
+    return MAGICRealBackend(**backend_kwargs)
+
+
+def _collect_runtime_environment(
+    backend: MAGICRealBackend,
+    device: str,
+) -> Dict[str, Any]:
+    """Collect runtime facts shared by Docker and host deployments."""
+    import dgl
+    import torch
+
+    cuda_available = torch.cuda.is_available()
+    cuda_device_count = torch.cuda.device_count() if cuda_available else 0
+    cuda_device_names = (
+        [torch.cuda.get_device_name(index) for index in range(cuda_device_count)]
+        if cuda_available
+        else []
+    )
+    return {
+        "python": sys.version.split()[0],
+        "python_executable": sys.executable,
+        "python_prefix": sys.prefix,
+        "torch": torch.__version__,
+        "torch_cuda_runtime": torch.version.cuda,
+        "dgl": dgl.__version__,
+        "device": device,
+        "cuda_available": cuda_available,
+        "cuda_device_count": cuda_device_count,
+        "cuda_device_names": cuda_device_names,
+        "upstream_path": str(backend.upstream_path.resolve()),
+    }
+
+
 # =============================================================================
 # Main formal runner
 # =============================================================================
@@ -475,6 +523,7 @@ def run_formal_experiment(
     k_neighbors: int = 5,
     dry_run: bool = False,
     force: bool = False,
+    upstream_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Run a formal MAGIC baseline experiment.
@@ -492,6 +541,8 @@ def run_formal_experiment(
         k_neighbors: K for KNN scoring
         dry_run: If True, enumerate artifacts and build contracts but skip model.fit()
         force: If True, overwrite existing output_dir
+        upstream_path: Optional pinned MAGIC source path. If omitted, retain the
+            backend default (/opt/magic-upstream).
 
     Returns:
         Dict with run summary
@@ -611,7 +662,12 @@ def run_formal_experiment(
     # ---- Step 5: Prepare DGL graphs ----
     print(f"\n[{utc_now()}] Preparing DGL graphs...")
     t_prep = _time.time()
-    backend = MAGICRealBackend(seed=seed, config=model_config, device=device)
+    backend = _create_magic_backend(
+        seed=seed,
+        model_config=model_config,
+        device=device,
+        upstream_path=upstream_path,
+    )
 
     # Train: one prepared graph PER contract (entity-level granularity)
     train_prepared_graphs: List[Any] = []
@@ -781,11 +837,9 @@ def run_formal_experiment(
     # runtime_manifest
     import torch
     runtime_manifest = {
-        "python": sys.version.split()[0],
-        "torch": torch.__version__,
-        "dgl": "1.0.0",
+        **_collect_runtime_environment(backend, device),
         "pytz": __import__("pytz").__version__,
-        "device": device,
+        # Retained for compatibility with existing artifact consumers.
         "cuda_compatible": torch.cuda.is_available(),
         "bridge_commit": "b36ec5550ab9b2f7e44dd2bfcda496c3082d43df",
         "upstream_sha": "aa0b647eea74b6faa0e52eb444370c4411a32cbe",
@@ -947,7 +1001,7 @@ def run_formal_experiment(
 # CLI Entry Point
 # =============================================================================
 
-def main(argv: Optional[List[str]] = None) -> None:
+def build_parser() -> ArgumentParser:
     parser = ArgumentParser(
         description="MAGIC Formal Experiment Runner for THEIA_E3 / THEIA_E5",
     )
@@ -982,6 +1036,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="Override ground truth root",
     )
     parser.add_argument(
+        "--upstream-path",
+        type=Path,
+        default=None,
+        help="Pinned MAGIC upstream source path (default: /opt/magic-upstream)",
+    )
+    parser.add_argument(
         "--max-epoch",
         type=int,
         default=50,
@@ -1008,7 +1068,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         action="store_true",
         help="Overwrite existing output directory",
     )
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    args = build_parser().parse_args(argv)
 
     model_config = MAGICModelConfig(
         max_epoch=args.max_epoch,
@@ -1035,6 +1099,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             k_neighbors=args.k,
             dry_run=args.dry_run,
             force=args.force,
+            upstream_path=args.upstream_path,
         )
         print(f"\nResult: {result}")
     except Exception as exc:
