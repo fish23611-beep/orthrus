@@ -307,7 +307,15 @@ def test_upstream_identity_verification_works() -> None:
     identity = verify_upstream_identity(UPSTREAM_PATH)
     assert identity.repository.endswith("FDUDSDE/MAGIC")
     assert identity.commit == UPSTREAM_COMMIT
-    assert identity.verification == "frozen-file-sha256"
+    # Strictly match production contract:
+    #   * Git-backed upstream (has .git): must verify both commit AND frozen hash
+    #   * Frozen snapshot (no .git): must verify frozen hash only
+    expected_verification = (
+        "git-commit-and-frozen-file-sha256"
+        if (UPSTREAM_PATH / ".git").exists()
+        else "frozen-file-sha256"
+    )
+    assert identity.verification == expected_verification
     assert identity.file_sha256 == FROZEN_FILE_SHA256
 
 
