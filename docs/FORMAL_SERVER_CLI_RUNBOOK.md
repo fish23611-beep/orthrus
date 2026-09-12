@@ -102,3 +102,12 @@ python -m src.baselines.magic.formal_runner \
 Host 候选环境在宣称可用于正式实验前，至少还需分别完成依赖 inventory、CUDA/DGL import、最小 GPU smoke、artifact 完整性和结果可复现性验收。Python 3.8 与旧版 Torch/DGL 的 wheel 可得性、宿主 NVIDIA driver 兼容性及安全维护状态都是部署风险，不能因 CLI 可用而视为已解决。
 
 若 Host 候选路径失败，停止使用该环境，不移动 fallback tag，也不修改冻结合同；从 `formal-f1-docker-fallback-v1` 对应的只读基线恢复现有 Docker 正式方案。回退不应覆盖或删除 Host 尝试产生的日志和 artifacts。
+
+### Host repository regression
+
+在 Host 环境运行 repository regression 时，涉及 pinned MAGIC upstream
+的测试必须显式提供 Host 上的 snapshot 路径：
+
+```bash
+MAGIC_UPSTREAM_PATH=/home/yby/magic-upstream \
+python -m pytest -q
