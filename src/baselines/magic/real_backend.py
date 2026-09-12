@@ -438,9 +438,25 @@ class MAGICRealBackend:
         # Deliberately lazy: seed.py performs optional Torch/DGL discovery.
         from .seed import MagicSeedController
 
+        # Policy note (real MAGIC backend only):
+        #   1. Pinned upstream MAGIC seeds RNGs (Python, NumPy, Torch CPU/CUDA,
+        #      DGL, dgl.random) but does NOT request
+        #      torch.use_deterministic_algorithms(True).
+        #   2. On PyTorch 1.12.x + CUDA 11.6 + DGL 1.0.0 the advanced-index
+        #      broadcast path used by upstream's mask-token assignment
+        #      ``new_g.ndata["attr"][mask_nodes] = self.enc_mask_token`` is
+        #      incompatible with deterministic algorithms and raises an
+        #      Indexing.cu assertion (``24 vs 4``). Enabling deterministic
+        #      algorithms is therefore NOT permitted on this host.
+        #   3. We keep every RNG seed hook (Python / NumPy / Torch CPU /
+        #      Torch CUDA / Torch CUDA all / DGL / dgl.random.seed) intact,
+        #      so experiment reproducibility is still seed-controlled.
+        #   4. This is seed-controlled reproducibility, not bitwise
+        #      deterministic execution; ``deterministic_requested`` on the
+        #      resulting manifest is therefore False.
         controller = MagicSeedController(
             seed=self.seed,
-            set_deterministic=True,
+            set_deterministic=False,
             set_cuda=True,
             require_dgl=True,
         )

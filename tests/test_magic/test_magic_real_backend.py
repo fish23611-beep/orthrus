@@ -600,6 +600,164 @@ def test_official_seed_reaches_model_and_dgl(seed: int, contracts) -> None:
     assert backend.seed_manifest.dgl_random_seed_set is True
 
 
+# =============================================================================
+# Real-backend seed policy contract (host CUDA / Torch 1.12.x compatibility)
+# =============================================================================
+# Pinned upstream MAGIC seeds RNGs but does NOT request
+# torch.use_deterministic_algorithms(True). Enabling deterministic
+# algorithms on PyTorch 1.12.x + CUDA 11.6 + DGL 1.0.0 triggers an
+# Indexing.cu assertion in the upstream mask-token assignment
+#   new_g.ndata["attr"][mask_nodes] = self.enc_mask_token
+# (24 vs 4 element-count mismatch). The real backend must therefore
+# preserve seed-controlled reproducibility without flipping the global
+# deterministic flag, while keeping every RNG seed hook intact.
+# =============================================================================
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_real_backend_seed_manifest_is_populated(
+    seed: int, contracts
+) -> None:
+    """fit() must always populate backend.seed_manifest."""
+    backend, _ = make_backend(seed=seed)
+    train_graph = backend.prepare_graph(
+        contracts[0], SplitType.TRAIN, "train"
+    )
+    # Before fit, manifest must be None (no claim made)
+    assert backend.seed_manifest is None
+    backend.fit(train_graph)
+    # After fit, manifest must be a concrete ReproducibilityManifest
+    from src.baselines.magic.seed import ReproducibilityManifest
+    assert isinstance(backend.seed_manifest, ReproducibilityManifest)
+    assert backend.seed_manifest is not None
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_real_backend_seed_manifest_seed_matches_backend_seed(
+    seed: int, contracts
+) -> None:
+    """seed_manifest.seed must equal the backend seed."""
+    backend, _ = make_backend(seed=seed)
+    train_graph = backend.prepare_graph(
+        contracts[0], SplitType.TRAIN, "train"
+    )
+    backend.fit(train_graph)
+    assert backend.seed_manifest.seed == backend.seed == seed
+
+
+def test_real_backend_preserves_python_numpy_torch_seed_hooks(
+    contracts,
+) -> None:
+    """All RNG seed hooks must still run for the real backend."""
+    backend, _ = make_backend(seed=0)
+    train_graph = backend.prepare_graph(
+        contracts[0], SplitType.TRAIN, "train"
+    )
+    backend.fit(train_graph)
+    manifest = backend.seed_manifest
+    assert manifest.python_seed_set is True
+    assert manifest.numpy_seed_set is True
+    assert manifest.torch_seed_set is True
+    # CUDA hook may be unavailable in CPU-only test environments, but the
+    # CPU seed hook must always run.
+    if manifest.torch_cuda_available:
+        assert manifest.torch_cuda_seed_set is True
+        assert manifest.torch_cuda_seed_all_set is True
+
+
+def test_real_backend_preserves_dgl_seed_hook(contracts) -> None:
+    """DGL seed + dgl.random.seed hooks must still run for the real backend."""
+    backend, harness = make_backend(seed=0)
+    train_graph = backend.prepare_graph(
+        contracts[0], SplitType.TRAIN, "train"
+    )
+    backend.fit(train_graph)
+    calls = harness.dgl.get_calls()
+    assert calls["seed_calls"] == [0]
+    assert calls["random_seed_calls"] == [0]
+    manifest = backend.seed_manifest
+    assert manifest.dgl_seed_set is True
+    assert manifest.dgl_random_seed_set is True
+
+
+def test_real_backend_does_not_request_deterministic_algorithms(
+    contracts,
+) -> None:
+    """Real backend must NOT request torch deterministic algorithms.
+
+    Pinned upstream MAGIC seeds RNGs but does not request bitwise
+    deterministic execution. Enabling deterministic algorithms on the
+    formal host (Torch 1.12.x + CUDA 11.6 + DGL 1.0.0) is incompatible
+    with the upstream mask-token advanced-index assignment.
+    """
+    backend, _ = make_backend(seed=0)
+    train_graph = backend.prepare_graph(
+        contracts[0], SplitType.TRAIN, "train"
+    )
+    backend.fit(train_graph)
+    manifest = backend.seed_manifest
+    assert manifest.deterministic_requested is False
+    # When deterministic_requested is False, the controller must not
+    # have flipped torch.use_deterministic_algorithms to True. On the
+    # test side we observe this through the recorded flag; if Torch is
+    # unavailable, the field is None and the contract still holds.
+    if manifest.torch_available:
+        # The controller only sets torch_deterministic_algorithms when
+        # deterministic_requested is True. With our policy, it must stay
+        # at its previous value (None or whatever the test environment
+        # has set); the real backend must not claim it.
+        # The strict invariant: the real backend never sets this flag.
+        # We verify the manifest records no deterministic request.
+        assert manifest.torch_deterministic_algorithms in (None, False)
+
+
+def test_real_backend_seed_policy_change_preserves_seed_call_sequence(
+    contracts,
+) -> None:
+    """The set_deterministic=False policy must not drop any seed hook call.
+
+    Specifically, fit() must still:
+      * call Python random.seed
+      * call NumPy np.random.seed
+      * call torch.manual_seed (and torch.cuda.manual_seed[_all] when CUDA
+        is available)
+      * call DGL seed() and dgl.random.seed()
+    """
+    import random
+    import numpy as np
+    import torch
+
+    backend, harness = make_backend(seed=42)
+    train_graph = backend.prepare_graph(
+        contracts[0], SplitType.TRAIN, "train"
+    )
+    backend.fit(train_graph)
+
+    # Python / NumPy / Torch CPU seeds must equal the backend seed.
+    # We cannot directly observe the captured calls without instrumentation,
+    # so we instead re-seed and verify the manifest captured the seed.
+    assert backend.seed_manifest.seed == 42
+    assert backend.seed_manifest.python_seed_set is True
+    assert backend.seed_manifest.numpy_seed_set is True
+    assert backend.seed_manifest.torch_seed_set is True
+
+    # DGL calls must still happen with the backend seed.
+    calls = harness.dgl.get_calls()
+    assert calls["seed_calls"] == [42]
+    assert calls["random_seed_calls"] == [42]
+
+    # Deterministic-flag state must remain disabled.
+    assert backend.seed_manifest.deterministic_requested is False
+
+    # Sanity: cross-check by resetting the fake DGL, re-fitting, and
+    # verifying that another full set of seed calls fires.
+    harness.dgl.reset()
+    backend.fit(train_graph)
+    assert harness.dgl.get_calls()["seed_calls"] == [42]
+    assert harness.dgl.get_calls()["random_seed_calls"] == [42]
+    assert backend.seed_manifest.deterministic_requested is False
+
+
 def run_stochastic_trace(seed: int, contract) -> Any:
     backend, harness = make_backend(seed=seed)
     train_graph = backend.prepare_graph(
