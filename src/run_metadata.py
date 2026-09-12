@@ -392,10 +392,12 @@ def dump_runtime(
 
 def _is_valid_path(path: Path | str | None) -> bool:
     """
-    Return True only when ``path`` is a real, non-empty, non-MagicMock string/Path.
+    Return True only when ``path`` is a real, non-empty, non-MagicMock,
+    non-filesystem-root string/Path.
 
     This guard makes every dump function a no-op in unit tests that pass
-    MagicMock objects as ``run_dir``.
+    MagicMock objects as ``run_dir``, and prevents the metadata layer from
+    ever writing to filesystem root ``/`` (POSIX) or ``C:\\`` (Windows).
     """
     # Validate the object before invoking its filesystem protocol.  Mock and
     # MagicMock synthesize ``__fspath__`` dynamically, so calling os.fspath()
@@ -410,7 +412,28 @@ def _is_valid_path(path: Path | str | None) -> bool:
         return False
     if not isinstance(s, str) or not s.strip():
         return False
+    if _is_filesystem_root_string(s):
+        return False
     return True
+
+
+def _is_filesystem_root_string(text: str) -> bool:
+    """Return True iff ``text`` is the filesystem root of an absolute tree.
+
+    ``Path('/').parent == Path('/')`` only when ``text`` is already the root
+    of an absolute tree, on both POSIX and Windows.  Relative paths and empty
+    strings are not considered roots.
+    """
+    try:
+        path = Path(text)
+    except (TypeError, ValueError):
+        return False
+    if not path.is_absolute():
+        return False
+    try:
+        return path.parent == path
+    except Exception:
+        return False
 
 
 def _write_json(path: Path | str, data: dict) -> None:
