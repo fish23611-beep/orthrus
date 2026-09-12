@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.util
 import inspect
+import os
+import subprocess
+import sys
 from pathlib import Path
 import random
-import sys
 from types import ModuleType
 from typing import Any, Dict, List
 
@@ -38,7 +41,35 @@ from src.baselines.magic.real_backend import (
 )
 
 
-UPSTREAM_PATH = Path("/opt/magic-upstream")
+# Test-side resolution of the real-backend upstream snapshot path.
+#
+# Production contract:
+#   * src.baselines.magic.real_backend.DEFAULT_UPSTREAM_PATH stays at
+#     /opt/magic-upstream so the Docker / Dev Container fallback works
+#     unchanged.
+#   * Tests that need a non-default snapshot read MAGIC_UPSTREAM_PATH.
+#     This env var is honored ONLY on the test side so the pinned Docker
+#     fallback contract is not weakened.
+#
+# Resolution rules (host-portable):
+#   * Unset or empty  -> real_backend.DEFAULT_UPSTREAM_PATH (Docker default).
+#   * Set             -> expanduser + resolve, but do NOT require existence
+#                         at import time. verify_upstream_identity() still
+#                         fail-fasts on a missing or tampered snapshot.
+#   * Host user paths (e.g. /home/<user>/magic-upstream) must NEVER be
+#     hard-coded here; they enter only through the env var.
+_MAGIC_UPSTREAM_ENV = "MAGIC_UPSTREAM_PATH"
+_DEFAULT_TEST_UPSTREAM = real_backend.DEFAULT_UPSTREAM_PATH
+
+
+def _resolve_test_upstream_path() -> Path:
+    raw = os.environ.get(_MAGIC_UPSTREAM_ENV)
+    if not raw:
+        return Path(_DEFAULT_TEST_UPSTREAM)
+    return Path(raw).expanduser().resolve()
+
+
+UPSTREAM_PATH = _resolve_test_upstream_path()
 
 
 class FakeGraph:
@@ -1023,3 +1054,114 @@ def test_legacy_magic_backend_behavior_unchanged() -> None:
     assert 100 in edge_timestamps  # First event of pair 1
     assert 102 in edge_timestamps  # Event of pair 2
     assert 101 not in edge_timestamps  # Second event of pair 1 (deduped)
+
+
+# =============================================================================
+# Host-portable upstream path resolution (MAGIC_UPSTREAM_PATH override)
+# =============================================================================
+#
+# These tests prove the contract that lets the same test file run on both:
+#   * Docker / Dev Container: MAGIC_UPSTREAM_PATH unset -> /opt/magic-upstream
+#   * Formal Host server   : MAGIC_UPSTREAM_PATH=/home/<user>/magic-upstream
+#
+# Production code (src/baselines/magic/real_backend.py) is intentionally
+# untouched: DEFAULT_UPSTREAM_PATH still resolves to /opt/magic-upstream,
+# integrity verification (FROZEN_FILE_SHA256 + UPSTREAM_COMMIT) still runs,
+# and missing / tampered snapshots still fail-fast. We do NOT relax the
+# contract to pytest.skip when the override path is missing.
+
+def _probe_upstream_path_in_subprocess(env_override):
+    """Import the test module in a clean subprocess and read UPSTREAM_PATH.
+
+    Using a subprocess isolates sys.modules / module-level state so we can
+    observe the env-var driven import-time constant without reload hacks or
+    pollution of the parent interpreter.
+    """
+    env = dict(os.environ)
+    if env_override is None:
+        env.pop("MAGIC_UPSTREAM_PATH", None)
+    else:
+        env["MAGIC_UPSTREAM_PATH"] = env_override
+
+    repo_root = Path(__file__).resolve().parents[2]
+    code = (
+        "import sys\n"
+        "sys.path.insert(0, {!r})\n"
+        "import tests.test_magic.test_magic_real_backend as m\n"
+        "print(str(m.UPSTREAM_PATH))\n"
+    ).format(str(repo_root))
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        cwd=str(repo_root),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip().splitlines()[-1]
+
+
+def test_default_upstream_path_is_docker_default_when_env_unset() -> None:
+    """A. Unset MAGIC_UPSTREAM_PATH -> tests still default to /opt/magic-upstream.
+
+    Validates Docker / Dev Container compatibility.
+    """
+    observed = _probe_upstream_path_in_subprocess(env_override=None)
+    assert Path(observed) == Path(real_backend.DEFAULT_UPSTREAM_PATH)
+    assert Path(observed) == Path("/opt/magic-upstream")
+
+
+def test_env_override_rewrites_test_upstream_path(tmp_path: Path) -> None:
+    """B. Setting MAGIC_UPSTREAM_PATH rewrites the test-side snapshot.
+
+    The override must NOT bake a host username into Python code: the path
+    only enters the module through the env var.
+    """
+    custom = tmp_path / "magic-upstream"
+    observed = _probe_upstream_path_in_subprocess(env_override=str(custom))
+    assert Path(observed) == custom.resolve()
+
+
+def test_env_override_still_runs_upstream_identity_verification(
+    tmp_path: Path,
+) -> None:
+    """C. Configurability does NOT bypass integrity verification.
+
+    The frozen-file SHA check (and therefore the UPSTREAM_COMMIT / commit
+    check when a .git directory is present) must still run on any
+    overridden path. A wrong snapshot must fail-fast, not be silently
+    accepted because the path came from an env var.
+    """
+    custom = tmp_path / "magic-upstream"
+    custom.mkdir()
+    (custom / "train.py").write_text("tampered", encoding="utf-8")
+
+    with pytest.raises(UpstreamIntegrityError, match="wrong upstream SHA256"):
+        verify_upstream_identity(custom)
+
+
+def test_missing_upstream_does_not_skip_under_override(tmp_path: Path) -> None:
+    """D. A missing upstream MUST NOT be skipped, even when env-var driven.
+
+    Missing snapshot continues to fail-fast; the host-portable override
+    must not relax the contract to pytest.skip.
+    """
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(UpstreamIntegrityError, match="missing MAGIC upstream"):
+        MAGICRealBackend(seed=0, upstream_path=missing)
+
+    # Also confirm the env-var driven test resolver does NOT auto-skip a
+    # missing path: the failure surfaces when the backend (or
+    # verify_upstream_identity) actually inspects the directory.
+    observed = _probe_upstream_path_in_subprocess(env_override=str(missing))
+    assert Path(observed) == missing.resolve()
+
+
+def test_env_override_does_not_change_production_default() -> None:
+    """Sanity guard: production DEFAULT_UPSTREAM_PATH must remain Docker default.
+
+    Ensures no drift in the pinned Docker fallback contract during the
+    host-portability fix.
+    """
+    assert Path(real_backend.DEFAULT_UPSTREAM_PATH) == Path("/opt/magic-upstream")
