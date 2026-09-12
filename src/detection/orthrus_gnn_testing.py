@@ -11,7 +11,7 @@ from model import *
 from factory import *
 import torch
 
-from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime, update_runtime_nested
+from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, resolve_runtime_dir, update_runtime, update_runtime_nested
 from run_metadata import _is_valid_path
 
 
@@ -358,9 +358,7 @@ def main(cfg):
         all_trained_models = [("model_epoch_1", os.path.join(gnn_models_dir, "model_epoch_1"))]
     else:
         all_trained_models = [(name, os.path.join(gnn_models_dir, name)) for name in listdir_sorted(gnn_models_dir)]
-    runtime_dir = getattr(cfg, "_run_dir", None)
-    if not _is_valid_path(runtime_dir):
-        runtime_dir = os.path.dirname(gnn_models_dir)
+    runtime_dir = resolve_runtime_dir(cfg, gnn_models_dir)
     dump_environment(cfg, runtime_dir)
     if hasattr(full_data, "loader_telemetry"):
         update_runtime_nested(runtime_dir, "dataset_loader", "testing", full_data.loader_telemetry)

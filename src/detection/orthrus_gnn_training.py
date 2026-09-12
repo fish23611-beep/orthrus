@@ -8,7 +8,7 @@ from model import MSTCOrthrus
 from config import *
 from data_utils import *
 from factory import *
-from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime, update_runtime_nested
+from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, resolve_runtime_dir, update_runtime, update_runtime_nested
 from wandb_control import wandb_log
 from run_metadata import _is_valid_path
 
@@ -47,8 +47,13 @@ def train(data,
 
 
 def _runtime_dir(cfg, fallback_dir):
-    run_dir = getattr(cfg, "_run_dir", None)
-    return run_dir if _is_valid_path(run_dir) else os.path.dirname(fallback_dir)
+    """Resolve a safe runtime metadata directory; never returns filesystem root.
+
+    Delegates to ``experiment_utils.resolve_runtime_dir`` so the same
+    root-fallback semantics apply to training, testing, and any future
+    pipeline stage.  See that function for the full rules.
+    """
+    return resolve_runtime_dir(cfg, fallback_dir)
 
 
 def _event_count(data):
