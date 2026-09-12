@@ -110,8 +110,120 @@ def _environment_scalar(value: Any) -> str | int | float | bool | None:
 
 
 def _valid_out_dir(value: Any) -> bool:
-    """Reject mocks and non-path objects so instrumentation never creates junk paths."""
-    return isinstance(value, (str, Path)) and bool(os.fspath(value))
+    """Reject mocks, non-path objects, and the filesystem root.
+
+    The instrumentation must never write to filesystem root ``/`` (POSIX) or
+    ``C:\\`` (Windows): root is not a safe metadata directory and a normal
+    user cannot create ``/environment.json`` there.  Rejecting it here is a
+    defense-in-depth layer so callers do not need to know about the
+    filesystem-root hazard.
+    """
+    if not isinstance(value, (str, Path)):
+        return False
+    try:
+        text = os.fspath(value)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(text, str) or not text.strip():
+        return False
+    if _is_filesystem_root(text):
+        return False
+    return True
+
+
+def _is_filesystem_root(value: Any) -> bool:
+    """Return True iff ``value`` is the filesystem root (``/``, ``C:\\``, …).
+
+    Uses the canonical property that ``Path(p).parent == Path(p)`` only when
+    ``p`` is already the root of an absolute tree.  ``None``, empty strings,
+    mocks, and relative paths are not considered roots.
+    """
+    if value is None:
+        return False
+    try:
+        text = os.fspath(value)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        path = Path(text)
+    except (TypeError, ValueError):
+        return False
+    if not path.is_absolute():
+        return False
+    try:
+        return path.parent == path
+    except Exception:
+        return False
+
+
+def resolve_runtime_dir(cfg: Any, fallback_dir: Any) -> str | None:
+    """Resolve a safe runtime metadata directory, never falling back to root.
+
+    Rules (applied in order):
+
+    A. If ``cfg._run_dir`` is a valid non-root path, return it as-is.  An
+       explicitly configured run directory is the canonical location and must
+       be preserved verbatim.
+
+    B. Otherwise, inspect ``fallback_dir``.  If it is not a usable path, return
+       ``None``.
+
+    C. Compute ``fallback_dir``'s parent.  When the parent is the filesystem
+       root (e.g. ``fallback_dir == "/fake"``), the parent is unsafe because
+       a non-root user cannot write ``/environment.json``.  Return ``None`` so
+       the caller treats instrumentation as a no-op.
+
+    D. Otherwise, return the parent so legacy callers continue to receive the
+       run directory that contains their ``trained_models`` artifact.
+
+    ``None`` is the explicit signal that there is no safe runtime metadata
+    directory.  Callers must NOT silently substitute cwd, ``/tmp``, or any
+    other auto-created location, must NOT catch PermissionError as success,
+    and must NOT escalate privileges.
+    """
+    # Rule A: explicit cfg._run_dir wins.
+    run_dir = getattr(cfg, "_run_dir", None)
+    if _is_valid_runtime_path(run_dir):
+        return os.fspath(run_dir)
+
+    # Rule B: legacy fallback must itself be a usable path.
+    if not _is_valid_runtime_path(fallback_dir):
+        return None
+
+    # Rule C/D: parent of fallback is safe iff it is not filesystem root.
+    parent = os.path.dirname(os.fspath(fallback_dir))
+    if _is_filesystem_root(parent):
+        return None
+    return parent
+
+
+def _is_valid_runtime_path(value: Any) -> bool:
+    """Accept only string/Path that resolve to a non-empty, non-root path.
+
+    Rejects ``None``, ``MagicMock`` and other mocks (any object whose class
+    name is ``"MagicMock"``), empty strings, and the filesystem root.
+    ``os.fspath`` synthesis on mocks can otherwise produce a junk absolute
+    path string that defeats the safety check.
+    """
+    if value is None:
+        return False
+    # Defend against MagicMock.__fspath__ synthesis: it produces a string
+    # that passes the type check below but is unsafe to use as a path.
+    if type(value).__name__ in ("MagicMock", "Mock"):
+        return False
+    if not isinstance(value, (str, Path)):
+        return False
+    try:
+        text = os.fspath(value)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(text, str) or not text.strip():
+        return False
+    if _is_filesystem_root(text):
+        return False
+    return True
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
