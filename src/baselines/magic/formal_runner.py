@@ -44,6 +44,7 @@ import sys
 import time as _time
 from argparse import ArgumentParser
 from datetime import datetime, timezone
+from importlib import metadata as _importlib_metadata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -70,6 +71,36 @@ from src.baselines.magic.evaluator import (
 from src.baselines.magic.contracts import SplitType
 from src.baselines.magic.protocol import fit_threshold
 import src.baselines.magic.real_backend as _rb
+
+
+# =============================================================================
+# Safe package version collector (non-fatal)
+# =============================================================================
+
+def _safe_package_version(package_name: str) -> str:
+    """
+    Safely collect the version of an installed package.
+
+    Uses importlib.metadata (Python 3.8+) to query distribution versions
+    without importing the package itself. Falls back gracefully if the
+    package is not installed.
+
+    Args:
+        package_name: Name of the package (as would be passed to pip install)
+
+    Returns:
+        Version string if installed.
+        "not_installed" if the package is not installed
+        (PackageNotFoundError).
+        "metadata_error:<ExceptionName>" for unexpected metadata failures
+        (e.g. permission errors, corrupted metadata). Non-fatal.
+    """
+    try:
+        return _importlib_metadata.version(package_name)
+    except _importlib_metadata.PackageNotFoundError:
+        return "not_installed"
+    except Exception as exc:
+        return "metadata_error:{}".format(type(exc).__name__)
 
 # =============================================================================
 # Canonical artifact paths
@@ -838,7 +869,7 @@ def run_formal_experiment(
     import torch
     runtime_manifest = {
         **_collect_runtime_environment(backend, device),
-        "pytz": __import__("pytz").__version__,
+        "pytz": _safe_package_version("pytz"),
         # Retained for compatibility with existing artifact consumers.
         "cuda_compatible": torch.cuda.is_available(),
         "bridge_commit": "b36ec5550ab9b2f7e44dd2bfcda496c3082d43df",
