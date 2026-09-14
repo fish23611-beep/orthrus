@@ -945,3 +945,46 @@ class TestSyntheticPipelineFixedIdentity:
             # Verify stale CSV indices NOT used
             assert "777777" not in ground_truth
             assert "777778" not in ground_truth
+
+# =============================================================================
+# Canonical dataset split contract
+# =============================================================================
+
+class TestTHEIAE5CanonicalSplits:
+    """Prevent formal MAGIC THEIA_E5 split drift from canonical config."""
+
+    def test_theia_e5_formal_split_matches_canonical_config(self):
+        from src.baselines.magic.formal_runner import THEIA_E5_SPLITS
+        from src.config import DATASET_DEFAULT_CONFIG
+
+        canonical = DATASET_DEFAULT_CONFIG["THEIA_E5"]
+
+        expected = {
+            "train": ["graph_8", "graph_9", "graph_10"],
+            "validation": ["graph_11"],
+            "test": ["graph_14", "graph_15"],
+        }
+
+        # Exact formal protocol.
+        assert THEIA_E5_SPLITS == expected
+
+        # formal_runner must not drift from the repository-wide
+        # canonical dataset configuration.
+        assert THEIA_E5_SPLITS["train"] == canonical["train_files"]
+        assert THEIA_E5_SPLITS["validation"] == canonical["val_files"]
+        assert THEIA_E5_SPLITS["test"] == canonical["test_files"]
+
+        used = set(
+            THEIA_E5_SPLITS["train"]
+            + THEIA_E5_SPLITS["validation"]
+            + THEIA_E5_SPLITS["test"]
+        )
+        unused = set(canonical["unused_files"])
+
+        assert used.isdisjoint(unused)
+        assert unused == {
+            "graph_12",
+            "graph_13",
+            "graph_16",
+            "graph_17",
+        }

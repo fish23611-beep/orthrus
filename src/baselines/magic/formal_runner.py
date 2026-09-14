@@ -136,11 +136,12 @@ THEIA_E3_SPLITS = {
     "test": ["graph_10", "graph_12", "graph_13"],
 }
 
-# Canonical THEIA_E5 splits
+# Canonical THEIA_E5 splits.
+# Must match src.config.DATASET_DEFAULT_CONFIG["THEIA_E5"].
 THEIA_E5_SPLITS = {
-    "train": ["graph_2", "graph_3", "graph_4", "graph_5", "graph_6", "graph_7"],
+    "train": ["graph_8", "graph_9", "graph_10"],
     "validation": ["graph_11"],
-    "test": ["graph_12", "graph_13", "graph_14"],
+    "test": ["graph_14", "graph_15"],
 }
 
 DATASET_SPLITS = {
