@@ -388,22 +388,50 @@ def grad_stats(model) -> Dict[str, Any]:
 class InstrumentedTrainer:
     """
     Callable with the same signature as _run_original_entity_training_lifecycle.
-    Injects read-only grad monitoring.
+    Injects read-only grad monitoring + low-overhead stage profiling.
+
+    KEY DESIGN DECISION: gc.collect() is NOT called per-step because the
+    original _run_original_entity_training_lifecycle does not call it.
+    The original lifecycle is GC-agnostic (no explicit GC).
     """
+
+    # Profiling output frequency: every N steps
+    _PROFILE_EVERY = 100
 
     def __init__(self, orig_fn, log: List, step_counter: List[int]):
         self._orig = orig_fn
         self._log = log
         self._steps = step_counter
+        self._profile_accum = {
+            "copy_s": 0.0,
+            "transfer_s": 0.0,
+            "forward_s": 0.0,
+            "backward_s": 0.0,
+            "grad_stats_s": 0.0,
+            "optimizer_s": 0.0,
+            "log_s": 0.0,
+            "del_s": 0.0,
+        }
+        self._profile_steps = 0
+        self._profile_start: Optional[float] = None
+        self._last_epoch_reported = -1
 
     def __call__(
         self, model, graphs, optimizer, max_epoch: int, device: str, dgl_module
     ):
         import torch
+        import time as _time
+
         n_train = len(graphs)
+        total_steps = n_train * max_epoch
+        self._profile_start = _time.time()
+        epoch_start = self._profile_start
+
         for epoch in range(max_epoch):
+            epoch_t0 = _time.time()
             for graph in graphs:
-                # Deep-copy (matches real_backend._run_original_entity_training_lifecycle)
+                # ---- Stage 1: Graph copy ----
+                t0 = _time.time()
                 copied = dgl_module.graph(
                     (graph.edges()[0].clone(), graph.edges()[1].clone()),
                     num_nodes=graph.num_nodes(),
@@ -414,29 +442,82 @@ class InstrumentedTrainer:
                 for k, t in graph.edata.items():
                     if t is not None:
                         copied.edata[k] = t.clone()
+                self._profile_accum["copy_s"] += _time.time() - t0
+
+                # ---- Stage 2: Device transfer ----
+                t0 = _time.time()
                 runtime_g = copied.to(device)
+                self._profile_accum["transfer_s"] += _time.time() - t0
+
+                # ---- Stage 3: Forward ----
                 model.train()
+                t0 = _time.time()
                 loss_t = model(runtime_g)
                 loss_raw = float(loss_t.detach().cpu().item())
+                self._profile_accum["forward_s"] += _time.time() - t0
+
                 loss_t = loss_t / n_train  # upstream semantics
                 optimizer.zero_grad()
+
+                # ---- Stage 4: Backward ----
+                t0 = _time.time()
                 loss_t.backward()
+                self._profile_accum["backward_s"] += _time.time() - t0
 
-                # Read-only grad capture: AFTER backward, BEFORE step
+                # ---- Stage 5: Read-only grad capture ----
+                t0 = _time.time()
                 gs = grad_stats(model)
+                self._profile_accum["grad_stats_s"] += _time.time() - t0
 
+                # ---- Stage 6: Optimizer step ----
+                t0 = _time.time()
                 optimizer.step()
+                self._profile_accum["optimizer_s"] += _time.time() - t0
+
                 self._steps[0] += 1
+                current_step = self._steps[0]
+
+                # ---- Stage 7: Log append ----
+                t0 = _time.time()
                 self._log.append({
                     "epoch": epoch + 1,
-                    "step": self._steps[0],
+                    "step": current_step,
                     "RAW_FORWARD_LOSS": loss_raw,
                     "LOSS_USED_FOR_BACKWARD": loss_raw / n_train,
                     "SCALING_FACTOR": 1.0 / n_train,
                     **gs,
                 })
+                self._profile_accum["log_s"] += _time.time() - t0
+
+                # ---- Stage 8: Cleanup (NO explicit gc.collect) ----
+                # NOTE: gc.collect() removed because original _run_original_entity_training_lifecycle
+                # does NOT call it. Removing per-step GC aligns InstrumentedTrainer with the
+                # original lifecycle, eliminating 9700 unnecessary full cyclic GC runs.
+                t0 = _time.time()
                 del copied, runtime_g, loss_t
-                gc.collect()
+                self._profile_accum["del_s"] += _time.time() - t0
+
+                # ---- Low-frequency profiling output ----
+                self._profile_steps += 1
+                if self._profile_steps % self._PROFILE_EVERY == 0 or epoch != self._last_epoch_reported:
+                    self._last_epoch_reported = epoch
+                    elapsed = _time.time() - self._profile_start
+                    p = self._profile_accum
+                    total_accum = sum(p.values())
+                    print(
+                        f"TRAIN_PROGRESS epoch={epoch+1} step={current_step} "
+                        f"copy_s={p['copy_s']:.3f} transfer_s={p['transfer_s']:.3f} "
+                        f"forward_s={p['forward_s']:.3f} backward_s={p['backward_s']:.3f} "
+                        f"grad_s={p['grad_stats_s']:.3f} optimizer_s={p['optimizer_s']:.3f} "
+                        f"log_s={p['log_s']:.3f} del_s={p['del_s']:.3f} "
+                        f"elapsed_s={elapsed:.1f}",
+                        flush=True,
+                    )
+                    # Reset accumulators for next window
+                    for k in p:
+                        p[k] = 0.0
+                    self._profile_start = _time.time()
+
         return model
 
 
