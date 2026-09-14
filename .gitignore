@@ -167,3 +167,5 @@ cython_debug/
 wandb/
 nohup.out
 artifacts/
+
+.env.local
