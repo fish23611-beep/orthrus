@@ -648,6 +648,24 @@ def embed_graph(
     return emb_np, list(node_ids_tuple)
 
 
+def _create_magic_backend(
+    *,
+    seed: int,
+    model_config: Optional[MAGICModelConfig],
+    device: str,
+    upstream_path: Optional[Path],
+) -> MAGICRealBackend:
+    """Create MAGIC backend while preserving the Docker default."""
+    backend_kwargs: Dict[str, Any] = {
+        "seed": seed,
+        "config": model_config,
+        "device": device,
+    }
+    if upstream_path is not None:
+        backend_kwargs["upstream_path"] = upstream_path
+    return MAGICRealBackend(**backend_kwargs)
+
+
 # =============================================================================
 # Main formal runner
 # =============================================================================
@@ -666,6 +684,7 @@ def run_formal_experiment(
     k_neighbors: int = 5,
     dry_run: bool = False,
     force: bool = False,
+    upstream_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Run a formal MAGIC baseline experiment.
@@ -683,6 +702,8 @@ def run_formal_experiment(
         k_neighbors: K for KNN scoring
         dry_run: If True, enumerate artifacts and build contracts but skip model.fit()
         force: If True, overwrite existing output_dir
+        upstream_path: Optional pinned MAGIC source path. If omitted, preserve
+            the backend default (/opt/magic-upstream).
 
     Returns:
         Dict with run summary
@@ -802,7 +823,12 @@ def run_formal_experiment(
     # ---- Step 5: Prepare DGL graphs ----
     print(f"\n[{utc_now()}] Preparing DGL graphs...")
     t_prep = _time.time()
-    backend = MAGICRealBackend(seed=seed, config=model_config, device=device)
+    backend = _create_magic_backend(
+        seed=seed,
+        model_config=model_config,
+        device=device,
+        upstream_path=upstream_path,
+    )
 
     # Train: one prepared graph PER contract (entity-level granularity)
     train_prepared_graphs: List[Any] = []
@@ -1186,6 +1212,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="Override ground truth root",
     )
     parser.add_argument(
+        "--upstream-path",
+        type=Path,
+        default=None,
+        help="Pinned MAGIC upstream source path (default: /opt/magic-upstream)",
+    )
+    parser.add_argument(
         "--max-epoch",
         type=int,
         default=50,
@@ -1239,6 +1271,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             k_neighbors=args.k,
             dry_run=args.dry_run,
             force=args.force,
+            upstream_path=args.upstream_path,
         )
         print(f"\nResult: {result}")
     except Exception as exc:
