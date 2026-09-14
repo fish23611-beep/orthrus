@@ -39,7 +39,10 @@ from typing import (
 
 import numpy as np
 
-from .contracts import ThresholdConfig
+from .contracts import (
+    ThresholdConfig,
+    GroundTruthMappingError,
+)
 from .protocol import fit_threshold, apply_threshold
 from .scoring import (
     MAGICEntityScorer,
@@ -133,37 +136,98 @@ def predict_magic(
 
 def load_magic_ground_truth(
     gt_root: Path,
+    *,
+    uuid_to_node_id_path: Optional[Path] = None,
+    graph_fingerprint: Optional[str] = None,
 ) -> Tuple[Dict[str, int], Dict[str, str], List[str]]:
     """
-    Load THEIA ground truth with authoritative UUID -> integer index_id mapping.
+    Load THEIA ground truth with authoritative UUID -> canonical node ID mapping.
 
-    CSV format (from DARPA THEIA dataset):
-        node_uuid, "{'node_type': 'display_label'}", index_id
+    The authoritative identity source for ground truth is:
+    1. Ground Truth CSV: UUID (column 1) is the GT node identifier
+    2. Current build metadata: uuid_to_node_id.pkl maps UUID -> canonical integer ID
 
-    This function:
-    1. Reads node_uuid (col 1) and index_id (col 3) from each CSV
-    2. Maps each UUID to its integer index_id (the ORTHRUS graph node ID)
-    3. Returns ground_truth as {str(index_id): 1} for all anomaly nodes
+    The CSV third column (index_id) is NEVER used as the ground_truth key.
+    It may be preserved as legacy_index_id for diagnostic purposes only.
 
-    Authoritative mapping source: Ground_Truth CSV files' third column (index_id),
-    which is the same field used by ORTHRUS graph construction
-    (src/graph_construction/build_orthrus_graphs.py: src_index_id/dst_index_id).
+    Authoritative mapping source:
+        Ground_Truth CSV (UUID) -> metadata/uuid_to_node_id.pkl (current build)
+        -> canonical node ID
 
     Args:
         gt_root: Path to Ground_Truth/darpa/darpa/E3-THEIA/ or equivalent
+        uuid_to_node_id_path: Optional path to metadata/uuid_to_node_id.pkl.
+                              If provided, GT UUIDs are resolved through this mapping.
+                              If NOT provided, a backward-compatible path is used
+                              (for synthetic/unit tests only).
+        graph_fingerprint: Fingerprint string of the graph build for provenance.
 
     Returns:
         Tuple of:
-        - ground_truth: Dict[str(index_id)] = 1 for anomaly nodes
-        - uuid_to_index_id: Dict[uuid] = str(index_id)
-        - unmapped_uuids: List of UUIDs that had no index_id (should be empty)
+        - ground_truth: Dict[str(canonical_id)] = 1 for anomaly nodes
+        - uuid_to_index_id: Dict[uuid] = str(canonical_id)
+        - unmapped_uuids: List of UUIDs that could not be resolved
 
     Raises:
-        ValueError: If any UUID is missing its index_id column
+        GroundTruthMappingError: If uuid_to_node_id_path is provided but missing,
+                                invalid, or cannot resolve all GT UUIDs.
+        ValueError: If GT CSV is malformed.
+
+    For formal experiments (uuid_to_node_id_path provided):
+        - ALL GT UUIDs MUST be resolvable through the sidecar
+        - ground_truth keys are canonical node IDs from the current build
+        - CSV third column is NOT used
+
+    For synthetic/unit tests (uuid_to_node_id_path NOT provided):
+        - uuid_to_index_id maps directly from CSV UUID to CSV index_id
+        - ground_truth keys are CSV index_ids (legacy behavior, only for tests)
+        - This path should not be used for formal evaluation
     """
     ground_truth: Dict[str, int] = {}
     uuid_to_index_id: Dict[str, str] = {}
     unmapped_uuids: List[str] = []
+
+    # ---- Load UUID -> canonical ID mapping from metadata sidecar ----
+    uuid_to_node_id: Optional[Dict[str, int]] = None
+    sidecar_sha256: Optional[str] = None
+
+    if uuid_to_node_id_path is not None:
+        # Formal path: require authoritative sidecar
+        if not uuid_to_node_id_path.is_file():
+            raise GroundTruthMappingError(
+                f"UUID-to-node-ID sidecar not found: {uuid_to_node_id_path}. "
+                f"For formal evaluation, the sidecar must exist and contain "
+                f"the current build's UUID -> canonical ID mapping."
+            )
+
+        # Load and validate sidecar
+        try:
+            import pickle
+            with open(uuid_to_node_id_path, "rb") as f:
+                uuid_to_node_id = pickle.load(f)
+        except Exception as exc:
+            raise GroundTruthMappingError(
+                f"Failed to load uuid_to_node_id.pkl: {exc}"
+            ) from exc
+
+        if not isinstance(uuid_to_node_id, dict):
+            raise GroundTruthMappingError(
+                f"uuid_to_node_id.pkl does not contain a dict. "
+                f"Got: {type(uuid_to_node_id).__name__}"
+            )
+
+        # Compute SHA256 of sidecar for provenance
+        import hashlib
+        sha256_hash = hashlib.sha256()
+        with open(uuid_to_node_id_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                sha256_hash.update(chunk)
+        sidecar_sha256 = sha256_hash.hexdigest()
+
+        print(f"  [load_magic_ground_truth] Sidecar loaded: {uuid_to_node_id_path.name}")
+        print(f"  [load_magic_ground_truth] Sidecar SHA256: {sidecar_sha256}")
+        print(f"  [load_magic_ground_truth] Sidecar size: {len(uuid_to_node_id)}")
+        print(f"  [load_magic_ground_truth] Graph fingerprint: {graph_fingerprint or 'unknown'}")
 
     if not gt_root.is_dir():
         raise FileNotFoundError(
@@ -191,6 +255,7 @@ def load_magic_ground_truth(
             f"Searched: {[str(d) for d in theia_dirs]}"
         )
 
+    # ---- Parse GT CSV, resolving UUIDs to canonical IDs ----
     for csv_path in csv_paths:
         with open(csv_path, newline="") as fh:
             for lineno, raw in enumerate(fh):
@@ -198,32 +263,90 @@ def load_magic_ground_truth(
                 if not parts or not parts[0].strip():
                     continue
                 first_col = parts[0].strip()
-                # Skip header row: if first column looks like a column name (no dashes)
-                # rather than a UUID (which always has dashes).
-                # The real GT files have no header; synthetic test files may.
-                # Conservative check: lines where first col has no '-' and is not a UUID
-                # are treated as headers.
+                # Skip header row
                 if lineno == 0 and "-" not in first_col:
-                    # Likely a header row (column names)
                     continue
                 uuid = first_col
-                if len(parts) < 3:
+
+                if len(parts) < 2:
                     raise ValueError(
-                        f"Ground truth CSV {csv_path} line has < 3 columns: "
-                        f"{raw!r}. Expected: uuid,label,index_id"
+                        f"Ground truth CSV {csv_path} line has < 2 columns: "
+                        f"{raw!r}. Expected: uuid,label[,index_id]"
                     )
-                index_id_str = parts[2].strip()
-                # index_id must be parseable as integer
-                try:
-                    int(index_id_str)
-                except ValueError:
-                    raise ValueError(
-                        f"Ground truth CSV {csv_path} line has non-integer index_id "
-                        f"in column 3: {parts!r}. Expected integer index_id "
-                        f"(the ORTHRUS graph node identifier)."
+
+                # CSV third column is now optional and NEVER used for ground_truth keys.
+                # It is preserved as legacy_index_id for diagnostic purposes only.
+                csv_index_id: Optional[str] = None
+                if len(parts) >= 3:
+                    csv_index_id = parts[2].strip()
+
+                # ---- Resolve UUID to canonical ID ----
+                if uuid_to_node_id is not None:
+                    # Formal path: resolve through sidecar
+                    if uuid not in uuid_to_node_id:
+                        unmapped_uuids.append(uuid)
+                        continue  # fail-fast handled below
+
+                    canonical_id_int = uuid_to_node_id[uuid]
+                    canonical_id_str = str(canonical_id_int)
+                    uuid_to_index_id[uuid] = canonical_id_str
+                    ground_truth[canonical_id_str] = 1
+                else:
+                    # Synthetic/unit test path: use CSV index_id directly
+                    # This is only acceptable when uuid_to_node_id_path is NOT provided
+                    if csv_index_id is None:
+                        raise ValueError(
+                            f"Ground truth CSV {csv_path} line has < 3 columns: "
+                            f"{raw!r}. Expected: uuid,label,index_id"
+                        )
+                    try:
+                        int(csv_index_id)
+                    except ValueError:
+                        raise ValueError(
+                            f"Ground truth CSV {csv_path} line has non-integer index_id "
+                            f"in column 3: {parts!r}. Expected integer index_id."
+                        )
+                    uuid_to_index_id[uuid] = csv_index_id
+                    ground_truth[csv_index_id] = 1
+
+    # ---- Fail-fast: all GT UUIDs must be resolvable in formal path ----
+    if uuid_to_node_id_path is not None and unmapped_uuids:
+        raise GroundTruthMappingError(
+            f"Failed to resolve {len(unmapped_uuids)} GT UUID(s) through sidecar: "
+            f"{unmapped_uuids[:5]}{'...' if len(unmapped_uuids) > 5 else ''}. "
+            f"All GT UUIDs must be resolvable through the current build's "
+            f"uuid_to_node_id.pkl for formal evaluation."
+        )
+
+    # ---- Cross-check: verify resolved GT matches ground_truth_nodes.pkl if present ----
+    if uuid_to_node_id_path is not None:
+        gt_cached_path = uuid_to_node_id_path.parent / "ground_truth_nodes.pkl"
+        if gt_cached_path.is_file():
+            try:
+                import pickle
+                with open(gt_cached_path, "rb") as f:
+                    cached_gt: Set[int] = pickle.load(f)
+
+                resolved_set = set(int(k) for k in ground_truth.keys())
+                cached_set = set(cached_gt)
+                if resolved_set != cached_set:
+                    diff_resolved = resolved_set - cached_set
+                    diff_cached = cached_set - resolved_set
+                    print(f"  [load_magic_ground_truth] WARNING: GT cross-check mismatch")
+                    print(f"  [load_magic_ground_truth] In resolved but not cached: {diff_resolved}")
+                    print(f"  [load_magic_ground_truth] In cached but not resolved: {diff_cached}")
+                    # In formal mode, mismatch is a fail-fast condition
+                    raise GroundTruthMappingError(
+                        f"GT cross-check failed: resolved GT set {resolved_set} "
+                        f"does not match ground_truth_nodes.pkl {cached_set}. "
+                        f"The sidecar mapping may be stale or for a different build."
                     )
-                uuid_to_index_id[uuid] = index_id_str
-                ground_truth[index_id_str] = 1
+                else:
+                    print(f"  [load_magic_ground_truth] GT cross-check PASS: {len(resolved_set)} nodes")
+            except GroundTruthMappingError:
+                raise
+            except Exception as exc:
+                print(f"  [load_magic_ground_truth] GT cross-check skipped: {exc}")
 
     return ground_truth, uuid_to_index_id, unmapped_uuids
 

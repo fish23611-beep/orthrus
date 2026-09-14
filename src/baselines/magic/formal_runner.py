@@ -68,7 +68,11 @@ from src.baselines.magic.evaluator import (
     load_magic_ground_truth,
     EvaluationUniverseError,
 )
-from src.baselines.magic.contracts import SplitType
+from src.baselines.magic.contracts import (
+    SplitType,
+    EmbeddingIdentityError,
+    GroundTruthMappingError,
+)
 from src.baselines.magic.protocol import fit_threshold
 import src.baselines.magic.real_backend as _rb
 
@@ -556,17 +560,91 @@ class InstrumentedTrainer:
 # Scoring helpers
 # =============================================================================
 
-def embed_graph(model, graph, device: str) -> Tuple[Any, List[str]]:
-    """Embed a DGL graph and return (embeddings, node_ids)."""
-    model.eval()
+def embed_prepared_graph(
+    model,
+    prepared_graph: Any,
+    device: str,
+) -> Tuple[Any, Tuple[str, ...]]:
+    """
+    Embed a MAGICPreparedGraph and return embeddings with canonical node IDs.
+
+    This is the canonical embedding path for formal experiments. It uses
+    MAGICPreparedGraph.local_to_canonical as the authoritative identity source,
+    replacing the legacy fallback to DGL local contiguous indices 0..N-1.
+
+    Args:
+        model: Fitted MAGIC model with embed() method
+        prepared_graph: MAGICPreparedGraph instance with local_to_canonical
+        device: Device for computation
+
+    Returns:
+        Tuple of:
+        - embeddings: [N, D] numpy array
+        - node_ids: Tuple of N canonical node ID strings
+
+    Raises:
+        EmbeddingIdentityError: If identity mapping is invalid or missing
+    """
     import torch
+    model.eval()
     with torch.no_grad():
-        emb = model.embed(graph.to(device))
+        emb = model.embed(prepared_graph.graph.to(device))
     emb_np = emb.cpu().numpy()
-    nids = list(graph.ndata.get("canonical_id", []))
-    if not nids:
-        nids = [str(i) for i in range(len(emb_np))]
-    return emb_np, nids
+
+    # Use MAGICPreparedGraph.local_to_canonical as authoritative identity source.
+    # This is the ONLY acceptable identity path for formal experiments.
+    local_to_canonical = prepared_graph.local_to_canonical
+
+    # ---- Fail-fast checks ----
+    if not local_to_canonical:
+        raise EmbeddingIdentityError(
+            "MAGICPreparedGraph.local_to_canonical is empty. "
+            "Cannot embed without canonical node identity. "
+            "The prepared graph must have valid local_to_canonical mapping."
+        )
+
+    if len(local_to_canonical) != emb_np.shape[0]:
+        raise EmbeddingIdentityError(
+            f"Embedding row count ({emb_np.shape[0]}) does not match "
+            f"local_to_canonical length ({len(local_to_canonical)}). "
+            f"Canonical identity mapping is corrupted."
+        )
+
+    # Verify no duplicate canonical IDs
+    canonical_ids = list(local_to_canonical)
+    if len(set(canonical_ids)) != len(canonical_ids):
+        dupes = [cid for cid in canonical_ids if canonical_ids.count(cid) > 1]
+        raise EmbeddingIdentityError(
+            f"local_to_canonical contains duplicate canonical IDs: {set(dupes)}. "
+            f"Each node must have a unique identity."
+        )
+
+    # ---- No fallback to local indices 0..N-1 ----
+    # This is the ONLY identity path. No silent fallback permitted.
+    return emb_np, local_to_canonical
+
+
+def embed_graph(
+    model,
+    prepared_graph: Any,
+    device: str,
+) -> Tuple[Any, List[str]]:
+    """
+    Embed a MAGICPreparedGraph (legacy wrapper for backward compatibility).
+
+    Prefer embed_prepared_graph() for formal experiments.
+    This wrapper delegates to embed_prepared_graph and converts Tuple to List.
+
+    Args:
+        model: Fitted MAGIC model with embed() method
+        prepared_graph: MAGICPreparedGraph instance
+        device: Device for computation
+
+    Returns:
+        Tuple of (embeddings, node_ids_list)
+    """
+    emb_np, node_ids_tuple = embed_prepared_graph(model, prepared_graph, device)
+    return emb_np, list(node_ids_tuple)
 
 
 # =============================================================================
@@ -789,13 +867,13 @@ def run_formal_experiment(
     model = backend._model
     model.eval()
     # Embed all train prepared graphs concatenated
-    # Actually: embed each train graph and collect all embeddings
+    # Use embed_prepared_graph to ensure canonical node IDs (not local 0..N-1)
     train_emb_list = []
     train_nids_list = []
     for pg in train_prepared_graphs:
-        emb, nids = embed_graph(model, pg.graph, device)
+        emb, nids_tuple = embed_prepared_graph(model, pg, device)
         train_emb_list.append(emb)
-        train_nids_list.extend(nids)
+        train_nids_list.extend(nids_tuple)
     # Concatenate
     import numpy as _np
     train_emb_concat = _np.vstack(train_emb_list)
@@ -806,7 +884,8 @@ def run_formal_experiment(
     # ---- Step 9: Embed val -> threshold ----
     print(f"\n[{utc_now()}] Embedding val graph...")
     t_emb_val = _time.time()
-    val_emb, val_nids = embed_graph(model, val_pg.graph, device)
+    val_emb, val_nids_tuple = embed_prepared_graph(model, val_pg, device)
+    val_nids = list(val_nids_tuple)
     print(f"  Val emb: {val_emb.shape} ({_time.time()-t_emb_val:.1f}s)")
     val_scores = scorer.score(val_emb, val_nids)
     val_node_scores = {r.canonical_node_id: r.score_raw for r in val_scores}
@@ -818,24 +897,30 @@ def run_formal_experiment(
     # ---- Step 10: Embed test -> evaluate ----
     print(f"\n[{utc_now()}] Embedding test graph...")
     t_emb_test = _time.time()
-    test_emb, test_nids = embed_graph(model, test_pg.graph, device)
+    test_emb, test_nids_tuple = embed_prepared_graph(model, test_pg, device)
+    test_nids = list(test_nids_tuple)
     print(f"  Test emb: {test_emb.shape} ({_time.time()-t_emb_test:.1f}s)")
     test_scores = scorer.score(test_emb, test_nids)
     test_node_scores = {r.canonical_node_id: r.score_raw for r in test_scores}
     print(f"  Test nodes scored: {len(test_node_scores)}")
 
-    # ---- Step 11: Load GT with UUID->index_id mapping ----
+    # ---- Step 11: Load GT with UUID->canonical_id mapping via metadata sidecar ----
     print(f"\n[{utc_now()}] Loading ground truth with authoritative UUID mapping...")
     try:
-        gt_dict, uuid_to_index_id, unmapped = load_magic_ground_truth(Path(gt))
-        print(f"  GT total: {len(gt_dict)}")
-        print(f"  GT mapped: {len(gt_dict)}")
-        print(f"  GT unmapped: {len(unmapped)}")
-    except FileNotFoundError:
-        print(f"  WARNING: GT not found at {gt} — running without GT")
-        gt_dict = None
-        uuid_to_index_id = {}
-        unmapped = []
+        gt_dict, uuid_to_index_id, unmapped = load_magic_ground_truth(
+            Path(gt),
+            uuid_to_node_id_path=(
+                graph_construction_root / "metadata" / "uuid_to_node_id.pkl"
+            ),
+            graph_fingerprint=graph_construction_root.name,
+        )
+    except (FileNotFoundError, GroundTruthMappingError) as exc:
+        print(f"  ERROR: formal GT identity resolution failed: {exc}")
+        raise
+
+    print(f"  GT total: {len(gt_dict)}")
+    print(f"  GT mapped: {len(gt_dict)}")
+    print(f"  GT unmapped: {len(unmapped)}")
 
     # ---- Step 12: Build test node universe ----
     test_node_ids = sorted(test_node_scores.keys())
@@ -1023,6 +1108,10 @@ def run_formal_experiment(
         "GT_UUID_MAPPED_TO_INDEX_ID": True,
         "EVALUATION_UNIVERSE_IS_TEST_NODES": True,
         "MISSING_PREDICTIONS_RAISE_ERROR": True,
+        "PREDICTION_IDS_ARE_CANONICAL": True,
+        "GT_CSV_INDEX_ID_USED_FOR_EVALUATION": False,
+        "EMBEDDING_USES_PREPARED_GRAPH_LOCAL_TO_CANONICAL": True,
+        "NO_LOCAL_INDEX_FALLBACK": True,
     }
     (output_dir / "guards.json").write_text(json.dumps(guards, indent=2))
 
@@ -1035,6 +1124,8 @@ def run_formal_experiment(
         "gt_outside_test": gt_outside_test,
         "test_node_count": len(test_node_ids),
         "test_positive_predictions": sum(predictions.values()),
+        "GT_MAPPING_SOURCE": "graph_metadata_uuid_to_node_id",
+        "GT_CSV_INDEX_ID_USED_FOR_EVALUATION": False,
     }
     (output_dir / "gt_coverage.json").write_text(json.dumps(gt_coverage, indent=2))
 

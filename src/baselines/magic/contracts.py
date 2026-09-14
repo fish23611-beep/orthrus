@@ -511,3 +511,27 @@ MAGIC_REVERSED_EDGE_PREFIXES = LEGACY_REVERSED_EDGE_PREFIXES  # Alias for backwa
 
 # Legacy simple graph policy: only keep first edge for (src, dst) pair
 MAGIC_SIMPLE_GRAPH_POLICY = "first"
+
+
+# =============================================================================
+# Formal Identity Contract Exceptions
+# =============================================================================
+
+class EmbeddingIdentityError(ValueError):
+    """
+    Raised when embedding node identity mapping is invalid.
+
+    This replaces the silent fallback to local contiguous indices,
+    ensuring that predictions always use canonical provenance node IDs.
+    """
+    pass
+
+
+class GroundTruthMappingError(ValueError):
+    """
+    Raised when GT UUID cannot be mapped to canonical node ID.
+
+    This replaces the silent fallback to CSV index_id, ensuring that
+    GT identity is always resolved through the current build metadata.
+    """
+    pass
