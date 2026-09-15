@@ -40,6 +40,7 @@ import gc
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time as _time
 from argparse import ArgumentParser
@@ -75,6 +76,152 @@ from src.baselines.magic.contracts import (
 )
 from src.baselines.magic.protocol import fit_threshold
 import src.baselines.magic.real_backend as _rb
+
+# =============================================================================
+# Git provenance helpers (subprocess-based, no shell=True)
+# =============================================================================
+
+class GitProvenanceError(Exception):
+    """Raised when git metadata collection fails unexpectedly."""
+    pass
+
+
+def _get_git_commit(repo_path: Path) -> str:
+    """
+    Get the current HEAD commit hash for a repository.
+
+    Args:
+        repo_path: Path to the git repository
+
+    Returns:
+        40-char git commit SHA
+
+    Raises:
+        GitProvenanceError: If git command fails
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise GitProvenanceError(
+                f"git rev-parse HEAD failed in {repo_path}: {result.stderr.strip()}"
+            )
+        commit = result.stdout.strip()
+        if not commit or len(commit) != 40:
+            raise GitProvenanceError(
+                f"Invalid git commit hash from {repo_path}: {commit!r}"
+            )
+        return commit
+    except subprocess.TimeoutExpired:
+        raise GitProvenanceError(f"git rev-parse HEAD timed out in {repo_path}")
+    except FileNotFoundError:
+        raise GitProvenanceError(f"git not found when querying {repo_path}")
+
+
+def _get_git_dirty(repo_path: Path) -> bool:
+    """
+    Check if the repository has uncommitted changes at the start of experiment.
+
+    Captures the worktree status at a single point in time (experiment start).
+    This value must NOT be recalculated later (e.g., at artifact-writing time)
+    and used as "dirty_at_start".
+
+    Args:
+        repo_path: Path to the git repository
+
+    Returns:
+        True if there are uncommitted changes, False if clean
+
+    Raises:
+        GitProvenanceError: If git command fails unexpectedly
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise GitProvenanceError(
+                f"git status --porcelain failed in {repo_path}: {result.stderr.strip()}"
+            )
+        # Any non-empty output means there are uncommitted changes
+        return bool(result.stdout.strip())
+    except subprocess.TimeoutExpired:
+        raise GitProvenanceError(
+            f"git status --porcelain timed out in {repo_path}"
+        )
+    except FileNotFoundError:
+        raise GitProvenanceError(f"git not found when querying {repo_path}")
+
+
+def _get_upstream_sha(upstream_path: Path) -> str:
+    """
+    Get the current HEAD commit hash for the MAGIC upstream.
+
+    Args:
+        upstream_path: Path to the MAGIC upstream repository
+
+    Returns:
+        40-char git commit SHA
+
+    Raises:
+        GitProvenanceError: If git command fails
+    """
+    return _get_git_commit(upstream_path)
+
+
+def _verify_upstream_frozen(upstream_path: Path, expected_sha: str) -> Tuple[bool, str]:
+    """
+    Verify that the upstream repository is at the expected frozen commit.
+
+    Args:
+        upstream_path: Path to the MAGIC upstream repository
+        expected_sha: Expected git commit SHA (frozen value)
+
+    Returns:
+        Tuple of (is_valid, actual_sha)
+        is_valid: True if actual_sha matches expected_sha
+        actual_sha: The actual current HEAD commit
+
+    Raises:
+        GitProvenanceError: If git command fails unexpectedly
+    """
+    try:
+        actual_sha = _get_upstream_sha(upstream_path)
+        is_valid = (actual_sha == expected_sha)
+        return is_valid, actual_sha
+    except GitProvenanceError:
+        raise
+
+
+def _collect_repository_provenance(repo_root: Path) -> Dict[str, Any]:
+    """
+    Collect repository-level provenance at experiment start.
+
+    This captures the repository state ONCE at experiment start.
+    The returned dict should be stored and reused for all artifact writes.
+
+    Args:
+        repo_root: Path to the repository root
+
+    Returns:
+        Dict with keys:
+        - repository_commit: str, 40-char git SHA
+        - repository_dirty_at_start: bool
+    """
+    commit = _get_git_commit(repo_root)
+    dirty = _get_git_dirty(repo_root)
+    return {
+        "repository_commit": commit,
+        "repository_dirty_at_start": dirty,
+    }
+
 
 # =============================================================================
 # Safe package version collector (non-fatal)
@@ -724,8 +871,53 @@ def run_formal_experiment(
         )
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- Step 0: Capture provenance at experiment start ----
+    print(f"\n[{utc_now()}] Capturing provenance...")
+
+    try:
+        repo_provenance = _collect_repository_provenance(REPO_ROOT)
+        print(f"  repository_commit: {repo_provenance['repository_commit'][:8]}...")
+        print(f"  repository_dirty_at_start: {repo_provenance['repository_dirty_at_start']}")
+    except GitProvenanceError as exc:
+        raise RuntimeError(
+            f"Failed to capture repository provenance at experiment start: {exc}"
+        ) from exc
+
+    FROZEN_UPSTREAM_SHA = "aa0b647eea74b6faa0e52eb444370c4411a32cbe"
+    if upstream_path is not None:
+        upstream_path = Path(upstream_path)
+        try:
+            upstream_valid, actual_upstream_sha = _verify_upstream_frozen(
+                upstream_path, FROZEN_UPSTREAM_SHA
+            )
+            print(f"  upstream_path: {upstream_path}")
+            print(f"  upstream_sha: {actual_upstream_sha[:8]}...")
+            if not upstream_valid:
+                raise RuntimeError(
+                    f"UPSTREAM INTEGRITY VIOLATION: "
+                    f"expected {FROZEN_UPSTREAM_SHA[:8]}..., "
+                    f"got {actual_upstream_sha[:8]}... "
+                    f"(verification method: git-commit)"
+                )
+        except GitProvenanceError as exc:
+            raise RuntimeError(
+                f"Failed to verify upstream provenance: {exc}"
+            ) from exc
+    else:
+        actual_upstream_sha = FROZEN_UPSTREAM_SHA
+        print(f"  upstream_sha (frozen): {actual_upstream_sha[:8]}... (no upstream_path)")
+
+    provenance = {
+        "repository_commit": repo_provenance["repository_commit"],
+        "repository_dirty_at_start": repo_provenance["repository_dirty_at_start"],
+        "upstream_sha": actual_upstream_sha,
+        "upstream_path": str(upstream_path) if upstream_path else None,
+        # upstream_verification will be set after backend creation using real backend metadata
+        "upstream_verification": None,
+    }
+
     # ---- Step 1: Resolve paths ----
-    print(f"[{utc_now()}] === MAGIC Formal Experiment ===")
+    print(f"\n[{utc_now()}] === MAGIC Formal Experiment ===")
     print(f"  Dataset: {dataset}")
     print(f"  Seed: {seed}")
     print(f"  Adapter: {adapter_profile}")
@@ -829,6 +1021,11 @@ def run_formal_experiment(
         device=device,
         upstream_path=upstream_path,
     )
+
+    # Use real upstream verification from backend (actual frozen-file SHA256 check)
+    # backend.upstream_identity is set during __init__ via verify_upstream_identity()
+    provenance["upstream_verification"] = backend.upstream_identity.verification
+    print(f"  upstream_verification: {provenance['upstream_verification']}")
 
     # Train: one prepared graph PER contract (entity-level granularity)
     train_prepared_graphs: List[Any] = []
@@ -1004,15 +1201,39 @@ def run_formal_experiment(
 
     # runtime_manifest
     import torch
+    cuda_available = torch.cuda.is_available()
     runtime_manifest = {
-        "python": sys.version.split()[0],
+        # Python environment
+        "python_executable": sys.executable,
+        "python_version": sys.version.split()[0],
+        "python_prefix": sys.prefix,
+        # PyTorch
         "torch": torch.__version__,
-        "dgl": "1.0.0",
+        "torch_cuda_runtime": torch.version.cuda,
+        # DGL - use safe package version collector (not hardcoded)
+        "dgl": _safe_package_version("dgl"),
+        # Other packages
         "pytz": _safe_package_version("pytz"),
+        # Device
         "device": device,
-        "cuda_compatible": torch.cuda.is_available(),
+        # Backward-compatibility field (preserve old schema key)
+        "cuda_compatible": cuda_available,
+        "cuda_available": cuda_available,
+        "cuda_device_count": torch.cuda.device_count() if cuda_available else 0,
+        "cuda_device_names": [
+            torch.cuda.get_device_name(i)
+            for i in range(torch.cuda.device_count())
+        ] if cuda_available else [],
+        # Repository provenance
+        "repository_commit": provenance["repository_commit"],
+        "repository_dirty_at_start": provenance["repository_dirty_at_start"],
+        # Upstream provenance
+        "upstream_path": provenance["upstream_path"],
+        "upstream_sha": provenance["upstream_sha"],
+        "upstream_verification": provenance["upstream_verification"],
+        # Bridge commit (preserved from existing contract)
         "bridge_commit": "b36ec5550ab9b2f7e44dd2bfcda496c3082d43df",
-        "upstream_sha": "aa0b647eea74b6faa0e52eb444370c4411a32cbe",
+        # Experiment config
         "dataset": dataset,
         "seed": seed,
         "adapter_profile": adapter_profile,
@@ -1043,8 +1264,12 @@ def run_formal_experiment(
 
     # resolved_config
     config_out = {
+        # Provenance
+        "repository_commit": provenance["repository_commit"],
+        "upstream_sha": provenance["upstream_sha"],
+        # Bridge commit (preserved from existing contract)
         "bridge_commit": "b36ec5550ab9b2f7e44dd2bfcda496c3082d43df",
-        "upstream_sha": "aa0b647eea74b6faa0e52eb444370c4411a32cbe",
+        # Experiment config
         "dataset": dataset,
         "seed": seed,
         "adapter_profile": adapter_profile,
@@ -1104,6 +1329,8 @@ def run_formal_experiment(
     (output_dir / "train_log.json").write_text(json.dumps(train_log_out, indent=2))
 
     # run_status
+    # NOTE: git_status here is for guards.json SOURCE_CODE_MODIFIED only.
+    # repository_dirty_at_start is captured at experiment start (provenance dict).
     import subprocess
     git_status = subprocess.run(
         ["git", "status", "--short"], cwd=str(REPO_ROOT), capture_output=True, text=True
@@ -1113,8 +1340,14 @@ def run_formal_experiment(
         "run_id": f"magic-{dataset.lower()}-{adapter_profile}-seed{seed}",
         "dataset": dataset,
         "seed": seed,
+        # Provenance (from start-of-experiment capture)
+        "repository_commit": provenance["repository_commit"],
+        "repository_dirty_at_start": provenance["repository_dirty_at_start"],
+        "upstream_sha": provenance["upstream_sha"],
+        "upstream_path": provenance["upstream_path"],
+        "upstream_verification": provenance["upstream_verification"],
+        # Bridge commit (preserved from existing contract)
         "bridge_commit": "b36ec5550ab9b2f7e44dd2bfcda496c3082d43df",
-        "upstream_sha": "aa0b647eea74b6faa0e52eb444370c4411a32cbe",
         "timestamp": utc_now(),
         "total_runtime_seconds": total_time,
         "epochs_completed": epochs_done,
