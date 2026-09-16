@@ -13,6 +13,7 @@ detection:
     encoder:
       backbone: graph_transformer
       neighbor_size: 24
+      batch_size: 512
       context:
         mode: multiscale
         multiscale:
@@ -23,7 +24,7 @@ detection:
           neighbor_budgets: [8, 8, 8]
           share_encoder: true
           fusion: gated
-          use_scale_embedding: false
+          use_scale_embedding: true
           gate_hidden_dim: 64
     decoder:
       predict_edge_type:
