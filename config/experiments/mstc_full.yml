@@ -6,6 +6,8 @@ model:
   variant: mstc
 experiment_identity:
   semantics_version: temporal_v2
+model_selection:
+  method: min_val_objective
 logging:
   wandb_mode: disabled
 detection:
