@@ -451,7 +451,7 @@ def get_default_cfg(args):
 
      # Epoch / model selection
      cfg.model_selection = CN()
-     cfg.model_selection.method = "min_val_mean_edge_loss"  # ["min_val_mean_edge_loss", "last_epoch"]
+     cfg.model_selection.method = "min_val_objective"  # formal: validation objective; "last_epoch" also supported
      cfg.model_selection.legacy_test_selection_enabled = False  # True=select by test MCC (leakage); DISABLED 鈥?raises ValueError
 
      # Logging / W&B

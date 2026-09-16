@@ -139,3 +139,107 @@ def test_evaluation_selection_ignores_test_metrics(tmp_path, evaluation_module):
     assert run_b_summary["epoch"] == 1
     assert run_a_summary["mcc"] == 0.10
     assert run_b_summary["mcc"] == 0.05
+
+
+def test_validation_objective_field_matches_formal_task_contract(
+    evaluation_module,
+):
+    def cfg(type_enabled, time_enabled, variant="mstc"):
+        return SimpleNamespace(
+            model=SimpleNamespace(variant=variant),
+            detection=SimpleNamespace(
+                gnn_training=SimpleNamespace(
+                    decoder=SimpleNamespace(
+                        predict_edge_type=SimpleNamespace(
+                            enabled=type_enabled
+                        ),
+                        time_gap=SimpleNamespace(
+                            enabled=time_enabled
+                        ),
+                    )
+                )
+            ),
+        )
+
+    assert evaluation_module._validation_objective_field(
+        cfg(True, True)
+    ) == "score_raw"
+
+    assert evaluation_module._validation_objective_field(
+        cfg(True, False)
+    ) == "loss_type"
+
+    assert evaluation_module._validation_objective_field(
+        cfg(False, True)
+    ) == "loss_time"
+
+    assert evaluation_module._validation_objective_field(
+        cfg(True, False, variant="orthrus_baseline")
+    ) == "loss_type"
+
+
+def test_min_val_objective_joint_mstc_uses_score_raw(
+    tmp_path, evaluation_module
+):
+    cfg = _make_cfg(tmp_path)
+
+    cfg.model.variant = "mstc"
+    cfg.model_selection.method = "min_val_objective"
+    cfg.detection.gnn_training = SimpleNamespace(
+        decoder=SimpleNamespace(
+            predict_edge_type=SimpleNamespace(enabled=True),
+            time_gap=SimpleNamespace(enabled=True),
+        )
+    )
+
+    _create_checkpoint_dirs(cfg)
+
+    # Formal objective ordering:
+    #   epoch 1 = 2.0
+    #   epoch 2 = 0.5  <- must win
+    #   epoch 3 = 1.0
+    objective = {
+        1: 2.0,
+        2: 0.5,
+        3: 1.0,
+    }
+
+    for epoch, score in objective.items():
+        path = (
+            Path(cfg.detection.gnn_testing._edge_losses_dir)
+            / "val"
+            / f"model_epoch_{epoch}"
+            / "window.csv"
+        )
+        path.write_text(
+            "score_raw,loss_type,loss_time\n"
+            f"{score},10.0,10.0\n",
+            encoding="utf-8",
+        )
+
+    # Deliberately give legacy val_mean_edge_loss the opposite ordering.
+    # If production code accidentally still uses it, epoch 1 would win.
+    stats_by_epoch = {
+        "model_epoch_1": {
+            "val_mean_edge_loss": 0.1,
+            "mcc": 0.9,
+        },
+        "model_epoch_2": {
+            "val_mean_edge_loss": 9.0,
+            "mcc": 0.1,
+        },
+        "model_epoch_3": {
+            "val_mean_edge_loss": 5.0,
+            "mcc": 0.8,
+        },
+    }
+
+    best = _run_standard_evaluation(
+        evaluation_module,
+        cfg,
+        stats_by_epoch,
+    )
+
+    assert best["epoch"] == 2
+    assert best["val_objective"] == pytest.approx(0.5)
+    assert best["val_objective_field"] == "score_raw"

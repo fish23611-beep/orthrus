@@ -166,13 +166,91 @@ def _persist_canonical_metrics(run_dir, best_stats, best_epoch_dir, method, cfg)
             pass
 
 
+
+def _validation_objective_field(cfg):
+    """Return the validation CSV field required by the formal model-selection contract."""
+    variant = getattr(getattr(cfg, "model", None), "variant", None)
+
+    # ORTHRUS baseline is type-only.
+    if variant == "orthrus_baseline":
+        return "loss_type"
+
+    decoder = cfg.detection.gnn_training.decoder
+    type_enabled = bool(decoder.predict_edge_type.enabled)
+    time_enabled = bool(decoder.time_gap.enabled)
+
+    if type_enabled and time_enabled:
+        return "score_raw"
+    if type_enabled:
+        return "loss_type"
+    if time_enabled:
+        return "loss_time"
+
+    raise ValueError(
+        "min_val_objective requires at least one enabled prediction task"
+    )
+
+
+def _compute_validation_objective(val_tw_path, cfg):
+    """Compute the formal validation objective from validation event CSVs only."""
+    import pandas as _pd
+
+    field = _validation_objective_field(cfg)
+    values = []
+
+    if not os.path.isdir(val_tw_path):
+        raise FileNotFoundError(
+            f"Validation edge-score directory not found: {val_tw_path}"
+        )
+
+    csv_files = [
+        name for name in sorted(os.listdir(val_tw_path))
+        if name.endswith(".csv")
+    ]
+
+    if not csv_files:
+        raise ValueError(
+            f"No validation CSV files found under {val_tw_path}"
+        )
+
+    for name in csv_files:
+        path = os.path.join(val_tw_path, name)
+        df = _pd.read_csv(path)
+
+        if field not in df.columns:
+            raise ValueError(
+                f"Validation objective field {field!r} is missing from {path}. "
+                f"Available columns: {list(df.columns)}"
+            )
+
+        arr = _pd.to_numeric(
+            df[field], errors="coerce"
+        ).to_numpy(dtype=float)
+
+        if arr.size and not np.isfinite(arr).all():
+            raise ValueError(
+                f"Validation objective field {field!r} contains non-finite "
+                f"values in {path}"
+            )
+
+        values.extend(arr.tolist())
+
+    if not values:
+        raise ValueError(
+            f"Validation objective field {field!r} contains no values"
+        )
+
+    return float(np.mean(values)), field
+
 def standard_evaluation(cfg, evaluation_fn):
     """
     Evaluate all model checkpoints and select the best one based on cfg.model_selection.
 
     Selection strategies (cfg.model_selection.method):
-        "min_val_mean_edge_loss" (default): pick epoch with lowest mean edge loss on val.
-        "last_epoch":                   pick the last processed epoch.
+        "min_val_objective" (default): pick the epoch with the lowest formal
+                                      validation objective.
+        "last_epoch":              pick the last processed epoch.
+        "min_val_mean_edge_loss": legacy/read-only compatibility.
 
     When cfg.model_selection.legacy_test_selection=True, falls back to selecting by
     test MCC — this constitutes test-set leakage and is kept only for compatibility
@@ -211,6 +289,15 @@ def standard_evaluation(cfg, evaluation_fn):
         # Annotate epoch number for convenience
         stats["epoch"] = int(model_epoch_dir.split("_")[-1])
 
+        # Formal paper checkpoint selection uses validation data only and
+        # follows the active training objective.
+        if cfg.model_selection.method == "min_val_objective":
+            val_objective, val_objective_field = _compute_validation_objective(
+                val_tw_path, cfg
+            )
+            stats["val_objective"] = val_objective
+            stats["val_objective_field"] = val_objective_field
+
         # Only create W&B media objects when there is an active run.
         # In disabled mode wandb.run is None and raw wandb.log would raise
         # "You must call wandb.init() before wandb.log()".
@@ -248,41 +335,78 @@ def standard_evaluation(cfg, evaluation_fn):
         raise ValueError(
             "cfg.model_selection.legacy_test_selection_enabled=True is not allowed: "
             "selecting the best epoch by test-set metrics constitutes test-set leakage "
-            "and is prohibited.  Use cfg.model_selection.method='min_val_mean_edge_loss' "
-            "(default) or cfg.model_selection.method='last_epoch' instead."
+            "and is prohibited. Use model_selection.method='min_val_objective' "
+            "or 'last_epoch' instead."
         )
 
     if method == "last_epoch":
         best_epoch_dir = epoch_results[-1][0]
-        best_stats     = epoch_results[-1][1]
-    else:
-        # Strict val-metric integrity check before any selection.
-        # Every epoch must have a finite val_mean_edge_loss.  Missing,
-        # None, NaN, or inf values are all treated as invalid; selection
-        # MUST NOT silently skip such epochs or fall back to test metrics.
+        best_stats = epoch_results[-1][1]
+        selection_key = None
+
+    elif method in ("min_val_objective", "min_val_mean_edge_loss"):
+        # min_val_mean_edge_loss is retained only for legacy/read-only compatibility.
+        selection_key = (
+            "val_objective"
+            if method == "min_val_objective"
+            else "val_mean_edge_loss"
+        )
+
         import math
         invalid = []
+
         for epoch_dir, stats, _ in epoch_results:
-            v = stats.get("val_mean_edge_loss", None)
-            if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
-                invalid.append((epoch_dir, v))
+            value = stats.get(selection_key, None)
+            try:
+                valid = value is not None and math.isfinite(float(value))
+            except (TypeError, ValueError):
+                valid = False
+
+            if not valid:
+                invalid.append((epoch_dir, value))
+
         if invalid:
-            lines = "\n".join(f"  - {ep}: {val!r}" for ep, val in invalid)
+            lines = "\n".join(
+                f"  - {epoch}: {value!r}"
+                for epoch, value in invalid
+            )
             raise ValueError(
-                "Invalid or missing 'val_mean_edge_loss' for one or more epochs "
-                "under method 'min_val_mean_edge_loss'.  Test-set metrics are "
-                "NOT consulted as a fallback.  Affected epochs:\n"
-                f"{lines}\n"
-                "Ensure node_evaluation.main computes and returns a finite "
-                "'val_mean_edge_loss' for every checkpoint."
+                f"Invalid or missing {selection_key!r} for one or more epochs "
+                f"under method {method!r}. Test-set metrics are NOT consulted "
+                f"as a fallback. Affected epochs:\n{lines}"
             )
 
-        val_losses = {r[0]: r[1]["val_mean_edge_loss"] for r in epoch_results}
-        best_epoch_dir = min(val_losses, key=val_losses.get)
-        best_stats = next(r[1] for r in epoch_results if r[0] == best_epoch_dir)
+        validation_scores = {
+            epoch_dir: float(stats[selection_key])
+            for epoch_dir, stats, _ in epoch_results
+        }
 
-    log(f"Best epoch selected ({method}): {best_epoch_dir}  "
-        f"val_mean_edge_loss={best_stats.get('val_mean_edge_loss', float('nan')):.6f}")
+        best_epoch_dir = min(
+            validation_scores,
+            key=validation_scores.get,
+        )
+
+        best_stats = next(
+            stats
+            for epoch_dir, stats, _ in epoch_results
+            if epoch_dir == best_epoch_dir
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported model_selection.method={method!r}. "
+            "Allowed formal methods are 'min_val_objective' and 'last_epoch'."
+        )
+
+    if selection_key is None:
+        log(
+            f"Best epoch selected ({method}): {best_epoch_dir}"
+        )
+    else:
+        log(
+            f"Best epoch selected ({method}): {best_epoch_dir}  "
+            f"{selection_key}={float(best_stats[selection_key]):.6f}"
+        )
 
     wandb_log(best_stats)
 
