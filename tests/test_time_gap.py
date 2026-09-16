@@ -651,3 +651,45 @@ def test_fit_decreasing_timestamps_across_windows_raises():
     stats = TimeGapStatistics()
     with pytest.raises(ValueError, match="[Nn]egative|[Dd]elta"):
         stats.fit([g1, g2])  # g2[0] t=19 < g1's last_seen[0]=20 → negative delta
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for transform_batch GPU runtime regression",
+)
+def test_transform_batch_cuda_runtime_preserves_causal_semantics():
+    """CUDA TemporalData must preserve final per-event causal TimeGap semantics."""
+    g = _make_graph(
+        src=torch.tensor([0, 0], dtype=torch.long),
+        dst=torch.tensor([1, 2], dtype=torch.long),
+        t=torch.tensor(
+            [5_000_000_000, 15_000_000_000],
+            dtype=torch.long,
+        ),
+    ).to("cuda")
+
+    stats = TimeGapStatistics()
+    stats.time_bucket_boundaries = [
+        math.log1p(1.0),
+        math.log1p(9.99),
+        math.log1p(21.0),
+        math.log1p(101.0),
+    ]
+
+    before = {0: 0, 1: 0, 2: -1}
+
+    src_target, dst_target, after = stats.transform_batch(g, before)
+
+    assert src_target.dtype == torch.long
+    assert dst_target.dtype == torch.long
+
+    # Event 0: 5s gap -> SHORT.
+    # Event 1: node 0 was updated at event 0, so 15s - 5s = 10s -> MEDIUM.
+    assert src_target.tolist() == [SHORT, MEDIUM]
+    assert dst_target.tolist() == [SHORT, NO_HISTORY]
+
+    assert after == {
+        0: 15_000_000_000,
+        1: 5_000_000_000,
+        2: 15_000_000_000,
+    }

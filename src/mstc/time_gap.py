@@ -267,12 +267,17 @@ class TimeGapStatistics:
         # Create local mutable copy of target state for per-event update
         working_last_seen = dict(last_seen_per_node)
 
-        # Build stable sort order: (timestamp, global_event_index)
-        timestamps = g.t.numpy()
+        # Build stable sort order: (timestamp, global_event_index).
+        # Runtime batches may live on CUDA.  Sorting and supervision state are
+        # Python-side bookkeeping, so copy the required scalar metadata to CPU
+        # once instead of calling .numpy() or .item() repeatedly on CUDA tensors.
+        timestamps = g.t.detach().cpu().tolist()
+        src_nodes = g.src.detach().cpu().tolist()
+        dst_nodes = g.dst.detach().cpu().tolist()
         if hasattr(g, "global_event_index"):
-            event_indices = g.global_event_index.numpy()
+            event_indices = g.global_event_index.detach().cpu().tolist()
         else:
-            event_indices = torch.arange(event_count).numpy()
+            event_indices = list(range(event_count))
 
         # Stable sort indices by (timestamp, global_event_index)
         sort_indices = sorted(
@@ -293,9 +298,9 @@ class TimeGapStatistics:
         # Note: for self-loop (src == dst), both src and dst targets use the
         # same pre-event snapshot, then state is updated once
         for orig_idx in sort_indices:
-            src_i = int(g.src[orig_idx].item())
-            dst_i = int(g.dst[orig_idx].item())
-            t_i_ns = int(g.t[orig_idx].item())
+            src_i = int(src_nodes[orig_idx])
+            dst_i = int(dst_nodes[orig_idx])
+            t_i_ns = int(timestamps[orig_idx])
 
             # Compute src target
             last_src = working_last_seen.get(src_i)
