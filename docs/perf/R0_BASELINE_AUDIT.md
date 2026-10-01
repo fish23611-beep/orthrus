@@ -46,4 +46,3 @@ isolation.
 - Dataset splits match the checked-in THEIA E3/E5 contracts.
 
 All R0 baseline, configuration, semantic, isolation, and `/home` safety gates passed before R1 edits began.
-
