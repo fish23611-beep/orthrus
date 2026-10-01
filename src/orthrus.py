@@ -45,6 +45,13 @@ from mstc.metadata_cache import export_metadata
 from artifact_paths import resolve_artifact_paths
 from run_metadata import dump_environment, dump_config, dump_runtime
 from wandb_control import resolve_wandb_mode, init_wandb, wandb_log, wandb_finish, wandb_is_active
+from runtime.runtime_profiler import (
+    configure_profiler,
+    finish_profiler,
+    get_profiler,
+    profile_requested,
+    sample_every_from,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +338,7 @@ def _run_preprocess_substages(cfg, substages, force=False):
 # Main
 # ---------------------------------------------------------------------------
 def main(cfg, args, **kwargs):
+    profiler = get_profiler()
     # ------------------------------------------------------------------
     # 0. C2: Detection-only mode validation
     # ------------------------------------------------------------------
@@ -428,7 +436,8 @@ def main(cfg, args, **kwargs):
     # ------------------------------------------------------------------
     t_gnn_training = None
     if "train" in stages:
-        orthrus_gnn_training.main(cfg)
+        with profiler.timer("training.total"):
+            orthrus_gnn_training.main(cfg)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         t_gnn_training = time_module.time()
@@ -439,7 +448,8 @@ def main(cfg, args, **kwargs):
     t_gnn_testing = None
     if "test" in stages:
         _check_artifact_prerequisites(stages, cfg)
-        orthrus_gnn_testing.main(cfg)
+        with profiler.timer("evaluation.inference_total"):
+            orthrus_gnn_testing.main(cfg)
         t_gnn_testing = time_module.time()
 
     # ------------------------------------------------------------------
@@ -448,7 +458,8 @@ def main(cfg, args, **kwargs):
     t_evaluation = None
     if "evaluate" in stages:
         _check_artifact_prerequisites(stages, cfg)
-        evaluation.main(cfg)
+        with profiler.timer("evaluation.postprocess_total"):
+            evaluation.main(cfg)
         t_evaluation = time_module.time()
 
     # ------------------------------------------------------------------
@@ -529,11 +540,29 @@ def run(args):
         create_dirs=True,
     )
 
+    profiler_enabled = profile_requested(getattr(args, "perf_profile", False))
+    sample_every = (
+        sample_every_from(getattr(args, "perf_profile_sample_every_n_batches", None))
+        if profiler_enabled else 10
+    )
+    configure_profiler(
+        enabled=profiler_enabled,
+        run_root=run_dir,
+        sample_every_n_batches=sample_every,
+        metadata={
+            "dataset": cfg_pre.dataset.name,
+            "stages": list(stages),
+        },
+    )
+
     cfg_pre._run_start_time = datetime.now(timezone.utc).isoformat()
     dump_environment(run_dir)
     dump_config(cfg_pre, run_dir)
     init_wandb(cfg_pre, args, wandb_mode)
 
+    status = "failed"
+    error_msg = None
+    timing = {}
     try:
         timing = main(cfg_pre, args)
         status = "completed"
@@ -544,14 +573,18 @@ def run(args):
         error_msg = f"{type(exc).__name__}: {exc}"
         raise
     finally:
+        try:
+            finish_profiler(status=status, error=error_msg)
+        except Exception as profile_exc:
+            log(f"Runtime profiler flush failed: {type(profile_exc).__name__}: {profile_exc}")
         dump_runtime(
             cfg_pre,
             run_dir,
             status=status,
             executed_stages=stages,
-            timing=timing if "timing" in dir() else {},
+            timing=timing,
             wandb_mode=wandb_mode,
-            error_message=error_msg if "error_msg" in dir() else None,
+            error_message=error_msg,
         )
         wandb_finish()
 

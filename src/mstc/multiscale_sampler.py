@@ -22,6 +22,10 @@ from typing import Dict, Literal, Optional, Sequence
 
 import torch
 from torch import Tensor
+try:
+    from runtime.runtime_profiler import get_profiler
+except ModuleNotFoundError:  # Supports tests importing this module as src.mstc.*
+    from src.runtime.runtime_profiler import get_profiler
 
 from .history_store import HistoryStore
 
@@ -243,7 +247,9 @@ class MultiScaleNeighborLoader:
         for idx, node in enumerate(all_nodes_list):
             reference_time_ns[idx] = ref_time_per_node[node]
 
-        history = self.history_store.query(query_nodes, reference_time_ns)
+        with get_profiler().timer("training.T_history_query", detail=True,
+                                  parent="training.T_total_batch"):
+            history = self.history_store.query(query_nodes, reference_time_ns)
 
         src_query_index = torch.zeros(batch_size, dtype=torch.long)
         node_to_qidx = {node: idx for idx, node in enumerate(all_nodes_list)}

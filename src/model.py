@@ -2,7 +2,10 @@ from provnet_utils import *
 from config import *
 from typing import Optional
 
+from time import perf_counter
+
 import torch
+from runtime.runtime_profiler import get_profiler
 import torch.nn as nn
 
 from mstc.time_gap import TimeGapStatistics
@@ -125,9 +128,16 @@ class MSTCOrthrus(nn.Module):
         # The returned post-batch state is committed only after both task outputs are computed.
         updated_last_seen = None
         src_target = dst_target = None
+        profiler = get_profiler()
+        target_started = perf_counter() if profiler.detail_active else None
         if self.time_task_enabled:
             src_target, dst_target, updated_last_seen = self.time_gap_statistics.transform_batch(
                 batch, self.last_seen_per_node
+            )
+        if target_started is not None:
+            profiler.record(
+                "training.T_timegap_target", perf_counter() - target_started,
+                parent="training.T_total_batch",
             )
 
         with torch.set_grad_enabled(train_mode):
@@ -155,6 +165,7 @@ class MSTCOrthrus(nn.Module):
             if x[0].shape[0] != batch_size:
                 x = (batch.x_src[edge_index[0]], batch.x_dst[edge_index[1]])
 
+            loss_started = perf_counter() if profiler.detail_active else None
             zero_scalar = h_src.sum() * 0.0
             zero_per_event = zero_scalar.expand(batch_size)
             if self.edge_decoder is None:
@@ -182,6 +193,11 @@ class MSTCOrthrus(nn.Module):
                 )
 
             score_raw = loss_type + self.lambda_time * loss_time
+            if loss_started is not None:
+                profiler.record(
+                    "training.T_loss", perf_counter() - loss_started,
+                    parent="training.T_total_batch",
+                )
 
         if updated_last_seen is not None:
             self.last_seen_per_node = updated_last_seen

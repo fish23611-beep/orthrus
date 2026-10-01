@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Sequence
+from runtime.runtime_profiler import get_profiler
 
 import torch
 from torch import Tensor, nn
@@ -221,7 +222,9 @@ class MultiScaleOrthrusEncoder(nn.Module):
 
         node_src_hidden = torch.zeros((node_ids.numel(), self.temporal_dim), dtype=current_src_hidden.dtype, device=device)
         node_dst_hidden = torch.zeros_like(node_src_hidden)
-        historical_src, historical_dst = self._historical_node_features(full_data, event_ids, device)
+        with get_profiler().timer("training.T_feature_gather", detail=True,
+                                  parent="training.T_total_batch"):
+            historical_src, historical_dst = self._historical_node_features(full_data, event_ids, device)
         for row, (edge_src, edge_dst) in enumerate(zip(edge_src_global.tolist(), edge_dst_global.tolist())):
             node_src_hidden[node_to_local[edge_src]] = self.src_linear(historical_src[row])
             node_dst_hidden[node_to_local[edge_dst]] = self.dst_linear(historical_dst[row])
@@ -234,10 +237,13 @@ class MultiScaleOrthrusEncoder(nn.Module):
             scale_ids = torch.full((node_ids.numel(),), scale_index, dtype=torch.long, device=device)
             node_features = node_features + self.scale_embedding(scale_ids)
 
+        with get_profiler().timer("training.T_feature_gather", detail=True,
+                                  parent="training.T_total_batch"):
+            gathered_edge_features = self._edge_features(full_data, event_ids, device)
         encoded = self.shared_graph_encoder(
             node_features,
             edge_index,
-            edge_feats=self._edge_features(full_data, event_ids, device),
+            edge_feats=gathered_edge_features,
         )
         src_local = torch.tensor([node_to_local[int(node)] for node in src_query_nodes], dtype=torch.long, device=device)
         dst_local = torch.tensor([node_to_local[int(node)] for node in dst_query_nodes], dtype=torch.long, device=device)
@@ -274,7 +280,10 @@ class MultiScaleOrthrusEncoder(nn.Module):
         current_src_out = self.current_src_out_proj(current_src_hidden)
         current_dst_out = self.current_dst_out_proj(current_dst_hidden)
 
-        sampled = self.neighbor_loader(src, dst, timestamp_ns=t)
+        profiler = get_profiler()
+        with profiler.timer("training.T_neighbor_sample", detail=True,
+                            parent="training.T_total_batch"):
+            sampled = self.neighbor_loader(src, dst, timestamp_ns=t)
         scale_src, scale_dst, scale_masks = [], [], []
         for scale_index in range(3):
             encoded_src, encoded_dst, scale_mask = self._encode_scale(
@@ -308,7 +317,9 @@ class MultiScaleOrthrusEncoder(nn.Module):
         h_dst = torch.where(all_empty.unsqueeze(-1), current_dst_out, h_dst)
         self.last_gate_weights = gate_weights.detach().clone()
         self.last_scale_mask = non_empty_scale_mask.detach().clone()
-        self.neighbor_loader.insert(src, dst, timestamp_ns=t, global_event_index=global_event_index)
+        with profiler.timer("training.T_history_insert", detail=True,
+                            parent="training.T_total_batch"):
+            self.neighbor_loader.insert(src, dst, timestamp_ns=t, global_event_index=global_event_index)
         return h_src, h_dst
 
     def reset_state(self) -> None:

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+from runtime.runtime_profiler import get_profiler
 
 from mstc.metrics import (
     compute_attack_detection_rate,
@@ -41,13 +42,14 @@ def run_mstc_epoch(
     if not validation_records:
         raise ValueError("validation records cannot be empty")
     output_dir = Path(cfg.detection.evaluation._evaluation_results_dir) / "calibration" / model_epoch_dir
-    calibration_module.run_calibration(
-        validation_records, test_records, output_dir,
-        min_triplet_samples=cfg.calibration.min_triplet_samples,
-        min_type_pair_samples=cfg.calibration.min_type_pair_samples,
-        epsilon=cfg.calibration.epsilon,
-        method=cfg.calibration.method,
-    )
+    with get_profiler().timer("evaluation.T_calibration"):
+        calibration_module.run_calibration(
+            validation_records, test_records, output_dir,
+            min_triplet_samples=cfg.calibration.min_triplet_samples,
+            min_type_pair_samples=cfg.calibration.min_type_pair_samples,
+            epsilon=cfg.calibration.epsilon,
+            method=cfg.calibration.method,
+        )
     validation_calibrated = calibration_module.load_event_records_from_csv(output_dir / "validation_calibrated.csv")
     test_calibrated = calibration_module.load_event_records_from_csv(output_dir / "test_calibrated.csv")
     predictions = node_prediction_fn(validation_calibrated, test_calibrated, cfg)
@@ -121,7 +123,8 @@ def mstc_evaluation_main(
         stats.update(canonical)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "node_predictions.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["node_id", "score", "y_hat", "y_true"])
-        writer.writeheader(); writer.writerows(rows)
+    with get_profiler().timer("evaluation.T_export"):
+        with (output_dir / "node_predictions.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["node_id", "score", "y_hat", "y_true"])
+            writer.writeheader(); writer.writerows(rows)
     return {"stats": stats, "prediction_result": prediction_result, "output_dir": output_dir, "rows": rows}

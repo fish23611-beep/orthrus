@@ -10,6 +10,7 @@ from data_utils import *
 from factory import *
 from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime, update_runtime_nested
 from wandb_control import wandb_log
+from runtime.runtime_profiler import get_profiler
 
 
 def train(data,
@@ -21,14 +22,21 @@ def train(data,
     model.train()
 
     losses = []
+    profiler = get_profiler()
     batch_loader = batch_loader_factory(cfg, data, model.graph_reindexer)
 
-    for batch in batch_loader:
+    for batch, batch_token in profiler.profile_batches(batch_loader):
+        profiler.add_counter("training.batches")
+        profiler.add_counter("training.events", int(batch.edge_index.size(1)))
         optimizer.zero_grad()
 
-        outputs = model(batch, full_data)
-        loss = outputs["loss"] if isinstance(outputs, dict) else outputs
+        with profiler.timer("training.T_forward", detail=True, parent="training.T_total_batch"), \
+                profiler.cuda_timer("training.T_forward_cuda", detail=True, parent="training.T_total_batch"):
+            outputs = model(batch, full_data)
+        with profiler.timer("training.T_loss", detail=True, parent="training.T_total_batch"):
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs
         if isinstance(outputs, dict):
+            sync_started = timer() if profiler.detail_active else None
             log(
                 "MSTC batch loss={:.4f}, type={:.4f}, time={:.4f}, src={:.4f}, dst={:.4f}".format(
                     outputs["loss"].item(),
@@ -38,10 +46,21 @@ def train(data,
                     outputs["loss_time_dst"].item(),
                 )
             )
+            if sync_started is not None:
+                profiler.record(
+                    "training.T_logging_sync", timer() - sync_started,
+                    parent="training.T_total_batch",
+                )
 
-        loss.backward()
-        optimizer.step()
-        losses.append(loss.item())
+        with profiler.timer("training.T_backward", detail=True, parent="training.T_total_batch"), \
+                profiler.cuda_timer("training.T_backward_cuda", detail=True, parent="training.T_total_batch"):
+            loss.backward()
+        with profiler.timer("training.T_optimizer", detail=True, parent="training.T_total_batch"), \
+                profiler.cuda_timer("training.T_optimizer_cuda", detail=True, parent="training.T_total_batch"):
+            optimizer.step()
+        with profiler.timer("training.T_logging_sync", detail=True, parent="training.T_total_batch"):
+            losses.append(loss.item())
+        profiler.end_batch(batch_token, "training.T_total_batch")
     return np.mean(losses)
 
 
@@ -115,6 +134,7 @@ def main(cfg):
     runtime_dir = _runtime_dir(cfg, gnn_models_dir)
     dump_environment(cfg, runtime_dir)
     device = get_device(cfg)
+    profiler = get_profiler()
 
     # CUDA APIs are guarded so CPU-only training remains supported.
     if device.type == "cuda":
@@ -129,10 +149,11 @@ def main(cfg):
     if requires_time_gap_statistics(cfg):
         time_gap_statistics = _fit_and_save_time_gap_statistics(train_data, cfg)
 
-    model = build_model(
-        data_sample=train_data[0], device=device, cfg=cfg, max_node_num=max_node_num,
-        time_gap_statistics=time_gap_statistics,
-    )
+    with profiler.timer("loading.T_model_construction"):
+        model = build_model(
+            data_sample=train_data[0], device=device, cfg=cfg, max_node_num=max_node_num,
+            time_gap_statistics=time_gap_statistics,
+        )
     optimizer = optimizer_factory(cfg, parameters=set(model.parameters()))
 
     num_epochs = 1 if cfg._from_weights else cfg.detection.gnn_training.num_epochs
@@ -161,7 +182,10 @@ def main(cfg):
 
         tot_loss = 0
         for g in train_data:
-            g.to(device=device)
+            profiler.add_counter("training.windows")
+            with profiler.timer("training.T_h2d"), \
+                    profiler.cuda_timer("training.T_h2d_cuda", detail=False):
+                g.to(device=device)
             loss = train(
                 data=g,  # avoids alteration of the graph across epochs
                 full_data=full_data,  # full list of edge messages (do not store on CPU)

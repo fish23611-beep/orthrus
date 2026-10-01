@@ -12,6 +12,7 @@ from factory import *
 import torch
 
 from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime, update_runtime_nested
+from runtime.runtime_profiler import get_profiler
 
 
 def _cleanup_checkpoint_cuda(model, device):
@@ -94,11 +95,14 @@ def test(
     event_count = 0
     tot_loss = 0
     start = time.perf_counter()
+    profiler = get_profiler()
 
     # NOTE: warning, this may reindexes the graph
     batch_loader = batch_loader_factory(cfg, data, model.graph_reindexer)
 
     for batch in batch_loader:
+        profiler.add_counter("evaluation.batches")
+        profiler.add_counter("evaluation.events", int(batch.edge_index.size(1)))
         unique_nodes = torch.cat([unique_nodes, batch.edge_index.flatten()]).unique()
 
         outputs = model(batch, full_data, inference=True)
@@ -188,7 +192,8 @@ def test(
     csv_file = os.path.join(logs_dir, time_interval + ".csv")
 
     df = pd.DataFrame(edge_list)
-    df.to_csv(csv_file, sep=',', header=True, index=False, encoding='utf-8')
+    with profiler.timer("evaluation.T_export"):
+        df.to_csv(csv_file, sep=',', header=True, index=False, encoding='utf-8')
 
     # log(
     #     f'Time: {time_interval}, Loss: {tot_loss:.4f}, Nodes_count: {len(unique_nodes)}, Edges_count: {event_count}, Cost Time: {(end - start):.2f}s')
@@ -335,6 +340,7 @@ def _load_nodeid2msg(cfg) -> dict:
 
 
 def main(cfg):
+    profiler = get_profiler()
     # Load node messages with cache-first strategy
     nodeid2msg = _load_nodeid2msg(cfg)
     nodeid2msg = {k: str(v) for k, v in nodeid2msg.items()}  # pre-compute because it's too slow in main loop
@@ -372,10 +378,11 @@ def main(cfg):
 
     for trained_model, model_path in all_trained_models:
         log(f"Evaluation with model {trained_model}...")
-        model = build_model(
-            data_sample=test_data[0], device=device, cfg=cfg, max_node_num=max_node_num,
-            time_gap_statistics=time_gap_statistics,
-        )
+        with profiler.timer("loading.T_model_construction"):
+            model = build_model(
+                data_sample=test_data[0], device=device, cfg=cfg, max_node_num=max_node_num,
+                time_gap_statistics=time_gap_statistics,
+            )
         model = load_model(model, model_path)
 
         if cfg._from_weights:
@@ -389,6 +396,7 @@ def main(cfg):
         #   4. test (no reset) 鈥?sees train + val history
         # Val and test must NOT reset/replay between them.
         # ------------------------------------------------------------------ #
+        reset_started = time.perf_counter() if profiler.enabled else None
         if isinstance(model, MSTCOrthrus):
             model.reset_state()
             log(f"    [replay] reset_state() called for {trained_model}")
@@ -396,7 +404,11 @@ def main(cfg):
             model.encoder.reset_state()
             log(f"    [replay] reset_state() called for {trained_model}")
 
-        _replay_train_history(model, train_data, full_data, cfg, device)
+        if reset_started is not None:
+            profiler.record("evaluation.T_reset_state",
+                            time.perf_counter() - reset_started)
+        with profiler.timer("evaluation.T_replay_train"):
+            _replay_train_history(model, train_data, full_data, cfg, device)
         log(f"    [replay] train history rebuilt for {trained_model}")
 
         # Process val then test 鈥?NO reset/replay between them
@@ -404,8 +416,10 @@ def main(cfg):
             (val_data, "val"),
             (test_data, "test"),
         ]:
+            split_started = time.perf_counter() if profiler.enabled else None
             log(f"    Testing {split} set...")
             for g in tqdm(graphs, desc=f"{split} set with {trained_model}"):
+                profiler.add_counter("evaluation.windows")
                 g.to(device=device)
                 result = test(
                     data=g,
@@ -420,6 +434,9 @@ def main(cfg):
                 if isinstance(result, dict):
                     processed_events += int(result.get("processed_event_count", 0))
                 g.to("cpu")
+            if split_started is not None:
+                profiler.record(f"evaluation.T_{split}",
+                                time.perf_counter() - split_started)
 
         # ------------------------------------------------------------------ #
         # Checkpoint-boundary CUDA lifecycle cleanup:

@@ -20,6 +20,7 @@ from torch_geometric.loader import TemporalDataLoader
 
 from encoders import OrthrusEncoder
 from serialization_compat import load_trusted_torch_artifact
+from runtime.runtime_profiler import get_profiler
 
 
 # --------------------------------------------------------------------------- #
@@ -1292,7 +1293,8 @@ class _WindowSpec:
 
 def _prepare_window(cfg, filepath: str, view_mode: str | None = None) -> TemporalData:
     """Load and transform exactly one trusted edge-embedding artifact."""
-    data = load_trusted_torch_artifact(filepath, expected_type=TemporalData).to("cpu")
+    with get_profiler().timer("loading.T_deserialize"):
+        data = load_trusted_torch_artifact(filepath, expected_type=TemporalData).to("cpu")
     if cfg.edge_featurization.embed_nodes.used_method.strip() == "only_type":
         data = extract_msg_node_type_only([data], cfg)[0]
     else:
@@ -1323,7 +1325,10 @@ class LazyTemporalWindowCollection(Sequence):
         return type(self)(self._cfg, specs, view_mode=self._view_mode)
 
     def _load(self, spec: _WindowSpec) -> TemporalData:
-        data = _prepare_window(self._cfg, spec.path, self._view_mode)
+        profiler = get_profiler()
+        with profiler.timer("training.T_window_load"):
+            data = _prepare_window(self._cfg, spec.path, self._view_mode)
+        profiler.add_counter("loading.windows")
         if spec.global_offset >= 0:
             actual_events = int(data.src.numel())
             if actual_events != spec.num_events:
@@ -1938,7 +1943,8 @@ def load_all_datasets(cfg):
     # restoring offsets and field metadata from the manifest. No source
     # TemporalData is loaded unless this validation misses.
     telemetry.observe("before sidecar load")
-    restored_metadata = compact_index.try_restore_metadata(cfg, view_mode)
+    with get_profiler().timer("loading.T_sparse_sidecar_load"):
+        restored_metadata = compact_index.try_restore_metadata(cfg, view_mode)
     allow_persistent = restored_metadata is not None
     if restored_metadata is not None:
         all_specs, max_node, field_metadata = restored_metadata
@@ -1953,6 +1959,7 @@ def load_all_datasets(cfg):
         train_data, val_data, test_data = split_collections
     else:
         telemetry.observe("before source metadata scan")
+        scan_started = time_module.perf_counter() if get_profiler().enabled else None
         (
             train_data, val_data, test_data, all_specs, max_node,
             field_metadata,
@@ -1960,6 +1967,9 @@ def load_all_datasets(cfg):
             cfg, collections, telemetry,
             history_telemetry=compact_index._telemetry,
         )
+        if scan_started is not None:
+            get_profiler().record("loading.T_source_metadata_scan",
+                                  time_module.perf_counter() - scan_started)
         telemetry.observe("after source metadata scan")
 
     total_events = sum(spec.num_events for spec in all_specs)
@@ -1977,6 +1987,7 @@ def load_all_datasets(cfg):
         setattr(compact_index, attr, torch.empty(total_events, dtype=dtype))
 
     telemetry.observe("before compact index build")
+    compact_started = time_module.perf_counter() if get_profiler().enabled else None
     compact_index.build(
         cfg,
         view_mode,
@@ -1984,8 +1995,12 @@ def load_all_datasets(cfg):
         loader_telemetry=telemetry,
         allow_persistent=allow_persistent,
     )
+    if compact_started is not None:
+        get_profiler().record("loading.T_compact_index",
+                              time_module.perf_counter() - compact_started)
     telemetry.observe("after compact index build")
 
+    metadata_started = time_module.perf_counter() if get_profiler().enabled else None
     full_data = BoundedFullData(
         cfg,
         all_specs,
@@ -1996,6 +2011,9 @@ def load_all_datasets(cfg):
         cache_windows=1,
         compact_index=compact_index,
     )
+    if metadata_started is not None:
+        get_profiler().record("loading.T_global_metadata",
+                              time_module.perf_counter() - metadata_started)
     telemetry.observe("after BoundedFullData construction")
     telemetry.observe("after global metadata construction")
     telemetry.observe("before model construction")

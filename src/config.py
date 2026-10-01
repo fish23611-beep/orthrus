@@ -431,6 +431,16 @@ def get_default_cfg(args):
      # None = load all windows (default, unchanged behavior)
      # int > 0 = load at most that many windows per split
      cfg._max_windows_per_split = getattr(args, "max_windows_per_split", None)
+     perf_profile_value = getattr(args, "perf_profile", False)
+     cfg._perf_profile = (
+          perf_profile_value if isinstance(perf_profile_value, bool) else False
+     )
+     profile_sample_value = getattr(args, "perf_profile_sample_every_n_batches", None)
+     cfg._perf_profile_sample_every_n_batches = (
+          profile_sample_value
+          if isinstance(profile_sample_value, int) and not isinstance(profile_sample_value, bool)
+          else None
+     )
 
      # Pipeline stage control
      cfg.pipeline = CN()
@@ -552,6 +562,11 @@ def get_runtime_required_args(return_unknown_args=False, args=None):
      parser.add_argument('--run_from_training', action="store_true", help="Runs Orthrus from training when graphs are arleady preprocessed")
      parser.add_argument('--from_weights', action="store_true", help="Whether to load Orthrus from pkl weights")
      parser.add_argument('--seed', type=int, default=0, help="Manual seed")
+     parser.add_argument('--perf-profile', action='store_true',
+                         help="Enable opt-in runtime profiling artifacts.")
+     parser.add_argument('--perf-profile-sample-every-n-batches', type=int, default=None,
+                         metavar='N',
+                         help="Collect fine-grained timings every N batches (default: 10).")
 
      parser.add_argument('--show_attack', type=int, help="Number of attack for plotting", default=0)
      parser.add_argument('--gt_type', type=str, help="Type of ground truth", default="orthrus")

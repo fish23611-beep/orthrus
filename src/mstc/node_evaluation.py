@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+from runtime.runtime_profiler import get_profiler
 
 # Import B3 aggregation (same pattern as existing MSTC modules)
 _agg_path = Path(__file__).resolve().parent / "aggregation.py"
@@ -155,13 +156,14 @@ def get_mstc_node_predictions(
     # Step 1: Aggregate validation events → validation node scores
     validation_node_scores: dict[Hashable, float]
     if validation_event_records and len(validation_event_records) > 0:
-        validation_node_scores = aggregator.aggregate_events(
-            validation_event_records,
-            method=aggregation_method,  # type: ignore
-            topk=topk,
-            include_dst=include_dst,
-            score_field=score_field,
-        )
+        with get_profiler().timer("evaluation.T_node_aggregation"):
+            validation_node_scores = aggregator.aggregate_events(
+                validation_event_records,
+                method=aggregation_method,  # type: ignore
+                topk=topk,
+                include_dst=include_dst,
+                score_field=score_field,
+            )
     else:
         raise ValueError(
             "validation_event_records cannot be empty. "
@@ -177,13 +179,14 @@ def get_mstc_node_predictions(
     # Step 2: Aggregate test events → test node scores
     test_node_scores: dict[Hashable, float]
     if test_event_records and len(test_event_records) > 0:
-        test_node_scores = aggregator.aggregate_events(
-            test_event_records,
-            method=aggregation_method,  # type: ignore
-            topk=topk,
-            include_dst=include_dst,
-            score_field=score_field,
-        )
+        with get_profiler().timer("evaluation.T_node_aggregation"):
+            test_node_scores = aggregator.aggregate_events(
+                test_event_records,
+                method=aggregation_method,  # type: ignore
+                topk=topk,
+                include_dst=include_dst,
+                score_field=score_field,
+            )
     else:
         # Empty test: return empty predictions
         test_node_scores = {}
@@ -216,11 +219,12 @@ def get_mstc_node_predictions(
                 for node_id, result in updated_results.items()
             }
     else:
-        threshold = compute_node_threshold(
-            validation_node_scores,
-            method=threshold_method,
-            quantile=threshold_quantile,
-        )
+        with get_profiler().timer("evaluation.T_threshold"):
+            threshold = compute_node_threshold(
+                validation_node_scores,
+                method=threshold_method,
+                quantile=threshold_quantile,
+            )
         test_node_predictions = (
             apply_node_threshold(test_node_scores, threshold)
             if test_node_scores

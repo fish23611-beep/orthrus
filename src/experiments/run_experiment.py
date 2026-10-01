@@ -65,6 +65,14 @@ def build_parser() -> argparse.ArgumentParser:
              "Default: None (load all windows). "
              "Use 2 for bounded baseline smoke test.",
     )
+    parser.add_argument(
+        "--perf-profile", action="store_true",
+        help="Enable the default-off runtime profiler.",
+    )
+    parser.add_argument(
+        "--perf-profile-sample-every-n-batches", type=int, default=None, metavar="N",
+        help="Collect fine-grained timings every N batches (default: 10).",
+    )
     return parser
 
 
@@ -109,6 +117,10 @@ def build_pipeline_args(namespace: argparse.Namespace) -> SimpleNamespace:
         gt_type="orthrus",
         plot_gt=False,
         max_windows_per_split=namespace.max_windows_per_split,
+        perf_profile=getattr(namespace, "perf_profile", False),
+        perf_profile_sample_every_n_batches=(
+            getattr(namespace, "perf_profile_sample_every_n_batches", None)
+        ),
     )
     if checkpoint is not None:
         if "train" in stages:
