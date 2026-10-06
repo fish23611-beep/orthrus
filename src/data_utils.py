@@ -1899,53 +1899,86 @@ def _scan_lazy_collections(cfg, collections, telemetry, history_telemetry=None):
     )
 
 
-def load_all_datasets(cfg):
-    """Return full chronological data through a bounded-memory production view.
+def _eager_load_selected_datasets(cfg, split_names, datasets):
+    """Compatibility path for injected eager split loaders."""
+    from mstc.dataset_views import apply_dataset_view
 
-    Uses CompactHistoryIndex for efficient per-event field lookups without
-    per-batch full artifact reloads.
-    """
+    view_mode = cfg.dataset_view.mode
+    datasets = [
+        [apply_dataset_view(data, view_mode) for data in dataset]
+        for dataset in datasets
+    ]
+    all_msg, all_t, all_edge_types, all_src, all_dst = [], [], [], [], []
+    max_node = -1
+    for dataset in datasets:
+        for data in dataset:
+            all_msg.append(data.msg)
+            all_t.append(data.t)
+            all_edge_types.append(data.edge_type)
+            all_src.append(data.src)
+            all_dst.append(data.dst)
+            if data.src.numel() > 0:
+                max_node = max(max_node, int(data.src.max()), int(data.dst.max()))
+
+    full_data = Data(
+        msg=torch.cat(all_msg),
+        t=torch.cat(all_t),
+        edge_type=torch.cat(all_edge_types),
+        src=torch.cat(all_src),
+        dst=torch.cat(all_dst),
+    )
+    by_split = dict(zip(split_names, datasets))
+    full_data = _inject_full_data_event_fields(
+        by_split.get("train", []),
+        by_split.get("val", []),
+        by_split.get("test", []),
+        full_data,
+    )
+    max_node = max_node + 1 if max_node >= 0 else 0
+    print(f"Max node in {cfg.dataset.name}: {max_node}")
+    return (*datasets, full_data, max_node)
+
+
+def _load_datasets(cfg, split_names, *, allow_full_sidecar):
+    """Load only requested splits; omitted splits are never resolved or scanned."""
     telemetry = _LoaderTelemetry()
     telemetry.observe("before dataset loading")
     path = cfg.edge_featurization.embed_edges._edge_embeds_dir
 
-    # The lazy keyword is deliberately optional at the call boundary so tests
-    # and downstream integrations that inject the historical 3-argument loader
-    # continue to use the eager semantic reference.
     try:
-        train_data = load_data_set(cfg, path=path, split="train", lazy=True)
-        telemetry.observe("after train index/path resolution")
-        val_data = load_data_set(cfg, path=path, split="val", lazy=True)
-        telemetry.observe("after val index/path resolution")
-        test_data = load_data_set(cfg, path=path, split="test", lazy=True)
-        telemetry.observe("after test index/path resolution")
+        datasets = [
+            load_data_set(cfg, path=path, split=split, lazy=True)
+            for split in split_names
+        ]
+        for split in split_names:
+            telemetry.observe(f"after {split} index/path resolution")
     except TypeError as exc:
         if "lazy" not in str(exc):
             raise
-        train_data = load_data_set(cfg, path=path, split="train")
-        val_data = load_data_set(cfg, path=path, split="val")
-        test_data = load_data_set(cfg, path=path, split="test")
+        datasets = [
+            load_data_set(cfg, path=path, split=split)
+            for split in split_names
+        ]
 
-    if not all(isinstance(data, LazyTemporalWindowCollection)
-               for data in (train_data, val_data, test_data)):
-        return _eager_load_all_datasets(cfg, train_data, val_data, test_data)
+    if not all(isinstance(data, LazyTemporalWindowCollection) for data in datasets):
+        if tuple(split_names) == ("train", "val", "test"):
+            return _eager_load_all_datasets(cfg, *datasets)
+        return _eager_load_selected_datasets(cfg, split_names, datasets)
 
     view_mode = cfg.dataset_view.mode
-    collections = tuple(
-        data.with_view(view_mode) for data in (train_data, val_data, test_data)
-    )
+    collections = tuple(data.with_view(view_mode) for data in datasets)
     raw_specs = tuple(
         spec for collection in collections for spec in collection._specs
     )
     compact_index = _CompactIndex(specs=raw_specs, total_events=0)
 
-    # The true warm path validates only path/stat/config metadata before
-    # restoring offsets and field metadata from the manifest. No source
-    # TemporalData is loaded unless this validation misses.
-    telemetry.observe("before sidecar load")
-    with get_profiler().timer("loading.T_sparse_sidecar_load"):
-        restored_metadata = compact_index.try_restore_metadata(cfg, view_mode)
-    allow_persistent = restored_metadata is not None
+    restored_metadata = None
+    if allow_full_sidecar:
+        telemetry.observe("before sidecar load")
+        with get_profiler().timer("loading.T_sparse_sidecar_load"):
+            restored_metadata = compact_index.try_restore_metadata(cfg, view_mode)
+    allow_persistent = allow_full_sidecar and restored_metadata is not None
+
     if restored_metadata is not None:
         all_specs, max_node, field_metadata = restored_metadata
         split_collections = []
@@ -1956,20 +1989,24 @@ def load_all_datasets(cfg):
                 collection.with_specs(all_specs[cursor:cursor + count])
             )
             cursor += count
-        train_data, val_data, test_data = split_collections
+        datasets = split_collections
     else:
         telemetry.observe("before source metadata scan")
-        scan_started = time_module.perf_counter() if get_profiler().enabled else None
-        (
-            train_data, val_data, test_data, all_specs, max_node,
-            field_metadata,
-        ) = _scan_lazy_collections(
-            cfg, collections, telemetry,
+        scan_started = (
+            time_module.perf_counter() if get_profiler().enabled else None
+        )
+        scanned = _scan_lazy_collections(
+            cfg,
+            collections,
+            telemetry,
             history_telemetry=compact_index._telemetry,
         )
+        *datasets, all_specs, max_node, field_metadata = scanned
         if scan_started is not None:
-            get_profiler().record("loading.T_source_metadata_scan",
-                                  time_module.perf_counter() - scan_started)
+            get_profiler().record(
+                "loading.T_source_metadata_scan",
+                time_module.perf_counter() - scan_started,
+            )
         telemetry.observe("after source metadata scan")
 
     total_events = sum(spec.num_events for spec in all_specs)
@@ -1987,7 +2024,9 @@ def load_all_datasets(cfg):
         setattr(compact_index, attr, torch.empty(total_events, dtype=dtype))
 
     telemetry.observe("before compact index build")
-    compact_started = time_module.perf_counter() if get_profiler().enabled else None
+    compact_started = (
+        time_module.perf_counter() if get_profiler().enabled else None
+    )
     compact_index.build(
         cfg,
         view_mode,
@@ -1996,11 +2035,15 @@ def load_all_datasets(cfg):
         allow_persistent=allow_persistent,
     )
     if compact_started is not None:
-        get_profiler().record("loading.T_compact_index",
-                              time_module.perf_counter() - compact_started)
+        get_profiler().record(
+            "loading.T_compact_index",
+            time_module.perf_counter() - compact_started,
+        )
     telemetry.observe("after compact index build")
 
-    metadata_started = time_module.perf_counter() if get_profiler().enabled else None
+    metadata_started = (
+        time_module.perf_counter() if get_profiler().enabled else None
+    )
     full_data = BoundedFullData(
         cfg,
         all_specs,
@@ -2012,19 +2055,37 @@ def load_all_datasets(cfg):
         compact_index=compact_index,
     )
     if metadata_started is not None:
-        get_profiler().record("loading.T_global_metadata",
-                              time_module.perf_counter() - metadata_started)
+        get_profiler().record(
+            "loading.T_global_metadata",
+            time_module.perf_counter() - metadata_started,
+        )
     telemetry.observe("after BoundedFullData construction")
     telemetry.observe("after global metadata construction")
     telemetry.observe("before model construction")
     full_data.loader_telemetry = telemetry.as_dict()
-
-    # Add history access telemetry
-    if hasattr(full_data, "loader_telemetry") and full_data.loader_telemetry:
-        full_data.loader_telemetry["history_access"] = compact_index.telemetry
+    full_data.loader_telemetry["history_access"] = compact_index.telemetry
 
     print(f"Max node in {cfg.dataset.name}: {max_node}")
-    return train_data, val_data, test_data, full_data, max_node
+    return (*datasets, full_data, max_node)
+
+
+def load_all_datasets(cfg):
+    """Return train, validation, and test data through the legacy full view."""
+    return _load_datasets(
+        cfg,
+        ("train", "val", "test"),
+        allow_full_sidecar=True,
+    )
+
+
+def load_train_val_datasets(cfg):
+    """Return train/validation data without resolving or materializing test."""
+    return _load_datasets(
+        cfg,
+        ("train", "val"),
+        allow_full_sidecar=False,
+    )
+
 
 
 def _resolve_window_specs(cfg, path: str, split: str) -> list[_WindowSpec]:

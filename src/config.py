@@ -198,6 +198,7 @@ TASK_ARGS = {
                "threshold_method": str,
           },
           "evaluation": {
+               "checkpoint_policy": str,
                "viz_malicious_nodes": bool,
                "ground_truth_version": str,  # ["darpa_v4"]
                "used_method": str,
@@ -531,6 +532,7 @@ def get_default_cfg(args):
      cfg.detection.gnn_training.encoder.context.multiscale.gate_hidden_dim = 64
 
      # C6 defaults are safe for the baseline variant but do not select MSTC evaluation.
+     cfg.detection.evaluation.checkpoint_policy = "all_checkpoints"
      cfg.calibration.method = "hierarchical_relation"
      cfg.calibration.min_triplet_samples = 100
      cfg.calibration.min_type_pair_samples = 200
@@ -833,6 +835,26 @@ def _validate_calibration_method(method: str) -> str:
     return method_str
 
 
+def _validate_checkpoint_policy(policy: str) -> str:
+    valid_policies = ("all_checkpoints", "val_select_then_test_best")
+    policy_str = str(policy).strip().lower()
+    if policy_str not in valid_policies:
+        raise ValueError(
+            "Invalid detection.evaluation.checkpoint_policy=%r. Allowed values: %s"
+            % (policy, ", ".join(valid_policies))
+        )
+    return policy_str
+
+
+def get_checkpoint_policy(cfg) -> str:
+    """Resolve the execution policy while preserving legacy cfg test doubles."""
+    evaluation_cfg = getattr(getattr(cfg, "detection", None), "evaluation", None)
+    policy = getattr(evaluation_cfg, "checkpoint_policy", None)
+    if not isinstance(policy, str):
+        policy = "all_checkpoints"
+    return _validate_checkpoint_policy(policy)
+
+
 def get_yml_cfg(args):
      # Checks that CLI args are OK
      check_args(args)
@@ -966,6 +988,10 @@ def get_yml_cfg(args):
 
      if hasattr(cfg, "semantic_features") and hasattr(cfg.semantic_features, "corpus_scope"):
          cfg.semantic_features.corpus_scope = _validate_corpus_scope(cfg.semantic_features.corpus_scope)
+
+     cfg.detection.evaluation.checkpoint_policy = _validate_checkpoint_policy(
+          cfg.detection.evaluation.checkpoint_policy
+     )
 
      # Checks args after all overrides are applied
      check_task_dependency_graph(str(yml_file), str(base_yml_file))

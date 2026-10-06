@@ -13,6 +13,12 @@ import torch
 
 from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime, update_runtime_nested
 from runtime.runtime_profiler import get_profiler
+from detection.checkpoint_policy import (
+    compute_validation_objective,
+    select_checkpoint_from_validation,
+    selection_manifest_path,
+    write_selection_manifest,
+)
 
 
 def _cleanup_checkpoint_cuda(model, device):
@@ -339,35 +345,203 @@ def _load_nodeid2msg(cfg) -> dict:
     return {k: str(v) for k, v in nodeid2msg.items()}
 
 
+def _reset_checkpoint_state(model, trained_model, profiler):
+    reset_started = time.perf_counter() if profiler.enabled else None
+    if isinstance(model, MSTCOrthrus):
+        model.reset_state()
+        log(f"    [replay] reset_state() called for {trained_model}")
+    elif hasattr(model, "encoder") and hasattr(model.encoder, "reset_state"):
+        model.encoder.reset_state()
+        log(f"    [replay] reset_state() called for {trained_model}")
+    if reset_started is not None:
+        profiler.record(
+            "evaluation.T_reset_state",
+            time.perf_counter() - reset_started,
+        )
+
+
+def _run_single_split(
+    graphs,
+    split,
+    *,
+    model,
+    full_data,
+    nodeid2msg,
+    trained_model,
+    cfg,
+    device,
+    profiler,
+):
+    processed_events = 0
+    split_started = time.perf_counter() if profiler.enabled else None
+    log(f"    Testing {split} set...")
+    for g in tqdm(graphs, desc=f"{split} set with {trained_model}"):
+        profiler.add_counter("evaluation.windows")
+        g.to(device=device)
+        try:
+            result = test(
+                data=g,
+                full_data=full_data,
+                model=model,
+                nodeid2msg=nodeid2msg,
+                split=split,
+                model_epoch_file=trained_model,
+                cfg=cfg,
+                device=device,
+            )
+            if isinstance(result, dict):
+                processed_events += int(result.get("processed_event_count", 0))
+        finally:
+            g.to("cpu")
+    if split_started is not None:
+        profiler.record(
+            f"evaluation.T_{split}",
+            time.perf_counter() - split_started,
+        )
+    return processed_events
+
+
+def _run_checkpoint_replay(
+    trained_model,
+    model_path,
+    *,
+    data_sample,
+    train_data,
+    split_sequence,
+    full_data,
+    max_node_num,
+    time_gap_statistics,
+    nodeid2msg,
+    cfg,
+    device,
+    profiler,
+):
+    """Construct/load one checkpoint and run reset -> replay -> requested splits."""
+    log(f"Evaluation with model {trained_model}...")
+    model = None
+    try:
+        with profiler.timer("loading.T_model_construction"):
+            model = build_model(
+                data_sample=data_sample,
+                device=device,
+                cfg=cfg,
+                max_node_num=max_node_num,
+                time_gap_statistics=time_gap_statistics,
+            )
+        model = load_model(model, model_path)
+        if cfg._from_weights:
+            model.load_state_dict(
+                torch.load(
+                    os.path.join(
+                        cfg._from_weights_path,
+                        f"{cfg.dataset.name}.pkl",
+                    )
+                )
+            )
+
+        _reset_checkpoint_state(model, trained_model, profiler)
+        with profiler.timer("evaluation.T_replay_train"):
+            _replay_train_history(model, train_data, full_data, cfg, device)
+        log(f"    [replay] train history rebuilt for {trained_model}")
+
+        processed_events = 0
+        for graphs, split in split_sequence:
+            processed_events += _run_single_split(
+                graphs,
+                split,
+                model=model,
+                full_data=full_data,
+                nodeid2msg=nodeid2msg,
+                trained_model=trained_model,
+                cfg=cfg,
+                device=device,
+                profiler=profiler,
+            )
+        return processed_events
+    finally:
+        if model is not None:
+            _cleanup_checkpoint_cuda(model, device)
+
+
+def _reject_stale_non_selected_test_artifacts(cfg, selected_epoch):
+    test_root = os.path.join(
+        cfg.detection.gnn_testing._edge_losses_dir,
+        "test",
+    )
+    if not os.path.isdir(test_root):
+        return
+    checkpoint_dirs = [
+        name
+        for name in sorted(os.listdir(test_root))
+        if os.path.isdir(os.path.join(test_root, name))
+    ]
+    stale = [name for name in checkpoint_dirs if name != selected_epoch]
+    if stale:
+        raise RuntimeError(
+            "val_select_then_test_best found stale non-selected test artifacts "
+            f"{stale} under {test_root}. Use a fresh run root or explicitly use "
+            "checkpoint_policy='all_checkpoints' compatibility mode."
+        )
+
+
 def main(cfg):
     profiler = get_profiler()
-    # Load node messages with cache-first strategy
-    nodeid2msg = _load_nodeid2msg(cfg)
-    nodeid2msg = {k: str(v) for k, v in nodeid2msg.items()}  # pre-compute because it's too slow in main loop
+    checkpoint_policy = get_checkpoint_policy(cfg)
+    if (
+        checkpoint_policy == "val_select_then_test_best"
+        and cfg.model_selection.method != "min_val_objective"
+    ):
+        raise ValueError(
+            "checkpoint_policy='val_select_then_test_best' requires "
+            "model_selection.method='min_val_objective'"
+        )
 
-    train_data, val_data, test_data, full_data, max_node_num = load_all_datasets(cfg)
+    nodeid2msg = _load_nodeid2msg(cfg)
+    nodeid2msg = {k: str(v) for k, v in nodeid2msg.items()}
+
+    if checkpoint_policy == "all_checkpoints":
+        train_data, val_data, test_data, full_data, max_node_num = (
+            load_all_datasets(cfg)
+        )
+    else:
+        train_data, val_data, full_data, max_node_num = (
+            load_train_val_datasets(cfg)
+        )
+        test_data = None
 
     time_gap_statistics = None
     if requires_time_gap_statistics(cfg):
         time_gap_statistics = _load_or_fit_time_gap_statistics(cfg, train_data)
 
-    # For each model trained at a given epoch, we test. C8-B may inject one
-    # explicit inference checkpoint (a checkpoint directory or checkpoint file).
     gnn_models_dir = cfg.detection.gnn_training._trained_models_dir
     inference_checkpoint = getattr(cfg, "_inference_checkpoint", None)
     if isinstance(inference_checkpoint, str) and inference_checkpoint:
         checkpoint_path = os.fspath(inference_checkpoint)
-        all_trained_models = [(os.path.basename(checkpoint_path.rstrip(os.sep)) or "checkpoint", checkpoint_path)]
+        checkpoint_name = (
+            os.path.basename(checkpoint_path.rstrip(os.sep)) or "checkpoint"
+        )
+        all_trained_models = [(checkpoint_name, checkpoint_path)]
     elif cfg._from_weights:
-        all_trained_models = [("model_epoch_1", os.path.join(gnn_models_dir, "model_epoch_1"))]
+        all_trained_models = [
+            ("model_epoch_1", os.path.join(gnn_models_dir, "model_epoch_1"))
+        ]
     else:
-        all_trained_models = [(name, os.path.join(gnn_models_dir, name)) for name in listdir_sorted(gnn_models_dir)]
+        all_trained_models = [
+            (name, os.path.join(gnn_models_dir, name))
+            for name in listdir_sorted(gnn_models_dir)
+        ]
+
     runtime_dir = getattr(cfg, "_run_dir", None)
     if not isinstance(runtime_dir, (str, os.PathLike)) or not os.fspath(runtime_dir):
         runtime_dir = os.path.dirname(gnn_models_dir)
     dump_environment(cfg, runtime_dir)
     if hasattr(full_data, "loader_telemetry"):
-        update_runtime_nested(runtime_dir, "dataset_loader", "testing", full_data.loader_telemetry)
+        update_runtime_nested(
+            runtime_dir,
+            "dataset_loader",
+            "testing",
+            full_data.loader_telemetry,
+        )
 
     device = get_device(cfg)
     if device.type == "cuda":
@@ -375,103 +549,146 @@ def main(cfg):
         torch.cuda.reset_peak_memory_stats(device=device)
     testing_started = time.perf_counter()
     processed_events = 0
+    selected_epoch = None
 
-    for trained_model, model_path in all_trained_models:
-        log(f"Evaluation with model {trained_model}...")
-        with profiler.timer("loading.T_model_construction"):
-            model = build_model(
-                data_sample=test_data[0], device=device, cfg=cfg, max_node_num=max_node_num,
+    if checkpoint_policy == "all_checkpoints":
+        assert test_data is not None
+        for trained_model, model_path in all_trained_models:
+            processed_events += _run_checkpoint_replay(
+                trained_model,
+                model_path,
+                data_sample=test_data[0],
+                train_data=train_data,
+                split_sequence=((val_data, "val"), (test_data, "test")),
+                full_data=full_data,
+                max_node_num=max_node_num,
                 time_gap_statistics=time_gap_statistics,
+                nodeid2msg=nodeid2msg,
+                cfg=cfg,
+                device=device,
+                profiler=profiler,
             )
-        model = load_model(model, model_path)
-
-        if cfg._from_weights:
-            model.load_state_dict(torch.load(os.path.join(cfg._from_weights_path, f"{cfg.dataset.name}.pkl")))
-
-        # ------------------------------------------------------------------ #
-        # Correct replay protocol (per checkpoint, before val+test):
-        #   1. reset_state()  鈥?clears any stale history
-        #   2. replay train   鈥?rebuilds history from scratch
-        #   3. val (no reset) 鈥?sees full train history
-        #   4. test (no reset) 鈥?sees train + val history
-        # Val and test must NOT reset/replay between them.
-        # ------------------------------------------------------------------ #
-        reset_started = time.perf_counter() if profiler.enabled else None
-        if isinstance(model, MSTCOrthrus):
-            model.reset_state()
-            log(f"    [replay] reset_state() called for {trained_model}")
-        elif hasattr(model, 'encoder') and hasattr(model.encoder, 'reset_state'):
-            model.encoder.reset_state()
-            log(f"    [replay] reset_state() called for {trained_model}")
-
-        if reset_started is not None:
-            profiler.record("evaluation.T_reset_state",
-                            time.perf_counter() - reset_started)
-        with profiler.timer("evaluation.T_replay_train"):
-            _replay_train_history(model, train_data, full_data, cfg, device)
-        log(f"    [replay] train history rebuilt for {trained_model}")
-
-        # Process val then test 鈥?NO reset/replay between them
-        for graphs, split in [
-            (val_data, "val"),
-            (test_data, "test"),
-        ]:
-            split_started = time.perf_counter() if profiler.enabled else None
-            log(f"    Testing {split} set...")
-            for g in tqdm(graphs, desc=f"{split} set with {trained_model}"):
-                profiler.add_counter("evaluation.windows")
-                g.to(device=device)
-                result = test(
-                    data=g,
-                    full_data=full_data,
-                    model=model,
-                    nodeid2msg=nodeid2msg,
-                    split=split,
-                    model_epoch_file=trained_model,
-                    cfg=cfg,
-                    device=device,
+        selection_validation_passes = len(all_trained_models)
+        canonical_validation_passes = 0
+        replay_passes = len(all_trained_models)
+        test_passes = len(all_trained_models)
+    else:
+        per_epoch_validation_objective = {}
+        objective_field = None
+        for trained_model, model_path in all_trained_models:
+            processed_events += _run_checkpoint_replay(
+                trained_model,
+                model_path,
+                data_sample=val_data[0],
+                train_data=train_data,
+                split_sequence=((val_data, "val"),),
+                full_data=full_data,
+                max_node_num=max_node_num,
+                time_gap_statistics=time_gap_statistics,
+                nodeid2msg=nodeid2msg,
+                cfg=cfg,
+                device=device,
+                profiler=profiler,
+            )
+            val_epoch_path = os.path.join(
+                cfg.detection.gnn_testing._edge_losses_dir,
+                "val",
+                trained_model,
+            )
+            value, field = compute_validation_objective(val_epoch_path, cfg)
+            if objective_field is not None and field != objective_field:
+                raise RuntimeError(
+                    "Validation objective field changed between checkpoints: "
+                    f"{objective_field!r} != {field!r}"
                 )
-                if isinstance(result, dict):
-                    processed_events += int(result.get("processed_event_count", 0))
-                g.to("cpu")
-            if split_started is not None:
-                profiler.record(f"evaluation.T_{split}",
-                                time.perf_counter() - split_started)
+            objective_field = field
+            per_epoch_validation_objective[trained_model] = value
 
-        # ------------------------------------------------------------------ #
-        # Checkpoint-boundary CUDA lifecycle cleanup:
-        #
-        #   Problem: del model is insufficient because Python reference cycles
-        #   (e.g. model ↔ encoder ↔ neighbor_loader ↔ graph_reindexer) keep
-        #   the old checkpoint's CUDA tensors alive until the next gc pass.
-        #   Over 6 checkpoints this accumulates several hundred MB of unreleased
-        #   CUDA memory, eventually triggering OOM on model_epoch_2 test.
-        #
-        #   Fix: explicitly break all known CUDA-holding references, invoke the
-        #   garbage collector to reclaim cyclic Python objects, and synchronise
-        #   the CUDA allocator so the freed memory is returned to the pool.
-        #
-        #   This does NOT change the replay protocol (reset → replay → val →
-        #   test), does NOT modify model parameters or hyperparameters, and does
-        #   NOT affect the val/test order or the no-reset-between-val-and-test
-        #   invariant.
-        # ------------------------------------------------------------------ #
-        _cleanup_checkpoint_cuda(model, device)
+        selected_epoch = select_checkpoint_from_validation(
+            per_epoch_validation_objective
+        )
+        manifest = {
+            "checkpoint_policy": checkpoint_policy,
+            "model_selection_method": cfg.model_selection.method,
+            "val_objective_field": objective_field,
+            "per_epoch_validation_objective": per_epoch_validation_objective,
+            "selected_epoch": selected_epoch,
+        }
+        write_selection_manifest(selection_manifest_path(cfg), manifest)
 
-        del model
+        _reject_stale_non_selected_test_artifacts(cfg, selected_epoch)
+
+        # This is the first optimized-policy access to the test split. The
+        # manifest above is already durable before this call begins.
+        (
+            train_data,
+            val_data,
+            test_data,
+            full_data,
+            max_node_num,
+        ) = load_all_datasets(cfg)
+        if hasattr(full_data, "loader_telemetry"):
+            update_runtime_nested(
+                runtime_dir,
+                "dataset_loader",
+                "testing_canonical",
+                full_data.loader_telemetry,
+            )
+
+        selected_paths = dict(all_trained_models)
+        if selected_epoch not in selected_paths:
+            raise RuntimeError(
+                f"Selected checkpoint {selected_epoch!r} is not available"
+            )
+        processed_events += _run_checkpoint_replay(
+            selected_epoch,
+            selected_paths[selected_epoch],
+            data_sample=test_data[0],
+            train_data=train_data,
+            split_sequence=((val_data, "val"), (test_data, "test")),
+            full_data=full_data,
+            max_node_num=max_node_num,
+            time_gap_statistics=time_gap_statistics,
+            nodeid2msg=nodeid2msg,
+            cfg=cfg,
+            device=device,
+            profiler=profiler,
+        )
+        selection_validation_passes = len(all_trained_models)
+        canonical_validation_passes = 1
+        replay_passes = len(all_trained_models) + 1
+        test_passes = 1
 
     test_seconds = time.perf_counter() - testing_started
     peak_gpu_memory_mb = (
         torch.cuda.max_memory_allocated(device=device) / (1024 ** 2)
-        if device.type == "cuda" else None
+        if device.type == "cuda"
+        else None
     )
-    update_runtime(runtime_dir, "testing", {
-        "test_seconds": test_seconds,
-        "events_per_second": events_per_second(processed_events, test_seconds),
-        "processed_event_count": processed_events,
-        "peak_gpu_memory_mb": peak_gpu_memory_mb,
-        "peak_cpu_memory_mb": peak_cpu_memory_mb(),
-    })
+    update_runtime(
+        runtime_dir,
+        "testing",
+        {
+            "test_seconds": test_seconds,
+            "events_per_second": events_per_second(
+                processed_events,
+                test_seconds,
+            ),
+            "processed_event_count": processed_events,
+            "peak_gpu_memory_mb": peak_gpu_memory_mb,
+            "peak_cpu_memory_mb": peak_cpu_memory_mb(),
+            "checkpoint_policy": checkpoint_policy,
+            "selected_epoch": selected_epoch,
+            "selection_validation_passes": selection_validation_passes,
+            "canonical_validation_passes": canonical_validation_passes,
+            "total_validation_passes": (
+                selection_validation_passes + canonical_validation_passes
+            ),
+            "replay_passes": replay_passes,
+            "test_passes": test_passes,
+        },
+    )
+
 
 
 if __name__ == "__main__":

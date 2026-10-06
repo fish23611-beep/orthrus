@@ -69,6 +69,7 @@ detection:
   gnn_testing:
     threshold_method: str
   evaluation:
+    checkpoint_policy: all_checkpoints
     viz_malicious_nodes: False
     ground_truth_version: darpa
     used_method: node_evaluation

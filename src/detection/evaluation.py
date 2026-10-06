@@ -17,7 +17,16 @@ from mstc.calibration_runner import (
 from data_utils import *
 from provnet_utils import log
 from .evaluation_utils import *
+from config import get_checkpoint_policy
+from .checkpoint_policy import (
+    compute_validation_objective as _shared_compute_validation_objective,
+    read_selection_manifest,
+    selection_manifest_path,
+    validate_selection_manifest,
+    validation_objective_field as _shared_validation_objective_field,
+)
 from wandb_control import wandb_log, wandb_is_active
+from mstc.experiment_utils import update_runtime
 from labelling import get_GP_of_each_attack
 
 PathLike = Union[str, "os.PathLike[str]"]
@@ -168,79 +177,12 @@ def _persist_canonical_metrics(run_dir, best_stats, best_epoch_dir, method, cfg)
 
 
 def _validation_objective_field(cfg):
-    """Return the validation CSV field required by the formal model-selection contract."""
-    variant = getattr(getattr(cfg, "model", None), "variant", None)
-
-    # ORTHRUS baseline is type-only.
-    if variant == "orthrus_baseline":
-        return "loss_type"
-
-    decoder = cfg.detection.gnn_training.decoder
-    type_enabled = bool(decoder.predict_edge_type.enabled)
-    time_enabled = bool(decoder.time_gap.enabled)
-
-    if type_enabled and time_enabled:
-        return "score_raw"
-    if type_enabled:
-        return "loss_type"
-    if time_enabled:
-        return "loss_time"
-
-    raise ValueError(
-        "min_val_objective requires at least one enabled prediction task"
-    )
+    return _shared_validation_objective_field(cfg)
 
 
 def _compute_validation_objective(val_tw_path, cfg):
-    """Compute the formal validation objective from validation event CSVs only."""
-    import pandas as _pd
+    return _shared_compute_validation_objective(val_tw_path, cfg)
 
-    field = _validation_objective_field(cfg)
-    values = []
-
-    if not os.path.isdir(val_tw_path):
-        raise FileNotFoundError(
-            f"Validation edge-score directory not found: {val_tw_path}"
-        )
-
-    csv_files = [
-        name for name in sorted(os.listdir(val_tw_path))
-        if name.endswith(".csv")
-    ]
-
-    if not csv_files:
-        raise ValueError(
-            f"No validation CSV files found under {val_tw_path}"
-        )
-
-    for name in csv_files:
-        path = os.path.join(val_tw_path, name)
-        df = _pd.read_csv(path)
-
-        if field not in df.columns:
-            raise ValueError(
-                f"Validation objective field {field!r} is missing from {path}. "
-                f"Available columns: {list(df.columns)}"
-            )
-
-        arr = _pd.to_numeric(
-            df[field], errors="coerce"
-        ).to_numpy(dtype=float)
-
-        if arr.size and not np.isfinite(arr).all():
-            raise ValueError(
-                f"Validation objective field {field!r} contains non-finite "
-                f"values in {path}"
-            )
-
-        values.extend(arr.tolist())
-
-    if not values:
-        raise ValueError(
-            f"Validation objective field {field!r} contains no values"
-        )
-
-    return float(np.mean(values)), field
 
 def standard_evaluation(cfg, evaluation_fn):
     """
@@ -416,6 +358,14 @@ def standard_evaluation(cfg, evaluation_fn):
 
     if runtime_dir:
         _persist_canonical_metrics(runtime_dir, best_stats, best_epoch_dir, method, cfg)
+        update_runtime(
+            runtime_dir,
+            "testing",
+            {
+                "checkpoint_policy": get_checkpoint_policy(cfg),
+                "selected_epoch": best_epoch_dir,
+            },
+        )
 
     # Persist selected-epoch artifacts: node_predictions.csv and event_predictions.csv
     if runtime_dir:
@@ -633,17 +583,127 @@ def mstc_evaluation_main(val_tw_path, test_tw_path, model_epoch_dir, cfg, **kwar
     return result["stats"]
 
 
+def _selected_checkpoint_evaluation(cfg, evaluation_fn):
+    """Evaluate exactly the epoch committed by the run-scoped manifest."""
+    if cfg.model_selection.method != "min_val_objective":
+        raise ValueError(
+            "checkpoint_policy='val_select_then_test_best' requires "
+            "model_selection.method='min_val_objective'"
+        )
+
+    manifest_path = selection_manifest_path(cfg)
+    manifest = read_selection_manifest(manifest_path)
+    selected_epoch = validate_selection_manifest(manifest, cfg)
+
+    edge_losses_dir = cfg.detection.gnn_testing._edge_losses_dir
+    test_losses_dir = os.path.join(edge_losses_dir, "test")
+    val_losses_dir = os.path.join(edge_losses_dir, "val")
+    if not os.path.isdir(test_losses_dir):
+        raise FileNotFoundError(
+            f"Selected checkpoint test directory not found: {test_losses_dir}"
+        )
+    test_checkpoint_dirs = [
+        name
+        for name in sorted(os.listdir(test_losses_dir))
+        if os.path.isdir(os.path.join(test_losses_dir, name))
+    ]
+    stale = [
+        name for name in test_checkpoint_dirs if name != selected_epoch
+    ]
+    if stale:
+        raise RuntimeError(
+            "val_select_then_test_best found stale non-selected test artifacts "
+            f"{stale} under {test_losses_dir}. Use a fresh run root or "
+            "checkpoint_policy='all_checkpoints' compatibility mode."
+        )
+    if test_checkpoint_dirs != [selected_epoch]:
+        raise ValueError(
+            "val_select_then_test_best requires exactly one selected test "
+            f"artifact directory {selected_epoch!r}; found {test_checkpoint_dirs}"
+        )
+
+    val_tw_path = os.path.join(val_losses_dir, selected_epoch)
+    test_tw_path = os.path.join(test_losses_dir, selected_epoch)
+    tw_to_malicious_nodes = (
+        compute_tw_labels(cfg)
+        if cfg.model.variant == "orthrus_baseline"
+        else {}
+    )
+    result = evaluation_fn(
+        val_tw_path,
+        test_tw_path,
+        selected_epoch,
+        cfg,
+        tw_to_malicious_nodes=tw_to_malicious_nodes,
+    )
+    if isinstance(result, tuple):
+        stats, _ = result
+    else:
+        stats = result
+
+    stats["epoch"] = int(selected_epoch.split("_")[-1])
+    stats["val_objective"] = float(
+        manifest["per_epoch_validation_objective"][selected_epoch]
+    )
+    stats["val_objective_field"] = manifest["val_objective_field"]
+    wandb_log(stats)
+
+    runtime_dir = getattr(cfg, "_run_dir", None)
+    if runtime_dir:
+        _persist_canonical_metrics(
+            runtime_dir,
+            stats,
+            selected_epoch,
+            cfg.model_selection.method,
+            cfg,
+        )
+        variant = getattr(cfg.model, "variant", None)
+        if variant == "mstc":
+            _persist_mstc_predictions(runtime_dir, selected_epoch, cfg)
+            _persist_event_predictions(
+                runtime_dir, selected_epoch, cfg, variant
+            )
+        elif variant == "orthrus_baseline":
+            _persist_baseline_node_predictions(
+                runtime_dir, selected_epoch, cfg
+            )
+            _persist_event_predictions(
+                runtime_dir, selected_epoch, cfg, variant
+            )
+        update_runtime(
+            runtime_dir,
+            "testing",
+            {
+                "checkpoint_policy": "val_select_then_test_best",
+                "selected_epoch": selected_epoch,
+            },
+        )
+    return stats
+
+
+
 def main(cfg):
     method = cfg.detection.evaluation.used_method.strip()
     variant = cfg.model.variant
     if method != "node_evaluation":
         raise ValueError(f"Invalid evaluation method {cfg.detection.evaluation.used_method}")
-    if variant == "orthrus_baseline":
-        standard_evaluation(cfg, evaluation_fn=node_evaluation.main)
-    elif variant == "mstc":
-        standard_evaluation(cfg, evaluation_fn=mstc_evaluation_main)
-    else:
+
+    checkpoint_policy = get_checkpoint_policy(cfg)
+    evaluation_fn = (
+        node_evaluation.main
+        if variant == "orthrus_baseline"
+        else mstc_evaluation_main
+        if variant == "mstc"
+        else None
+    )
+    if evaluation_fn is None:
         raise ValueError(f"Invalid model variant {variant}")
+
+    if checkpoint_policy == "all_checkpoints":
+        standard_evaluation(cfg, evaluation_fn=evaluation_fn)
+    else:
+        _selected_checkpoint_evaluation(cfg, evaluation_fn=evaluation_fn)
+
 
 
 if __name__ == "__main__":
