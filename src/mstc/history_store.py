@@ -18,6 +18,15 @@ import torch
 from torch import Tensor
 
 
+def _stable_lexsort_desc(timestamp_ns: Tensor, event_id: Tensor) -> Tensor:
+    """Return a stable descending lexicographic order for timestamp/event ID."""
+    event_order = torch.argsort(event_id, descending=True, stable=True)
+    timestamp_order = torch.argsort(
+        timestamp_ns[event_order], descending=True, stable=True
+    )
+    return event_order[timestamp_order]
+
+
 class HistoryStore:
     """
     Stores per-node temporal history for multi-scale sampling.
@@ -230,8 +239,7 @@ class HistoryStore:
         timestamps_cpu = timestamps.cpu()
         directions_cpu = directions.cpu() if directions is not None else None
 
-        sort_keys = timestamps_cpu * (10**10) + event_ids_cpu
-        sorted_idx = torch.argsort(sort_keys, descending=True)
+        sorted_idx = _stable_lexsort_desc(timestamps_cpu, event_ids_cpu)
 
         sorted_nodes = nodes_cpu[sorted_idx]
         sorted_neighbors = neighbors_cpu[sorted_idx]
@@ -282,8 +290,7 @@ class HistoryStore:
                 )
             )
 
-            sort_keys_all = all_times * (10**10) + all_events
-            sorted_idx_all = torch.argsort(sort_keys_all, descending=True)
+            sorted_idx_all = _stable_lexsort_desc(all_times, all_events)
 
             all_neighbors = all_neighbors[sorted_idx_all]
             all_events = all_events[sorted_idx_all]
