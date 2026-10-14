@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import random
+import os
+import sys
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pytest
 import torch
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.mstc.history_store import HistoryStore
 

@@ -2,6 +2,7 @@ from provnet_utils import *
 from config import *
 from typing import Tuple
 import torch.nn as nn
+from runtime.runtime_profiler import get_profiler
 from torch_geometric.nn import SAGEConv, TransformerConv
 
 
@@ -15,9 +16,13 @@ class GraphTransformer(nn.Module):
         self.activation = activation
 
     def forward(self, x, edge_index, edge_feats=None, **kwargs):
-        x = self.activation(self.conv(x, edge_index, edge_feats))
-        x = self.dropout(x)
-        x = self.conv2(x, edge_index, edge_feats)
+        profiler = get_profiler()
+        with profiler.timer("training.graph_encoder.conv1", detail=True):
+            x = self.activation(self.conv(x, edge_index, edge_feats))
+        with profiler.timer("training.graph_encoder.dropout", detail=True):
+            x = self.dropout(x)
+        with profiler.timer("training.graph_encoder.conv2", detail=True):
+            x = self.conv2(x, edge_index, edge_feats)
         return x
 
 

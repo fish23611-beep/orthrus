@@ -70,8 +70,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable the default-off runtime profiler.",
     )
     parser.add_argument(
+        "--benchmark-basic-timing", action="store_true",
+        help="Record minimal host Batch wall times without enabling detailed profiling.",
+    )
+    parser.add_argument(
+        "--shared-artifact-readonly", action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--perf-profile-sample-every-n-batches", type=int, default=None, metavar="N",
         help="Collect fine-grained timings every N batches (default: 10).",
+    )
+    parser.add_argument(
+        "--perf-profile-torch-trace-batches", type=int, default=0, metavar="N",
+        help="Capture an expensive PyTorch CPU/CUDA trace for N batches.",
+    )
+    parser.add_argument(
+        "--perf-profile-torch-trace-window-start", type=int, default=0, metavar="N",
+        help=argparse.SUPPRESS,
     )
     return parser
 
@@ -104,6 +120,7 @@ def build_pipeline_args(namespace: argparse.Namespace) -> SimpleNamespace:
         seed=namespace.seed,
         artifact_root=namespace.artifact_root,
         shared_artifact_root=getattr(namespace, "shared_artifact_root", None),
+        shared_artifact_readonly=getattr(namespace, "shared_artifact_readonly", False),
         stages=namespace.stages,
         checkpoint=checkpoint,
         cpu=namespace.cpu,
@@ -118,8 +135,15 @@ def build_pipeline_args(namespace: argparse.Namespace) -> SimpleNamespace:
         plot_gt=False,
         max_windows_per_split=namespace.max_windows_per_split,
         perf_profile=getattr(namespace, "perf_profile", False),
+        benchmark_basic_timing=getattr(namespace, "benchmark_basic_timing", False),
         perf_profile_sample_every_n_batches=(
             getattr(namespace, "perf_profile_sample_every_n_batches", None)
+        ),
+        perf_profile_torch_trace_batches=(
+            getattr(namespace, "perf_profile_torch_trace_batches", 0)
+        ),
+        perf_profile_torch_trace_window_start=(
+            getattr(namespace, "perf_profile_torch_trace_window_start", 0)
         ),
     )
     if checkpoint is not None:

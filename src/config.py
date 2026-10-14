@@ -633,7 +633,9 @@ def overwrite_cfg_with_args(cfg, args):
                     cfg_ptr = getattr(cfg_ptr, attr)
                setattr(cfg_ptr, attr_name, value)
 
-def set_task_paths(cfg):
+def set_task_paths(cfg, *, create_dirs=None):
+     if create_dirs is None:
+          create_dirs = not bool(getattr(cfg, "_shared_artifact_readonly", False))
      subtask_to_hash = {}
      # Directories common to all tasks
      for task, subtask in TASK_ARGS.items():
@@ -678,7 +680,8 @@ def set_task_paths(cfg):
 
                # The directory to save logs related to the graph_construction task
                subtask_cfg._logs_dir = os.path.join(subtask_cfg._task_path, "logs/")
-               os.makedirs(subtask_cfg._logs_dir, exist_ok=True)
+               if create_dirs:
+                    os.makedirs(subtask_cfg._logs_dir, exist_ok=True)
 
      # graph_construction paths
      cfg.graph_construction.build_graphs._graphs_dir = os.path.join(cfg.graph_construction.build_graphs._task_path, "nx/")
@@ -703,7 +706,8 @@ def set_task_paths(cfg):
 
      # C2: Metadata cache directory (derived from graph_construction task path)
      cfg._metadata_dir = os.path.join(cfg.graph_construction.build_graphs._task_path, "metadata")
-     os.makedirs(cfg._metadata_dir, exist_ok=True)
+     if create_dirs:
+          os.makedirs(cfg._metadata_dir, exist_ok=True)
 
      # TODO
      cfg.postprocessing._task_path = None
@@ -930,6 +934,10 @@ def get_yml_cfg(args):
 
      artifact_root_raw = getattr(args, "artifact_root", None)
      shared_root_raw = getattr(args, "shared_artifact_root", None)
+     shared_artifact_readonly = bool(
+          getattr(args, "shared_artifact_readonly", False)
+     )
+     cfg._shared_artifact_readonly = shared_artifact_readonly
 
      from artifact_paths import resolve_artifact_root
 

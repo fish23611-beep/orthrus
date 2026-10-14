@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Sequence
+from time import perf_counter
 from runtime.runtime_profiler import get_profiler
 
 import torch
@@ -138,6 +139,9 @@ class MultiScaleOrthrusEncoder(nn.Module):
         full_data: Any,
         device: torch.device,
     ) -> list[tuple[int, int, int, int]]:
+        profiler = get_profiler()
+        detail = profiler.detail_active
+        materialize_started = perf_counter() if detail else None
         event_ids = sampled[f"{scale}_event_id"].cpu()
         neighbors = sampled[f"{scale}_neighbor_id"].cpu()
         directions = sampled[f"{scale}_direction"].cpu()
@@ -145,6 +149,14 @@ class MultiScaleOrthrusEncoder(nn.Module):
         query_nodes = sampled["query_nodes"].cpu()
         records: list[tuple[int, int, int, int]] = []
         seen_event_ids: set[int] = set()
+        if materialize_started is not None:
+            profiler.record(
+                f"training.scan_scale.{scale}.cpu_materialize",
+                perf_counter() - materialize_started,
+                parent=f"training.scan_scale.{scale}.total",
+            )
+        loop_started = perf_counter() if detail else None
+        lookup_seconds = 0.0
 
         for q_idx in range(event_ids.size(0)):
             for slot in range(event_ids.size(1)):
@@ -158,9 +170,12 @@ class MultiScaleOrthrusEncoder(nn.Module):
                     raise ValueError(f"history direction must be 0 or 1, got {direction}")
                 query = int(query_nodes[q_idx])
                 neighbor = int(neighbors[q_idx, slot])
+                lookup_started = perf_counter() if detail else None
                 full_src = int(self._full_values(full_data, "src", torch.tensor([event_id]), device)[0])
                 full_dst = int(self._full_values(full_data, "dst", torch.tensor([event_id]), device)[0])
                 full_timestamp = int(self._full_values(full_data, "t", torch.tensor([event_id]), device)[0])
+                if lookup_started is not None:
+                    lookup_seconds += perf_counter() - lookup_started
                 sampled_timestamp = int(sampled[f"{scale}_timestamp_ns"].cpu()[q_idx, slot])
                 expected_src = query if direction == 0 else neighbor
                 expected_dst = neighbor if direction == 0 else query
@@ -170,6 +185,18 @@ class MultiScaleOrthrusEncoder(nn.Module):
                     raise ValueError("history timestamp and full_data timestamp disagree")
                 seen_event_ids.add(event_id)
                 records.append((event_id, query, neighbor, direction))
+        if loop_started is not None:
+            loop_seconds = perf_counter() - loop_started
+            profiler.record(
+                f"training.scan_scale.{scale}.full_data_query",
+                lookup_seconds, parent=f"training.scan_scale.{scale}.total",
+            )
+            profiler.record(
+                f"training.scan_scale.{scale}.candidate_loop",
+                max(0.0, loop_seconds - lookup_seconds),
+                parent=f"training.scan_scale.{scale}.total",
+            )
+        profiler.record_batch_stat(f"{scale}_scan_records", len(records))
         return records
 
     def _encode_scale(
@@ -184,7 +211,13 @@ class MultiScaleOrthrusEncoder(nn.Module):
         device: torch.device,
     ) -> tuple[Tensor, Tensor, Tensor]:
         scale = _SCALE_NAMES[scale_index]
-        records = self._scan_scale(scale, sampled, full_data, device)
+        profiler = get_profiler()
+        with profiler.timer(
+            f"training.scan_scale.{scale}.total", detail=True,
+            parent=f"training.encode_scale.{scale}.total",
+        ):
+            records = self._scan_scale(scale, sampled, full_data, device)
+        construct_started = perf_counter() if profiler.detail_active else None
         query_nodes = sampled["query_nodes"].to(device).long()
         src_indices = sampled["src_query_index"].to(device).long()
         dst_indices = sampled["dst_query_index"].to(device).long()
@@ -201,6 +234,8 @@ class MultiScaleOrthrusEncoder(nn.Module):
                 dst_has_history |= dst_query_nodes == query
 
         if not records:
+            profiler.record_batch_stat(f"{scale}_graph_nodes", 0)
+            profiler.record_batch_stat(f"{scale}_graph_edges", 0)
             return current_src_out, current_dst_out, src_has_history | dst_has_history
 
         event_ids = torch.tensor([record[0] for record in records], dtype=torch.long, device=device)
@@ -222,8 +257,19 @@ class MultiScaleOrthrusEncoder(nn.Module):
 
         node_src_hidden = torch.zeros((node_ids.numel(), self.temporal_dim), dtype=current_src_hidden.dtype, device=device)
         node_dst_hidden = torch.zeros_like(node_src_hidden)
-        with get_profiler().timer("training.T_feature_gather", detail=True,
-                                  parent="training.T_total_batch"):
+        if construct_started is not None:
+            profiler.record(
+                f"training.encode_scale.{scale}.python_tensor_organize",
+                perf_counter() - construct_started,
+                parent=f"training.encode_scale.{scale}.total",
+            )
+        with profiler.timer(
+            f"training.feature_gather.{scale}.node", detail=True,
+            parent=f"training.encode_scale.{scale}.total",
+        ), profiler.cuda_timer(
+            f"training.feature_gather.{scale}.node_cuda_interval", detail=True,
+            parent=f"training.feature_gather.{scale}.node",
+        ):
             historical_src, historical_dst = self._historical_node_features(full_data, event_ids, device)
         for row, (edge_src, edge_dst) in enumerate(zip(edge_src_global.tolist(), edge_dst_global.tolist())):
             node_src_hidden[node_to_local[edge_src]] = self.src_linear(historical_src[row])
@@ -237,20 +283,41 @@ class MultiScaleOrthrusEncoder(nn.Module):
             scale_ids = torch.full((node_ids.numel(),), scale_index, dtype=torch.long, device=device)
             node_features = node_features + self.scale_embedding(scale_ids)
 
-        with get_profiler().timer("training.T_feature_gather", detail=True,
-                                  parent="training.T_total_batch"):
+        with profiler.timer(
+            f"training.feature_gather.{scale}.edge", detail=True,
+            parent=f"training.encode_scale.{scale}.total",
+        ), profiler.cuda_timer(
+            f"training.feature_gather.{scale}.edge_cuda_interval", detail=True,
+            parent=f"training.feature_gather.{scale}.edge",
+        ):
             gathered_edge_features = self._edge_features(full_data, event_ids, device)
-        encoded = self.shared_graph_encoder(
-            node_features,
-            edge_index,
-            edge_feats=gathered_edge_features,
-        )
+        with profiler.timer(
+            f"training.graph_encoder.{scale}", detail=True,
+            parent=f"training.encode_scale.{scale}.total",
+        ), profiler.cuda_timer(
+            f"training.graph_encoder.{scale}.cuda_interval", detail=True,
+            parent=f"training.graph_encoder.{scale}",
+        ):
+            encoded = self.shared_graph_encoder(
+                node_features,
+                edge_index,
+                edge_feats=gathered_edge_features,
+            )
+        result_started = perf_counter() if profiler.detail_active else None
         src_local = torch.tensor([node_to_local[int(node)] for node in src_query_nodes], dtype=torch.long, device=device)
         dst_local = torch.tensor([node_to_local[int(node)] for node in dst_query_nodes], dtype=torch.long, device=device)
         encoded_src = encoded[src_local]
         encoded_dst = encoded[dst_local]
         encoded_src = torch.where(src_has_history.unsqueeze(-1), encoded_src, current_src_out)
         encoded_dst = torch.where(dst_has_history.unsqueeze(-1), encoded_dst, current_dst_out)
+        if result_started is not None:
+            profiler.record(
+                f"training.encode_scale.{scale}.result_index",
+                perf_counter() - result_started,
+                parent=f"training.encode_scale.{scale}.total",
+            )
+        profiler.record_batch_stat(f"{scale}_graph_nodes", int(node_ids.numel()))
+        profiler.record_batch_stat(f"{scale}_graph_edges", len(records))
         return encoded_src, encoded_dst, src_has_history | dst_has_history
 
     def forward(self, edge_index, t, msg, x, full_data, inference=False, **kwargs) -> tuple[Tensor, Tensor]:
@@ -275,24 +342,37 @@ class MultiScaleOrthrusEncoder(nn.Module):
         if x_src.size(0) != batch_size:
             x_src, x_dst = x_src[edge_index[0]], x_dst[edge_index[1]]
         x_src, x_dst = x_src.to(device), x_dst.to(device)
+        profiler = get_profiler()
+        projection_started = perf_counter() if profiler.detail_active else None
         current_src_hidden = self.src_linear(x_src) if self.use_node_feats_in_gnn else self.src_linear(torch.zeros_like(x_src))
         current_dst_hidden = self.dst_linear(x_dst) if self.use_node_feats_in_gnn else self.dst_linear(torch.zeros_like(x_dst))
         current_src_out = self.current_src_out_proj(current_src_hidden)
         current_dst_out = self.current_dst_out_proj(current_dst_hidden)
+        if projection_started is not None:
+            profiler.record(
+                "training.encoder.current_projection",
+                perf_counter() - projection_started,
+                parent="training.T_encoder",
+            )
 
-        profiler = get_profiler()
         with profiler.timer("training.T_neighbor_sample", detail=True,
-                            parent="training.T_total_batch"):
+                            parent="training.T_encoder"):
             sampled = self.neighbor_loader(src, dst, timestamp_ns=t)
         scale_src, scale_dst, scale_masks = [], [], []
         for scale_index in range(3):
-            encoded_src, encoded_dst, scale_mask = self._encode_scale(
-                scale_index, sampled, current_src_hidden, current_dst_hidden,
-                current_src_out, current_dst_out, full_data, device,
-            )
+            scale_name = _SCALE_NAMES[scale_index]
+            with profiler.timer(
+                f"training.encode_scale.{scale_name}.total", detail=True,
+                parent="training.T_encoder",
+            ):
+                encoded_src, encoded_dst, scale_mask = self._encode_scale(
+                    scale_index, sampled, current_src_hidden, current_dst_hidden,
+                    current_src_out, current_dst_out, full_data, device,
+                )
             scale_src.append(encoded_src)
             scale_dst.append(encoded_dst)
             scale_masks.append(scale_mask)
+        fusion_started = perf_counter() if profiler.detail_active else None
         h_src_stack = torch.stack(scale_src, dim=1)
         h_dst_stack = torch.stack(scale_dst, dim=1)
         non_empty_scale_mask = torch.stack(scale_masks, dim=1)
@@ -317,8 +397,13 @@ class MultiScaleOrthrusEncoder(nn.Module):
         h_dst = torch.where(all_empty.unsqueeze(-1), current_dst_out, h_dst)
         self.last_gate_weights = gate_weights.detach().clone()
         self.last_scale_mask = non_empty_scale_mask.detach().clone()
+        if fusion_started is not None:
+            profiler.record(
+                "training.encoder.fusion", perf_counter() - fusion_started,
+                parent="training.T_encoder",
+            )
         with profiler.timer("training.T_history_insert", detail=True,
-                            parent="training.T_total_batch"):
+                            parent="training.T_encoder"):
             self.neighbor_loader.insert(src, dst, timestamp_ns=t, global_event_index=global_event_index)
         return h_src, h_dst
 

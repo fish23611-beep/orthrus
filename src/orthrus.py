@@ -548,11 +548,23 @@ def run(args):
     configure_profiler(
         enabled=profiler_enabled,
         run_root=run_dir,
+        basic_timing=bool(getattr(args, "benchmark_basic_timing", False)),
         sample_every_n_batches=sample_every,
         metadata={
             "dataset": cfg_pre.dataset.name,
             "stages": list(stages),
+            "requested_profile_mode": "on" if getattr(args, "perf_profile", False) else "off",
+            "effective_profile_mode": "on" if profiler_enabled else "off",
+            "basic_timing": bool(getattr(args, "benchmark_basic_timing", False)),
         },
+        torch_trace_batches=(
+            int(getattr(args, "perf_profile_torch_trace_batches", 0) or 0)
+            if profiler_enabled else 0
+        ),
+        torch_trace_window_start=(
+            int(getattr(args, "perf_profile_torch_trace_window_start", 0) or 0)
+            if profiler_enabled else 0
+        ),
     )
 
     cfg_pre._run_start_time = datetime.now(timezone.utc).isoformat()

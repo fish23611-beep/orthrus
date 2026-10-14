@@ -813,6 +813,8 @@ class _CompactIndex:
         field_metadata: dict[str, tuple[tuple[int, ...], torch.dtype]] | None,
     ) -> None:
         """Publish generation-named tensors first and the manifest last."""
+        if bool(getattr(cfg, "_shared_artifact_readonly", False)):
+            return
         root = self._persistent_root(cfg)
         if root is None or field_metadata is None or not self.has_node_table():
             return

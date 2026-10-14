@@ -27,13 +27,19 @@ def train(data,
 
     for batch, batch_token in profiler.profile_batches(batch_loader):
         profiler.add_counter("training.batches")
-        profiler.add_counter("training.events", int(batch.edge_index.size(1)))
-        optimizer.zero_grad()
+        batch_events = int(batch.edge_index.size(1))
+        profiler.add_counter("training.events", batch_events)
+        profiler.record_basic_batch_stat("batch_events", batch_events)
+        profiler.record_batch_stat("batch_events", batch_events)
+        with profiler.timer("training.T_zero_grad", detail=True,
+                            parent="training.T_total_batch"):
+            optimizer.zero_grad()
 
         with profiler.timer("training.T_forward", detail=True, parent="training.T_total_batch"), \
-                profiler.cuda_timer("training.T_forward_cuda", detail=True, parent="training.T_total_batch"):
+                profiler.cuda_timer("training.T_forward_cuda_interval", detail=True, parent="training.T_total_batch"):
             outputs = model(batch, full_data)
-        with profiler.timer("training.T_loss", detail=True, parent="training.T_total_batch"):
+        with profiler.timer("training.T_loss_extract", detail=True,
+                            parent="training.T_total_batch"):
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs
         if isinstance(outputs, dict):
             sync_started = timer() if profiler.detail_active else None
@@ -48,17 +54,18 @@ def train(data,
             )
             if sync_started is not None:
                 profiler.record(
-                    "training.T_logging_sync", timer() - sync_started,
+                    "training.T_logging_items", timer() - sync_started,
                     parent="training.T_total_batch",
                 )
 
         with profiler.timer("training.T_backward", detail=True, parent="training.T_total_batch"), \
-                profiler.cuda_timer("training.T_backward_cuda", detail=True, parent="training.T_total_batch"):
+                profiler.cuda_timer("training.T_backward_cuda_interval", detail=True, parent="training.T_total_batch"):
             loss.backward()
         with profiler.timer("training.T_optimizer", detail=True, parent="training.T_total_batch"), \
-                profiler.cuda_timer("training.T_optimizer_cuda", detail=True, parent="training.T_total_batch"):
+                profiler.cuda_timer("training.T_optimizer_cuda_interval", detail=True, parent="training.T_total_batch"):
             optimizer.step()
-        with profiler.timer("training.T_logging_sync", detail=True, parent="training.T_total_batch"):
+        with profiler.timer("training.T_loss_item", detail=True,
+                            parent="training.T_total_batch"):
             losses.append(loss.item())
         profiler.end_batch(batch_token, "training.T_total_batch")
     return np.mean(losses)
@@ -75,6 +82,13 @@ def _event_count(data):
         if value is not None:
             return int(value.numel())
     return 0
+
+
+def _receipt_scalar(value):
+    """Return JSON-safe window metadata without inspecting tensor contents."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return f"<{type(value).__module__}.{type(value).__qualname__}>"
 
 
 def _run_scoped_metadata_dir(cfg):
@@ -171,6 +185,9 @@ def main(cfg):
     tot_loss = 0.0
     epoch_times = []
     processed_events = 0
+    completed_windows = []
+    training_batch_size = int(cfg.detection.gnn_training.encoder.batch_size)
+
     for epoch in tqdm(range(start_epoch, num_epochs + 1), desc="Training"):
         start = timer()
 
@@ -181,10 +198,18 @@ def main(cfg):
             model.encoder.reset_state()
 
         tot_loss = 0
-        for g in train_data:
+        for window_index, g in enumerate(train_data):
+            window_event_count = _event_count(g)
+            window_id = _receipt_scalar(getattr(g, "window_id", window_index))
+            profiler.set_context(
+                epoch=epoch,
+                window_index=window_index,
+                window_id=getattr(g, "window_id", window_index),
+            )
             profiler.add_counter("training.windows")
             with profiler.timer("training.T_h2d"), \
-                    profiler.cuda_timer("training.T_h2d_cuda", detail=False):
+                    profiler.cuda_timer("training.T_h2d_cuda_interval", detail=False,
+                                        parent="training.T_h2d"):
                 g.to(device=device)
             loss = train(
                 data=g,  # avoids alteration of the graph across epochs
@@ -194,9 +219,21 @@ def main(cfg):
                 cfg=cfg,
             )
             tot_loss += loss
-            processed_events += _event_count(g)
+            processed_events += window_event_count
             # log(f"Loss {loss:4f}")
             g.to("cpu")
+            # Appended only after the complete window, including its CPU return,
+            # succeeds. This is a lightweight receipt, not a timing record.
+            completed_windows.append({
+                "epoch": epoch,
+                "window_index": window_index,
+                "window_id": window_id,
+                "event_count": window_event_count,
+                "expected_batch_count": (
+                    (window_event_count + training_batch_size - 1) // training_batch_size
+                ),
+            })
+
 
         tot_loss /= len(train_data)
         log(f'GNN training loss Epoch: {epoch:02d}, Loss: {tot_loss:.4f}')
@@ -217,7 +254,11 @@ def main(cfg):
         # Keep legacy state_dict.pkl for inference, plus complete resume state.
         if cfg._test_mode or epoch % 1 == 0:
             model_path = os.path.join(gnn_models_dir, f"model_epoch_{epoch}")
-            save_model(model, model_path, neigh_loader=False, optimizer=optimizer, epoch=epoch, cfg=cfg)
+            with profiler.timer("training.T_checkpoint"):
+                save_model(
+                    model, model_path, neigh_loader=False, optimizer=optimizer,
+                    epoch=epoch, cfg=cfg,
+                )
 
     total_train_seconds = timer() - training_started
     runtime = {
@@ -228,6 +269,14 @@ def main(cfg):
         "processed_event_count": processed_events,
         "peak_gpu_memory_mb": peak_memory_mb if epoch_times else None,
         "peak_cpu_memory_mb": peak_cpu_memory_mb(),
+        "execution_receipt": {
+            "schema_version": 1,
+            "status": "completed",
+            "start_epoch": start_epoch,
+            "end_epoch": num_epochs,
+            "batch_size": training_batch_size,
+            "windows": completed_windows,
+        },
     }
     update_runtime(runtime_dir, "training", runtime)
     update_runtime(runtime_dir, "model", {

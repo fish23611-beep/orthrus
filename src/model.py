@@ -2,8 +2,6 @@ from provnet_utils import *
 from config import *
 from typing import Optional
 
-from time import perf_counter
-
 import torch
 from runtime.runtime_profiler import get_profiler
 import torch.nn as nn
@@ -129,16 +127,14 @@ class MSTCOrthrus(nn.Module):
         updated_last_seen = None
         src_target = dst_target = None
         profiler = get_profiler()
-        target_started = perf_counter() if profiler.detail_active else None
-        if self.time_task_enabled:
-            src_target, dst_target, updated_last_seen = self.time_gap_statistics.transform_batch(
-                batch, self.last_seen_per_node
-            )
-        if target_started is not None:
-            profiler.record(
-                "training.T_timegap_target", perf_counter() - target_started,
-                parent="training.T_total_batch",
-            )
+        with profiler.timer(
+            "training.T_timegap_target", detail=True,
+            parent="training.T_forward",
+        ):
+            if self.time_task_enabled:
+                src_target, dst_target, updated_last_seen = self.time_gap_statistics.transform_batch(
+                    batch, self.last_seen_per_node
+                )
 
         with torch.set_grad_enabled(train_mode):
             batch_global_event_index = getattr(batch, "global_event_index", None)
@@ -151,53 +147,60 @@ class MSTCOrthrus(nn.Module):
                         "but it is not present on the batch."
                     )
                 encoder_kwargs["global_event_index"] = batch_global_event_index
-            h = self.encoder(
-                edge_index=edge_index,
-                t=batch.t,
-                x=x,
-                msg=batch.msg,
-                edge_feats=batch.edge_feats if hasattr(batch, "edge_feats") else None,
-                full_data=full_data,
-                inference=inference,
-                **encoder_kwargs,
-            )
+            with profiler.timer(
+                "training.T_encoder", detail=True, parent="training.T_forward",
+            ):
+                h = self.encoder(
+                    edge_index=edge_index,
+                    t=batch.t,
+                    x=x,
+                    msg=batch.msg,
+                    edge_feats=batch.edge_feats if hasattr(batch, "edge_feats") else None,
+                    full_data=full_data,
+                    inference=inference,
+                    **encoder_kwargs,
+                )
             h_src, h_dst = (h[edge_index[0]], h[edge_index[1]]) if isinstance(h, torch.Tensor) else h
             if x[0].shape[0] != batch_size:
                 x = (batch.x_src[edge_index[0]], batch.x_dst[edge_index[1]])
 
-            loss_started = perf_counter() if profiler.detail_active else None
-            zero_scalar = h_src.sum() * 0.0
-            zero_per_event = zero_scalar.expand(batch_size)
-            if self.edge_decoder is None:
-                edge_logits = h_src.new_empty((batch_size, 0))
-                loss_type = zero_per_event if inference else zero_scalar
-            else:
-                edge_logits = self.edge_decoder.logits(h_src, h_dst)
-                loss_type = self.edge_decoder.loss(
-                    h_src, h_dst, batch.edge_type, inference=inference
-                )
+            with profiler.timer(
+                "training.T_loss", detail=True, parent="training.T_forward",
+            ):
+                zero_scalar = h_src.sum() * 0.0
+                zero_per_event = zero_scalar.expand(batch_size)
+                with profiler.timer(
+                    "training.T_edge_head", detail=True, parent="training.T_loss",
+                ):
+                    if self.edge_decoder is None:
+                        edge_logits = h_src.new_empty((batch_size, 0))
+                        loss_type = zero_per_event if inference else zero_scalar
+                    else:
+                        edge_logits = self.edge_decoder.logits(h_src, h_dst)
+                        loss_type = self.edge_decoder.loss(
+                            h_src, h_dst, batch.edge_type, inference=inference
+                        )
 
-            if not self.time_task_enabled:
-                src_time_logits = h_src.new_empty((batch_size, 0))
-                dst_time_logits = h_src.new_empty((batch_size, 0))
-                loss_time = zero_per_event if inference else zero_scalar
-                loss_time_src = zero_per_event if inference else zero_scalar
-                loss_time_dst = zero_per_event if inference else zero_scalar
-            else:
-                src_target = src_target.to(h_src.device)
-                dst_target = dst_target.to(h_src.device)
-                src_time_logits, dst_time_logits = self.time_gap_decoder(h_src, h_dst)
-                reduction = "none" if inference else "mean"
-                loss_time, loss_time_src, loss_time_dst = self.time_gap_decoder.loss(
-                    src_time_logits, dst_time_logits, src_target, dst_target, reduction=reduction
-                )
+                with profiler.timer(
+                    "training.T_time_head", detail=True, parent="training.T_loss",
+                ):
+                    if not self.time_task_enabled:
+                        src_time_logits = h_src.new_empty((batch_size, 0))
+                        dst_time_logits = h_src.new_empty((batch_size, 0))
+                        loss_time = zero_per_event if inference else zero_scalar
+                        loss_time_src = zero_per_event if inference else zero_scalar
+                        loss_time_dst = zero_per_event if inference else zero_scalar
+                    else:
+                        src_target = src_target.to(h_src.device)
+                        dst_target = dst_target.to(h_src.device)
+                        src_time_logits, dst_time_logits = self.time_gap_decoder(h_src, h_dst)
+                        reduction = "none" if inference else "mean"
+                        loss_time, loss_time_src, loss_time_dst = self.time_gap_decoder.loss(
+                            src_time_logits, dst_time_logits, src_target, dst_target,
+                            reduction=reduction,
+                        )
 
-            score_raw = loss_type + self.lambda_time * loss_time
-            if loss_started is not None:
-                profiler.record(
-                    "training.T_loss", perf_counter() - loss_started,
-                    parent="training.T_total_batch",
-                )
+                score_raw = loss_type + self.lambda_time * loss_time
 
         if updated_last_seen is not None:
             self.last_seen_per_node = updated_last_seen

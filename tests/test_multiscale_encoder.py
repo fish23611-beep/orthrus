@@ -434,3 +434,69 @@ def test_equal_fusion_backward_pass():
     for name, param in encoder.named_parameters():
         if param.grad is not None:
             assert torch.isfinite(param.grad).all(), f"Non-finite gradient on {name}"
+
+
+def _assert_nested_tensor_equal(left, right):
+    assert type(left) is type(right)
+    if isinstance(left, torch.Tensor):
+        assert torch.equal(left, right)
+    elif isinstance(left, dict):
+        assert left.keys() == right.keys()
+        for key in left:
+            _assert_nested_tensor_equal(left[key], right[key])
+    elif isinstance(left, (list, tuple)):
+        assert len(left) == len(right)
+        for a, b in zip(left, right):
+            _assert_nested_tensor_equal(a, b)
+    else:
+        assert left == right
+
+
+def test_profiler_switch_preserves_outputs_gradients_optimizer_rng_and_history():
+    from runtime.runtime_profiler import configure_profiler
+
+    torch.manual_seed(101)
+    template, _, _ = _make_encoder()
+    initial_state = {key: value.clone() for key, value in template.state_dict().items()}
+    full = _full_data()
+    batch = _batch(src=(0,), dst=(2,), t=(100,), event_ids=(3,))
+
+    def execute(enabled):
+        configure_profiler(
+            enabled=enabled, run_root=None, sample_every_n_batches=1,
+        )
+        torch.manual_seed(202)
+        encoder, loader, _ = _make_encoder()
+        encoder.load_state_dict(initial_state)
+        loader.history_store.insert(
+            torch.tensor([0, 1, 2]), torch.tensor([1, 2, 3]),
+            torch.tensor([0, 1, 2]), torch.tensor([90, 60, 10]),
+        )
+        optimizer = torch.optim.Adam(encoder.parameters(), lr=0.001)
+        profiler = __import__("runtime.runtime_profiler", fromlist=["get_profiler"]).get_profiler()
+        with profiler.batch("training.T_total_batch"):
+            h_src, h_dst = _forward(encoder, full, batch)
+            loss = h_src.square().mean() + h_dst.square().mean()
+            loss.backward()
+            gradients = {
+                name: parameter.grad.clone()
+                for name, parameter in encoder.named_parameters()
+                if parameter.grad is not None
+            }
+            optimizer.step()
+        result = {
+            "h_src": h_src.detach().clone(),
+            "h_dst": h_dst.detach().clone(),
+            "loss": loss.detach().clone(),
+            "gradients": gradients,
+            "parameters": {key: value.clone() for key, value in encoder.state_dict().items()},
+            "optimizer": optimizer.state_dict(),
+            "rng": torch.get_rng_state().clone(),
+            "history": encoder.history_state_dict(),
+        }
+        configure_profiler(enabled=False, run_root=None)
+        return result
+
+    disabled = execute(False)
+    enabled = execute(True)
+    _assert_nested_tensor_equal(disabled, enabled)

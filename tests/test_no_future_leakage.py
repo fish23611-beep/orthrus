@@ -159,3 +159,44 @@ def test_mstc_reset_and_replay_progress_one_shared_time_state():
     model.reset_state()
     assert model.last_seen_per_node == {}
     assert encoder.reset_calls == 1
+
+def test_profiler_switch_preserves_timegap_targets_scores_rng_and_time_state():
+    from runtime.runtime_profiler import configure_profiler, get_profiler
+
+    torch.manual_seed(303)
+    template = MSTCOrthrus(
+        encoder=_Encoder(dim=2),
+        edge_decoder=None,
+        time_gap_decoder=TimeGapDecoder(in_dim=2, hidden_dim=4),
+        time_gap_statistics=_fit_stats(),
+    )
+    initial = {key: value.clone() for key, value in template.state_dict().items()}
+    batch = _model_batch([10_000_000_000, 20_000_000_000])
+
+    def execute(enabled):
+        configure_profiler(enabled=enabled, run_root=None, sample_every_n_batches=1)
+        torch.manual_seed(404)
+        model = MSTCOrthrus(
+            encoder=_Encoder(dim=2),
+            edge_decoder=None,
+            time_gap_decoder=TimeGapDecoder(in_dim=2, hidden_dim=4),
+            time_gap_statistics=_fit_stats(),
+        )
+        model.load_state_dict(initial)
+        with get_profiler().batch("training.T_total_batch"):
+            outputs = model(batch, full_data=None, inference=True)
+        result = (
+            {key: value.detach().clone() for key, value in outputs.items()},
+            dict(model.last_seen_per_node),
+            torch.get_rng_state().clone(),
+        )
+        configure_profiler(enabled=False, run_root=None)
+        return result
+
+    disabled = execute(False)
+    enabled = execute(True)
+    assert disabled[0].keys() == enabled[0].keys()
+    for key in disabled[0]:
+        assert torch.equal(disabled[0][key], enabled[0][key]), key
+    assert disabled[1] == enabled[1]
+    assert torch.equal(disabled[2], enabled[2])

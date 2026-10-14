@@ -17,11 +17,12 @@ import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
 
-PROFILE_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = 2
 PROFILE_ENV = "ORTHRUS_PERF_PROFILE"
 PROFILE_SAMPLE_ENV = "ORTHRUS_PERF_PROFILE_SAMPLE_EVERY_N_BATCHES"
 
@@ -91,6 +92,14 @@ def _percentile(sorted_values: list[float], q: float) -> float:
     return float(sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight)
 
 
+@dataclass
+class _TimerFrame:
+    name: str
+    started: float
+    parent: str | None
+    child_seconds: float = 0.0
+
+
 class RuntimeProfiler:
     """Aggregate wall-clock and CUDA-event timings without changing semantics."""
 
@@ -99,37 +108,71 @@ class RuntimeProfiler:
         *,
         enabled: bool,
         run_root: str | os.PathLike[str] | None = None,
+        basic_timing: bool = False,
         sample_every_n_batches: int = 10,
         raw_sample_limit: int = 2000,
         metadata: dict[str, Any] | None = None,
+        torch_trace_batches: int = 0,
+        torch_trace_window_start: int = 0,
     ) -> None:
         if sample_every_n_batches <= 0:
             raise ValueError("sample_every_n_batches must be positive")
         if raw_sample_limit < 0:
             raise ValueError("raw_sample_limit must be non-negative")
+        if torch_trace_batches < 0:
+            raise ValueError("torch_trace_batches must be non-negative")
+        if torch_trace_window_start < 0:
+            raise ValueError("torch_trace_window_start must be non-negative")
         self.enabled = bool(enabled)
+        self.basic_timing = bool(basic_timing)
         self.run_root = Path(run_root) if run_root is not None else None
         self.sample_every_n_batches = int(sample_every_n_batches)
         self.raw_sample_limit = int(raw_sample_limit)
+        self.torch_trace_batches = int(torch_trace_batches)
+        self.torch_trace_window_start = int(torch_trace_window_start)
         self.metadata = dict(metadata or {})
         self._samples: dict[str, list[float]] = defaultdict(list)
+        self._self_samples: dict[str, list[float]] = defaultdict(list)
         self._sums: dict[str, float] = defaultdict(float)
+        self._self_sums: dict[str, float] = defaultdict(float)
         self._observed_counts: dict[str, int] = defaultdict(int)
         self._parents: dict[str, str] = {}
-        self._units: dict[str, str] = {}
+        self._domains: dict[str, str] = {}
         self._counters: dict[str, float] = defaultdict(float)
         self._tags: dict[str, Any] = {}
-        self._pending_cuda: list[tuple[str, Any, Any, str | None]] = []
+        self._pending_cuda: list[tuple[str, Any, Any, str | None, dict[str, Any] | None]] = []
+        self._timer_stack: list[_TimerFrame] = []
+        self._observations: dict[str, list[float]] = defaultdict(list)
+        self._observation_units: dict[str, str] = {}
+        self._batch_rows: list[dict[str, Any]] = []
+        self._current_batch_row: dict[str, Any] | None = None
+        self._context: dict[str, Any] = {}
+        self._torch_profiler: Any = None
+        self._torch_trace_seen = 0
+        self._torch_trace_path: str | None = None
         self._batch_index = 0
         self._detail_active = False
         self._start_wall = time.perf_counter()
         self._start_cpu = time.process_time()
-        self._start_io = _proc_io()
+        self._start_io = _proc_io() if self.enabled else None
         self._flushed = False
+
+    @property
+    def timing_active(self) -> bool:
+        return self.enabled or self.basic_timing
 
     @property
     def detail_active(self) -> bool:
         return self.enabled and self._detail_active
+
+    def set_context(self, **values: Any) -> None:
+        if self.timing_active:
+            self._context.update(values)
+
+    def clear_context(self, *names: str) -> None:
+        if self.timing_active:
+            for name in names:
+                self._context.pop(name, None)
 
     def add_counter(self, name: str, value: float = 1.0) -> None:
         if self.enabled:
@@ -145,18 +188,46 @@ class RuntimeProfiler:
         seconds: float,
         *,
         parent: str | None = None,
-        unit: str = "seconds",
+        self_seconds: float | None = None,
+        domain: str = "cpu_wall",
     ) -> None:
         if not self.enabled:
             return
         duration = max(0.0, float(seconds))
+        exclusive = duration if self_seconds is None else max(0.0, float(self_seconds))
         self._observed_counts[name] += 1
         self._sums[name] += duration
+        self._self_sums[name] += exclusive
         if len(self._samples[name]) < self.raw_sample_limit:
             self._samples[name].append(duration)
+            self._self_samples[name].append(exclusive)
         if parent:
             self._parents[name] = parent
-        self._units[name] = unit
+        self._domains[name] = domain
+        if self.detail_active and self._current_batch_row is not None:
+            key = f"time.{name}"
+            self._current_batch_row[key] = float(self._current_batch_row.get(key, 0.0)) + duration
+        if self._timer_stack and parent == self._timer_stack[-1].name:
+            self._timer_stack[-1].child_seconds += duration
+
+    def record_batch_stat(self, name: str, value: Any, *, unit: str = "count") -> None:
+        if not self.detail_active or self._current_batch_row is None:
+            return
+        stored = value if isinstance(value, (bool, int)) else float(value)
+        self._current_batch_row[name] = stored
+        if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+            values = self._observations[name]
+            if len(values) < self.raw_sample_limit:
+                values.append(float(stored))
+            self._observation_units[name] = unit
+
+    def record_basic_batch_stat(self, name: str, value: Any) -> None:
+        # Store only scalars already computed by the training path.
+        if not self.timing_active or self._current_batch_row is None:
+            return
+        self._current_batch_row[name] = (
+            value if isinstance(value, (bool, int)) else float(value)
+        )
 
     @contextmanager
     def timer(
@@ -170,11 +241,19 @@ class RuntimeProfiler:
         if not active:
             yield
             return
-        started = time.perf_counter()
+        inferred_parent = parent or (self._timer_stack[-1].name if self._timer_stack else None)
+        frame = _TimerFrame(name, time.perf_counter(), inferred_parent)
+        self._timer_stack.append(frame)
         try:
             yield
         finally:
-            self.record(name, time.perf_counter() - started, parent=parent)
+            elapsed = time.perf_counter() - frame.started
+            if self._timer_stack.pop() is not frame:
+                raise RuntimeError("runtime profiler timer stack corruption")
+            self.record(
+                name, elapsed, parent=inferred_parent,
+                self_seconds=max(0.0, elapsed - frame.child_seconds),
+            )
 
     @contextmanager
     def cuda_timer(
@@ -203,23 +282,103 @@ class RuntimeProfiler:
             yield
         finally:
             end.record()
-            self._pending_cuda.append((name, start, end, parent))
+            self._pending_cuda.append((name, start, end, parent, self._current_batch_row))
 
-    def begin_batch(self) -> tuple[float, bool] | None:
+    def _start_torch_trace_if_needed(self) -> None:
+        if (
+            self.torch_trace_batches <= 0
+            or int(self._context.get("window_index", -1)) < self.torch_trace_window_start
+            or self._torch_profiler is not None
+            or self._torch_trace_seen >= self.torch_trace_batches
+        ):
+            return
+        try:
+            import torch
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            self._torch_profiler = torch.profiler.profile(
+                activities=activities,
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False,
+            )
+            self._torch_profiler.start()
+        except Exception as exc:
+            self._tags["torch_trace_error"] = f"{type(exc).__name__}: {exc}"
+            self._torch_trace_seen = self.torch_trace_batches
+            self._torch_profiler = None
+
+    def _stop_torch_trace(self) -> None:
+        if self._torch_profiler is None:
+            return
+        try:
+            self._torch_profiler.stop()
+            if self.run_root is not None:
+                profile_dir = self.run_root / "profiling"
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                path = profile_dir / "torch_trace.json"
+                self._torch_profiler.export_chrome_trace(str(path))
+                self._torch_trace_path = str(path)
+        except Exception as exc:
+            self._tags["torch_trace_error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._torch_profiler = None
+
+    def _trace_step(self) -> None:
+        if self._torch_profiler is None:
+            return
+        self._torch_profiler.step()
+        self._torch_trace_seen += 1
+        if self._torch_trace_seen >= self.torch_trace_batches:
+            self._stop_torch_trace()
+
+    def begin_batch(self) -> tuple[_TimerFrame, bool] | None:
         """Begin one batch and activate deterministic detailed sampling."""
-        if not self.enabled:
+        if not self.timing_active:
             return None
         self._batch_index += 1
         previous = self._detail_active
-        self._detail_active = (self._batch_index - 1) % self.sample_every_n_batches == 0
-        return time.perf_counter(), previous
+        self._detail_active = (
+            self.enabled
+            and (self._batch_index - 1) % self.sample_every_n_batches == 0
+        )
+        frame = _TimerFrame("training.T_total_batch", time.perf_counter(), None)
+        self._timer_stack.append(frame)
+        self._current_batch_row = {
+            "batch_index": self._batch_index,
+            "wall_time_start_unix": time.time(),
+            "detail_sampled": self._detail_active,
+            "basic_timing": self.basic_timing,
+            **self._context,
+        }
+        if self._detail_active:
+            self._start_torch_trace_if_needed()
+            rss = _current_rss_mb()
+            if rss is not None:
+                self.record_batch_stat("cpu_rss_start_mb", rss, unit="MB")
+        return frame, previous
 
-    def end_batch(self, token: tuple[float, bool] | None, total_name: str) -> None:
+    def end_batch(self, token: tuple[_TimerFrame, bool] | None, total_name: str) -> None:
         """Finish a batch begun by :meth:`begin_batch`."""
         if token is None:
             return
-        started, previous = token
-        self.record(total_name, time.perf_counter() - started)
+        frame, previous = token
+        elapsed = time.perf_counter() - frame.started
+        if self._timer_stack.pop() is not frame:
+            raise RuntimeError("runtime profiler batch timer stack corruption")
+        self.record(total_name, elapsed, self_seconds=max(0.0, elapsed - frame.child_seconds))
+        if self._current_batch_row is not None:
+            self._current_batch_row["total_seconds"] = elapsed
+            self._current_batch_row["wall_time_end_unix"] = time.time()
+            if self._detail_active:
+                rss = _current_rss_mb()
+                if rss is not None:
+                    self.record_batch_stat("cpu_rss_end_mb", rss, unit="MB")
+            self._batch_rows.append(self._current_batch_row)
+        self._current_batch_row = None
+        self._resolve_ready_cuda()
+        self._trace_step()
         self._detail_active = previous
 
     def profile_batches(
@@ -227,9 +386,9 @@ class RuntimeProfiler:
         batches: Any,
         *,
         prepare_name: str = "training.T_batch_prepare",
-    ) -> Iterator[tuple[Any, tuple[float, bool] | None]]:
+    ) -> Iterator[tuple[Any, tuple[_TimerFrame, bool] | None]]:
         """Yield batches with retrieval time included in the sampled batch total."""
-        if not self.enabled:
+        if not self.timing_active:
             for batch in batches:
                 yield batch, None
             return
@@ -241,30 +400,49 @@ class RuntimeProfiler:
                 batch = next(iterator)
             except StopIteration:
                 assert token is not None
-                _, previous = token
+                frame, previous = token
+                if self._timer_stack.pop() is not frame:
+                    raise RuntimeError("runtime profiler batch timer stack corruption")
+                self._current_batch_row = None
                 self._detail_active = previous
                 self._batch_index -= 1
                 return
             if self.detail_active:
+                elapsed = time.perf_counter() - prepare_started
                 self.record(
-                    prepare_name, time.perf_counter() - prepare_started,
+                    prepare_name, elapsed,
                     parent="training.T_total_batch",
                 )
             yield batch, token
 
     @contextmanager
     def batch(self, total_name: str = "training.batch.total") -> Iterator[None]:
-        if not self.enabled:
-            yield
-            return
-        self._batch_index += 1
-        previous = self._detail_active
-        self._detail_active = (self._batch_index - 1) % self.sample_every_n_batches == 0
+        token = self.begin_batch()
         try:
-            with self.timer(total_name):
-                yield
+            yield
         finally:
-            self._detail_active = previous
+            self.end_batch(token, total_name)
+
+    def _resolve_ready_cuda(self) -> None:
+        if not self._pending_cuda:
+            return
+        remaining = []
+        for name, start, end, parent, batch_row in self._pending_cuda:
+            try:
+                if not end.query():
+                    remaining.append((name, start, end, parent, batch_row))
+                    continue
+                elapsed = start.elapsed_time(end) / 1000.0
+                self.record(
+                    name, elapsed, parent=parent, self_seconds=elapsed,
+                    domain="cuda_event_interval",
+                )
+                if batch_row is not None:
+                    key = f"time.{name}"
+                    batch_row[key] = float(batch_row.get(key, 0.0)) + elapsed
+            except Exception:
+                remaining.append((name, start, end, parent, batch_row))
+        self._pending_cuda = remaining
 
     def _resolve_cuda(self) -> None:
         if not self._pending_cuda:
@@ -272,8 +450,15 @@ class RuntimeProfiler:
         try:
             import torch
             torch.cuda.synchronize()
-            for name, start, end, parent in self._pending_cuda:
-                self.record(name, start.elapsed_time(end) / 1000.0, parent=parent)
+            for name, start, end, parent, batch_row in self._pending_cuda:
+                elapsed = start.elapsed_time(end) / 1000.0
+                self.record(
+                    name, elapsed, parent=parent, self_seconds=elapsed,
+                    domain="cuda_event_interval",
+                )
+                if batch_row is not None:
+                    key = f"time.{name}"
+                    batch_row[key] = float(batch_row.get(key, 0.0)) + elapsed
         except Exception as exc:
             self._tags["cuda_event_resolution_error"] = f"{type(exc).__name__}: {exc}"
         finally:
@@ -285,6 +470,8 @@ class RuntimeProfiler:
             values = sorted(self._samples.get(name, ()))
             observed = int(self._observed_counts[name])
             total = float(self._sums[name])
+            self_values = sorted(self._self_samples.get(name, ()))
+            self_total = float(self._self_sums[name])
             count = len(values)
             entry: dict[str, Any] = {
                 "count": observed,
@@ -296,7 +483,11 @@ class RuntimeProfiler:
                 "p90_seconds": _percentile(values, 0.90),
                 "p95_seconds": _percentile(values, 0.95),
                 "max_seconds": max(values) if values else 0.0,
-                "unit": self._units.get(name, "seconds"),
+                "self_total_seconds": self_total,
+                "self_mean_seconds": self_total / observed if observed else 0.0,
+                "self_median_seconds": _percentile(self_values, 0.50),
+                "self_p95_seconds": _percentile(self_values, 0.95),
+                "timing_domain": self._domains.get(name, "cpu_wall"),
                 "parent": self._parents.get(name),
                 "percentage_of_parent": None,
             }
@@ -304,12 +495,29 @@ class RuntimeProfiler:
         for name, entry in result.items():
             parent_name = entry.get("parent")
             parent = result.get(parent_name) if parent_name else None
-            if parent and parent["mean_seconds"] > 0:
-                # Mean ratios remain meaningful when detail sampling makes child
-                # and parent counts differ.
+            if (
+                parent
+                and parent["mean_seconds"] > 0
+                and entry["count"] == parent["count"]
+            ):
                 entry["percentage_of_parent"] = (
                     100.0 * entry["mean_seconds"] / parent["mean_seconds"]
                 )
+        return result
+
+    def _observation_summary(self) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for name, retained in sorted(self._observations.items()):
+            values = sorted(retained)
+            result[name] = {
+                "retained_sample_count": len(values),
+                "median": _percentile(values, 0.50),
+                "p90": _percentile(values, 0.90),
+                "p95": _percentile(values, 0.95),
+                "min": min(values) if values else 0.0,
+                "max": max(values) if values else 0.0,
+                "unit": self._observation_units.get(name, "count"),
+            }
         return result
 
     def _memory(self) -> dict[str, Any]:
@@ -360,6 +568,9 @@ class RuntimeProfiler:
             "error": error,
             "sample_every_n_batches": self.sample_every_n_batches,
             "raw_sample_limit": self.raw_sample_limit,
+            "torch_trace_batches": self.torch_trace_batches,
+            "torch_trace_window_start": self.torch_trace_window_start,
+            "torch_trace_path": self._torch_trace_path,
             "wall_seconds": elapsed,
             "cpu_seconds": max(0.0, time.process_time() - self._start_cpu),
             "metadata": self.metadata,
@@ -369,14 +580,67 @@ class RuntimeProfiler:
             "memory": self._memory(),
             "io_delta": self._io_delta(),
             "metrics": metrics,
+            "observations": self._observation_summary(),
             "raw_samples_seconds": {
                 name: list(values) for name, values in sorted(self._samples.items())
+            },
+            "raw_self_samples_seconds": {
+                name: list(values) for name, values in sorted(self._self_samples.items())
             },
         }
 
     def flush(self, *, status: str = "completed", error: str | None = None) -> dict[str, Any] | None:
-        if not self.enabled or self.run_root is None:
+        if not self.timing_active or self.run_root is None:
             return None
+        if not self.enabled:
+            timing_dir = self.run_root / "benchmark_timing"
+            timing_dir.mkdir(parents=True, exist_ok=True)
+            batch_fields = sorted({key for row in self._batch_rows for key in row})
+            if batch_fields:
+                preferred = [
+                    "batch_index", "epoch", "window_index", "window_id",
+                    "detail_sampled", "basic_timing", "batch_events", "total_seconds",
+                ]
+                batch_fields = [key for key in preferred if key in batch_fields] + [
+                    key for key in batch_fields if key not in preferred
+                ]
+                with (timing_dir / "basic_batches.csv").open(
+                    "w", newline="", encoding="utf-8"
+                ) as handle:
+                    writer = csv.DictWriter(handle, fieldnames=batch_fields)
+                    writer.writeheader()
+                    writer.writerows(self._batch_rows)
+                with (timing_dir / "basic_batches.json").open(
+                    "w", encoding="utf-8"
+                ) as handle:
+                    json.dump(
+                        self._batch_rows, handle, indent=2,
+                        sort_keys=True, allow_nan=False,
+                    )
+            durations = sorted(
+                float(row["total_seconds"])
+                for row in self._batch_rows
+                if "total_seconds" in row
+            )
+            summary = {
+                "schema_version": 1,
+                "detailed_profiler_enabled": False,
+                "basic_timing_enabled": True,
+                "status": status,
+                "error": error,
+                "batch_count": len(durations),
+                "total_batch_seconds": sum(durations),
+                "p50_batch_seconds": _percentile(durations, 0.50),
+                "p95_batch_seconds": _percentile(durations, 0.95),
+                "timing_semantics": "host perf_counter; no CUDA synchronization",
+            }
+            with (timing_dir / "basic_summary.json").open(
+                "w", encoding="utf-8"
+            ) as handle:
+                json.dump(summary, handle, indent=2, sort_keys=True, allow_nan=False)
+            self._flushed = True
+            return summary
+        self._stop_torch_trace()
         self._resolve_cuda()
         payload = self.payload(status=status, error=error)
         profile_dir = self.run_root / "profiling"
@@ -391,7 +655,9 @@ class RuntimeProfiler:
         fieldnames = [
             "stage", "count", "retained_sample_count", "samples_truncated",
             "total_seconds", "mean_seconds", "median_seconds", "p90_seconds",
-            "p95_seconds", "max_seconds", "parent", "percentage_of_parent",
+            "p95_seconds", "max_seconds", "self_total_seconds", "self_mean_seconds",
+            "self_median_seconds", "self_p95_seconds", "timing_domain", "parent",
+            "percentage_of_parent",
         ]
         with csv_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -399,7 +665,26 @@ class RuntimeProfiler:
             for stage, metric in payload["metrics"].items():
                 writer.writerow({"stage": stage, **{key: metric.get(key) for key in fieldnames[1:]}})
 
-        summary = {key: value for key, value in payload.items() if key != "raw_samples_seconds"}
+        batch_fields = sorted({key for row in self._batch_rows for key in row})
+        if batch_fields:
+            preferred = [
+                "batch_index", "epoch", "window_index", "window_id",
+                "detail_sampled", "total_seconds",
+            ]
+            batch_fields = [key for key in preferred if key in batch_fields] + [
+                key for key in batch_fields if key not in preferred
+            ]
+            with (profile_dir / "perf_batches.csv").open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=batch_fields)
+                writer.writeheader()
+                writer.writerows(self._batch_rows)
+            with (profile_dir / "perf_batches.json").open("w", encoding="utf-8") as handle:
+                json.dump(self._batch_rows, handle, indent=2, sort_keys=True, allow_nan=False)
+
+        summary = {
+            key: value for key, value in payload.items()
+            if key not in {"raw_samples_seconds", "raw_self_samples_seconds"}
+        }
         with summary_path.open("w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2, sort_keys=True, allow_nan=False)
         self._flushed = True
@@ -413,17 +698,23 @@ def configure_profiler(
     *,
     enabled: bool,
     run_root: str | os.PathLike[str] | None,
+    basic_timing: bool = False,
     sample_every_n_batches: int = 10,
     raw_sample_limit: int = 2000,
     metadata: dict[str, Any] | None = None,
+    torch_trace_batches: int = 0,
+    torch_trace_window_start: int = 0,
 ) -> RuntimeProfiler:
     global _ACTIVE_PROFILER
     _ACTIVE_PROFILER = RuntimeProfiler(
         enabled=enabled,
         run_root=run_root,
+        basic_timing=basic_timing,
         sample_every_n_batches=sample_every_n_batches,
         raw_sample_limit=raw_sample_limit,
         metadata=metadata,
+        torch_trace_batches=torch_trace_batches,
+        torch_trace_window_start=torch_trace_window_start,
     )
     return _ACTIVE_PROFILER
 

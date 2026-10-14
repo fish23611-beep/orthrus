@@ -1,0 +1,1144 @@
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "src"))
+
+import plan_runtime_windows
+import run_runtime_benchmark
+
+
+def _tree_content_snapshot(root: Path):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        relative = str(path.relative_to(root))
+        if path.is_symlink():
+            result[relative] = ("symlink", path.readlink().as_posix())
+        elif path.is_file():
+            result[relative] = (
+                "file",
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+        elif path.is_dir():
+            result[relative] = ("directory",)
+    return result
+
+
+def _args(tmp_path, **overrides):
+    shared = tmp_path / "shared"
+    shared.mkdir(exist_ok=True)
+    (shared / "input.marker").write_text("immutable-input")
+    values = dict(
+        dataset="THEIA_E3",
+        config=str(ROOT / "config/experiments/mstc_full.yml"),
+        artifact_root=str(tmp_path / "output"),
+        shared_artifact_root=str(shared),
+        seed=0,
+        windows=2,
+        window_start=0,
+        selection_manifest=None,
+        warmup_epochs=1,
+        profile_mode="on",
+        basic_timing="on",
+        torch_trace_batches=0,
+        gpu_sample_ms=200,
+        execute=False,
+    )
+    values.update(overrides)
+    args = SimpleNamespace(**values)
+    # Populate the exact config-derived task-hash paths for ordinary fixtures.
+    # Overrides that intentionally point at a missing/incomplete root remain
+    # untouched so fail-fast tests exercise the real preflight.
+    if Path(args.shared_artifact_root) == shared:
+        model, edge_embeds = run_runtime_benchmark.resolve_expected_shared_inputs(
+            args, shared.resolve()
+        )
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"model")
+        for split in ("train", "val", "test"):
+            split_dir = edge_embeds / split
+            split_dir.mkdir(parents=True)
+            (split_dir / "window.pt").write_bytes(split.encode())
+    return args
+
+
+def _write_rows(path: Path, rows):
+    path.parent.mkdir(parents=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "batch_index",
+                "epoch",
+                "window_index",
+                "batch_events",
+                "total_seconds",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _complete_rows(*, epochs=range(1, 7), window_end=2, events=5):
+    rows = []
+    batch_index = 1
+    for epoch in epochs:
+        for window_index in range(window_end):
+            rows.append({
+                "batch_index": batch_index,
+                "epoch": epoch,
+                "window_index": window_index,
+                "batch_events": events,
+                "total_seconds": 0.5,
+            })
+            batch_index += 1
+    return rows
+
+
+def _write_runtime_receipt(root: Path, *, epochs=range(1, 7), window_end=2,
+                           events=5, batches_per_window=1):
+    windows = [
+        {
+            "epoch": epoch,
+            "window_index": window_index,
+            "window_id": window_index,
+            "event_count": events,
+            "expected_batch_count": batches_per_window,
+        }
+        for epoch in epochs
+        for window_index in range(window_end)
+    ]
+    payload = {
+        "status": "completed",
+        "executed_stages": ["train"],
+        "training": {
+            "execution_receipt": {
+                "schema_version": 1,
+                "status": "completed",
+                "start_epoch": 1,
+                "end_epoch": 6,
+                "batch_size": 512,
+                "windows": windows,
+            }
+        },
+    }
+    (root / "runtime.json").parent.mkdir(parents=True, exist_ok=True)
+    (root / "runtime.json").write_text(json.dumps(payload))
+
+
+def _write_valid_manifest(path: Path, *, dataset="THEIA_E3", start=0, count=2,
+                          warmup=1, source_exists=True):
+    source = path.with_suffix(".csv")
+    if source_exists:
+        source.write_text("epoch,window_index\n2,0\n")
+    source_sha256 = hashlib.sha256(
+        source.read_bytes() if source_exists else b"frozen-source"
+    ).hexdigest()
+    payload = {
+        "schema_version": 2,
+        "dataset": dataset,
+        "selection_rule": "test fixture",
+        "source": str(source),
+        "source_sha256": source_sha256,
+        "source_sha256_scope": "content_sha256_of_batches_csv_file",
+        "warmup_epochs_excluded": warmup,
+        "eligible_epochs": [2, 3, 4, 5, 6],
+        "selected_start": start,
+        "selected_end_exclusive": start + count,
+        "window_count": count,
+    }
+    path.write_text(json.dumps(payload))
+    return payload
+
+
+def test_benchmark_command_preserves_config_dual_roots_and_seed(tmp_path):
+    args = _args(tmp_path)
+    roots = run_runtime_benchmark.validate(args)
+    command = run_runtime_benchmark.build_command(args, roots=roots)
+    assert command[command.index("--max-windows-per-split") + 1] == "2"
+    assert command[command.index("--seed") + 1] == "0"
+    assert command[command.index("--artifact-root") + 1] == str(
+        (tmp_path / "output").resolve()
+    )
+    assert command[command.index("--shared-artifact-root") + 1] == str(
+        (tmp_path / "shared").resolve()
+    )
+    assert "--shared-artifact-readonly" in command
+    assert "--benchmark-basic-timing" in command
+    assert "--perf-profile" in command
+    assert "--cpu" not in command
+
+
+def test_twenty_window_case_requires_matching_selection_manifest(tmp_path):
+    args = _args(tmp_path, windows=20, window_start=4)
+    with pytest.raises(ValueError, match="selection-manifest"):
+        run_runtime_benchmark.validate(args)
+    manifest = tmp_path / "selection.json"
+    _write_valid_manifest(manifest, start=4, count=20)
+    args.selection_manifest = str(manifest)
+    roots = run_runtime_benchmark.validate(args)
+    command = run_runtime_benchmark.build_command(args, roots=roots)
+    assert command[command.index("--max-windows-per-split") + 1] == "24"
+
+    args.dataset = "THEIA_E5"
+    with pytest.raises(ValueError, match="does not match dataset"):
+        run_runtime_benchmark.validate(args)
+
+
+def test_missing_or_empty_shared_root_fails_fast_without_output(tmp_path):
+    missing = tmp_path / "missing"
+    args = _args(tmp_path, shared_artifact_root=str(missing))
+    with pytest.raises(ValueError, match="does not exist"):
+        run_runtime_benchmark.validate(args)
+    assert not (tmp_path / "output").exists()
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    args.shared_artifact_root = str(empty)
+    with pytest.raises(ValueError, match="empty"):
+        run_runtime_benchmark.validate(args)
+
+    incomplete = tmp_path / "incomplete"
+    incomplete.mkdir()
+    (incomplete / "unrelated").write_text("x")
+    args.shared_artifact_root = str(incomplete)
+    with pytest.raises(ValueError, match="lacks exact task-hash"):
+        run_runtime_benchmark.validate(args)
+    assert not (tmp_path / "output").exists()
+
+
+def test_same_nested_existing_and_symlink_overlap_roots_are_rejected(tmp_path):
+    args = _args(tmp_path)
+    shared = Path(args.shared_artifact_root)
+
+    args.artifact_root = str(shared)
+    with pytest.raises(ValueError, match="already exists|overlap"):
+        run_runtime_benchmark.validate(args)
+
+    args.artifact_root = str(shared / "nested-output")
+    with pytest.raises(ValueError, match="overlap"):
+        run_runtime_benchmark.validate(args)
+
+    link = tmp_path / "shared-link"
+    link.symlink_to(shared, target_is_directory=True)
+    args.artifact_root = str(link / "via-symlink")
+    with pytest.raises(ValueError, match="overlap"):
+        run_runtime_benchmark.validate(args)
+
+    existing = tmp_path / "existing-output"
+    existing.mkdir()
+    args.artifact_root = str(existing)
+    with pytest.raises(ValueError, match="already exists"):
+        run_runtime_benchmark.validate(args)
+
+
+def test_profile_off_removes_conflicting_parent_environment(tmp_path):
+    parent = {
+        "KEEP_ME": "yes",
+        run_runtime_benchmark.PROFILE_ENV: "1",
+        run_runtime_benchmark.PROFILE_SAMPLE_ENV: "1",
+    }
+    child = run_runtime_benchmark.controlled_child_environment(parent)
+    assert child["KEEP_ME"] == "yes"
+    assert run_runtime_benchmark.PROFILE_ENV not in child
+    assert run_runtime_benchmark.PROFILE_SAMPLE_ENV not in child
+
+    args = _args(tmp_path, profile_mode="off")
+    command = run_runtime_benchmark.build_command(
+        args, roots=run_runtime_benchmark.validate(args)
+    )
+    assert "--perf-profile" not in command
+    assert "--benchmark-basic-timing" in command
+
+
+def test_warmup_and_causal_replay_are_excluded_and_on_off_match(tmp_path):
+    rows = [
+        {"batch_index": 1, "epoch": 1, "window_index": 1, "batch_events": 999, "total_seconds": 9.0},
+        {"batch_index": 2, "epoch": 2, "window_index": 0, "batch_events": 10, "total_seconds": 1.0},
+        {"batch_index": 3, "epoch": 2, "window_index": 1, "batch_events": 20, "total_seconds": 2.0},
+        {"batch_index": 4, "epoch": 2, "window_index": 2, "batch_events": 30, "total_seconds": 3.0},
+    ]
+    on_root = tmp_path / "on"
+    off_root = tmp_path / "off"
+    _write_rows(on_root / "profiling/perf_batches.csv", rows)
+    _write_rows(off_root / "benchmark_timing/basic_batches.csv", rows)
+
+    on = run_runtime_benchmark.aggregate(
+        on_root, 1, 2, profile_mode="on", basic_timing="on", warmup_epochs=1
+    )
+    off = run_runtime_benchmark.aggregate(
+        off_root, 1, 2, profile_mode="off", basic_timing="on", warmup_epochs=1
+    )
+    assert on["warmup_batch_count"] == 1
+    assert on["causal_replay_batch_count"] == 1
+    assert on["measured_batch_count"] == 2
+    assert on["measured_distinct_window_indices"] == [1, 2]
+    assert on["measured_observed_window_count"] == 2
+    assert on["events"] == 50
+    assert on["stages"]["total_seconds"]["total_seconds"] == 5.0
+    assert on["measurement_identity_sha256"] == off["measurement_identity_sha256"]
+    assert on["measurement_source"] == "detailed_profile"
+    assert off["measurement_source"] == "basic_timing"
+
+
+def test_pure_off_is_separate_from_basic_timing(tmp_path):
+    result = run_runtime_benchmark.aggregate(
+        tmp_path,
+        0,
+        2,
+        profile_mode="off",
+        basic_timing="off",
+        warmup_epochs=1,
+    )
+    assert result["measurement_source"] == "pure_wall"
+    assert result["measurement_rows_found"] is False
+    assert result["measured_batch_count"] == 0
+
+
+def test_dry_run_has_no_output_or_shared_side_effect(tmp_path, capsys):
+    args = _args(tmp_path)
+    shared = Path(args.shared_artifact_root)
+    before = _tree_content_snapshot(shared)
+    argv = [
+        "--dataset", args.dataset,
+        "--config", args.config,
+        "--artifact-root", args.artifact_root,
+        "--shared-artifact-root", args.shared_artifact_root,
+        "--windows", "2",
+        "--profile-mode", "off",
+        "--basic-timing", "on",
+    ]
+    assert run_runtime_benchmark.main(argv) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["requested_profile_mode"] == "off"
+    identity = payload["experiment_identity"]
+    assert identity["git_sha"]
+    assert len(identity["resolved_config_sha256"]) == 64
+    assert identity["dataset"] == "THEIA_E3"
+    assert identity["seed"] == 0
+    assert identity["window_manifest_sha256"] is None
+    assert not Path(args.artifact_root).exists()
+    assert _tree_content_snapshot(shared) == before
+
+
+def test_shared_snapshot_names_metadata_and_content_scope_honestly(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "input.bin").write_bytes(b"input")
+    snapshot = run_runtime_benchmark.shared_tree_snapshot(shared)
+    assert len(snapshot["metadata_fingerprint_sha256"]) == 64
+    assert snapshot["fingerprint_scope"].startswith("metadata_only:")
+    assert snapshot["content_sha256"] is None
+    assert snapshot["content_hash_status"] == "not_computed"
+
+
+def test_e3_e5_manifests_have_content_identity(tmp_path):
+    manifest = tmp_path / "e3-selection.json"
+    _write_valid_manifest(manifest, start=4, count=20)
+    args = _args(
+        tmp_path, windows=20, window_start=4, selection_manifest=str(manifest)
+    )
+    _, shared = run_runtime_benchmark.validate(args)
+    identity = run_runtime_benchmark.experiment_identity(
+        args, shared, manifest_validation=args._validated_manifest
+    )
+    assert identity["window_manifest_sha256"] == hashlib.sha256(
+        manifest.read_bytes()
+    ).hexdigest()
+
+
+def test_gpu_identity_resolves_selected_logical_device(monkeypatch):
+    monkeypatch.setattr(run_runtime_benchmark.shutil, "which", lambda name: "/nvidia-smi")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-three")
+    monkeypatch.setattr(
+        run_runtime_benchmark.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout="1, GPU-one\n3, GPU-three\n"
+        ),
+    )
+    identity = run_runtime_benchmark._gpu_identity(require_resolved=True)
+    assert identity["gpu_uuid"] == "GPU-three"
+    assert identity["gpu_uuids"] == ["GPU-one", "GPU-three"]
+    assert identity["gpu_identity_runtime_verified"] is True
+
+
+def test_execute_keeps_shared_file_list_and_content_hash_unchanged(
+    tmp_path, monkeypatch
+):
+    args = _args(tmp_path, profile_mode="off")
+    manifest = tmp_path / "selection.json"
+    _write_valid_manifest(manifest)
+    shared = Path(args.shared_artifact_root)
+    nested = shared / "nested"
+    nested.mkdir()
+    (nested / "input.bin").write_bytes(b"preprocessed")
+    before = _tree_content_snapshot(shared)
+
+    original_run = run_runtime_benchmark.subprocess.run
+
+    def fake_run(command, **kwargs):
+        if "--artifact-root" not in command:
+            return original_run(command, **kwargs)
+        output = Path(command[command.index("--artifact-root") + 1])
+        _write_rows(
+            output / "benchmark_timing/basic_batches.csv",
+            _complete_rows(),
+        )
+        _write_runtime_receipt(output)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(run_runtime_benchmark.subprocess, "run", fake_run)
+    monkeypatch.setattr(run_runtime_benchmark, "start_gpu_sampler", lambda *a: None)
+    monkeypatch.setattr(
+        run_runtime_benchmark, "_gpu_identity",
+        lambda **kwargs: {
+            "gpu_uuid": "GPU-test", "gpu_uuids": ["GPU-test"],
+            "cuda_visible_devices": "GPU-test", "nvidia_visible_devices": None,
+            "cuda_device_order": None, "gpu_identity_scope": "test",
+            "gpu_mapping_validation_status": "validated_test_mapping",
+            "gpu_identity_runtime_verified": bool(kwargs.get("require_resolved")),
+        },
+    )
+    argv = [
+        "--dataset", args.dataset,
+        "--config", args.config,
+        "--artifact-root", args.artifact_root,
+        "--shared-artifact-root", args.shared_artifact_root,
+        "--windows", "2",
+        "--profile-mode", "off",
+        "--selection-manifest", str(manifest),
+        "--basic-timing", "on",
+        "--execute",
+    ]
+    assert run_runtime_benchmark.main(argv) == 0
+    assert _tree_content_snapshot(shared) == before
+    result = json.loads((Path(args.artifact_root) / "benchmark_result.json").read_text())
+    assert result["shared_root_unchanged"] is True
+    assert result["effective_profile_mode"] == "off"
+    assert result["profile_mode_matches_request"] is True
+
+
+def test_readonly_config_path_resolution_creates_nothing_under_shared(
+    tmp_path, monkeypatch
+):
+    import config as config_module
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "existing.txt").write_text("keep")
+    before = _tree_content_snapshot(shared)
+    monkeypatch.setattr(
+        config_module, "_resolve_ground_truth_dir", lambda cfg=None: str(tmp_path / "gt")
+    )
+    args = SimpleNamespace(
+        dataset="THEIA_E3",
+        model="orthrus",
+        config=str(ROOT / "config/experiments/mstc_full.yml"),
+        cpu=True,
+        from_weights=False,
+        seed=0,
+        skip_tracing=False,
+        artifact_root=str(tmp_path / "output"),
+        shared_artifact_root=str(shared),
+        shared_artifact_readonly=True,
+        max_windows_per_split=2,
+    )
+    cfg = config_module.get_yml_cfg(args)
+    assert cfg._shared_artifact_readonly is True
+    assert _tree_content_snapshot(shared) == before
+    assert not (tmp_path / "output").exists()
+
+
+def test_readonly_compact_sidecar_publish_is_noop(tmp_path, monkeypatch):
+    from data_utils import _CompactIndex
+
+    index = _CompactIndex(specs=(), total_events=0)
+    shared = tmp_path / "shared"
+    edge_embeds = shared / "edge_embeds"
+    edge_embeds.mkdir(parents=True)
+    cfg = SimpleNamespace(
+        _shared_artifact_readonly=True,
+        edge_featurization=SimpleNamespace(
+            embed_edges=SimpleNamespace(_edge_embeds_dir=str(edge_embeds))
+        ),
+    )
+    # Make every condition after the read-only guard eligible.  Without that
+    # guard this call would create ``_compact_index_v2`` (and then attempt to
+    # publish tensors), so the assertion cannot pass merely because the test
+    # configuration omitted the persistent root.
+    monkeypatch.setattr(_CompactIndex, "has_node_table", lambda self: True)
+    index._write_persistent(cfg, "host_network_full", {})
+    assert not (edge_embeds / index.PERSISTENT_DIR_NAME).exists()
+
+
+def test_window_planner_excludes_warmup_and_deduplicates_epochs(tmp_path):
+    source = tmp_path / "batches.csv"
+    with source.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "epoch",
+                "window_index",
+                "batch_events",
+                "history_valid_slots",
+                "total_seconds",
+            ],
+        )
+        writer.writeheader()
+        for epoch in (1, 2, 3):
+            for window in range(25):
+                writer.writerow({
+                    "epoch": epoch,
+                    "window_index": window,
+                    "batch_events": 100 + window,
+                    "history_valid_slots": window * 10,
+                    "total_seconds": (
+                        100.0 if epoch == 1 else 1.0 + abs(window - 12) / 100
+                    ),
+                })
+    output = tmp_path / "plan.json"
+    assert plan_runtime_windows.main([
+        "--dataset", "THEIA_E3",
+        "--batches-csv", str(source),
+        "--window-count", "20",
+        "--warmup-epochs", "1",
+        "--output", str(output),
+    ]) == 0
+    plan = json.loads(output.read_text())
+    assert plan["schema_version"] == 2
+    assert plan["dataset"] == "THEIA_E3"
+    assert plan["eligible_epochs"] == [2, 3]
+    assert plan["warmup_epochs_excluded"] == 1
+    assert plan["window_count"] == 20
+    assert set(plan["selected_feature_means"]) == {
+        "events", "history", "batch_seconds"
+    }
+    assert plan["window_features"]["0"]["events"] == 100
+    assert len(plan["fast_windows"]) == 3
+    assert len(plan["slow_windows"]) == 3
+
+
+@pytest.mark.parametrize(
+    ("profile_mode", "basic_timing", "present", "missing_code"),
+    [
+        ("off", "on", "none", "measurement_rows_missing"),
+        ("on", "on", "profile_only", "measurement_rows_missing"),
+        ("on", "on", "rows_only", "detailed_profile_missing"),
+    ],
+)
+def test_measurement_artifacts_are_fail_closed(
+    tmp_path, profile_mode, basic_timing, present, missing_code
+):
+    args = _args(
+        tmp_path, profile_mode=profile_mode, basic_timing=basic_timing
+    )
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root)
+    if present in {"profile_only", "both"}:
+        profile = root / "profiling/perf_profile.json"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(json.dumps({"enabled": True, "status": "completed"}))
+    if present in {"rows_only", "both"}:
+        _write_rows(root / "profiling/perf_batches.csv", _complete_rows())
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is False
+    assert missing_code in evidence["error_codes"]
+
+
+def test_empty_basic_csv_is_not_valid_measurement(tmp_path):
+    args = _args(tmp_path, profile_mode="off", basic_timing="on")
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root)
+    _write_rows(root / "benchmark_timing/basic_batches.csv", [])
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is False
+    assert "measurement_rows_empty" in evidence["error_codes"]
+
+
+def test_twenty_window_measurement_rejects_nineteen_observed(tmp_path):
+    args = _args(tmp_path, windows=20, profile_mode="off", basic_timing="on")
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root, window_end=20)
+    rows = [
+        row for row in _complete_rows(window_end=20)
+        if row["window_index"] != 19
+    ]
+    _write_rows(root / "benchmark_timing/basic_batches.csv", rows)
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is False
+    assert "batch_window_coverage_mismatch" in evidence["error_codes"]
+
+
+def test_missing_post_warmup_epoch_window_is_rejected(tmp_path):
+    args = _args(tmp_path, profile_mode="off", basic_timing="on")
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root)
+    rows = [
+        row for row in _complete_rows()
+        if not (row["epoch"] == 4 and row["window_index"] == 1)
+    ]
+    _write_rows(root / "benchmark_timing/basic_batches.csv", rows)
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is False
+    assert "batch_window_coverage_mismatch" in evidence["error_codes"]
+
+
+@pytest.mark.parametrize("mutation", ["duplicate_batch", "unexpected_window"])
+def test_duplicate_or_unexpected_batch_rows_are_rejected(tmp_path, mutation):
+    args = _args(tmp_path, profile_mode="off", basic_timing="on")
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root)
+    rows = _complete_rows()
+    if mutation == "duplicate_batch":
+        rows.append(dict(rows[0]))
+        expected = "duplicate_batch_index"
+    else:
+        extra = dict(rows[-1])
+        extra.update(batch_index=999, window_index=2)
+        rows.append(extra)
+        expected = "unexpected_batch_epoch_window"
+    _write_rows(root / "benchmark_timing/basic_batches.csv", rows)
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is False
+    assert expected in evidence["error_codes"]
+
+
+def test_pure_off_uses_receipt_without_batch_csv(tmp_path):
+    args = _args(tmp_path, profile_mode="off", basic_timing="off")
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root)
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is True
+    assert evidence["measurement_source"] == "pure_wall"
+    assert evidence["batch_rows_required"] is False
+
+
+def test_pure_off_rejects_incomplete_receipt(tmp_path):
+    args = _args(tmp_path, profile_mode="off", basic_timing="off")
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root, epochs=range(1, 6))
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is False
+    assert "receipt_window_coverage_mismatch" in evidence["error_codes"]
+
+
+def test_multiple_batches_per_window_are_validated_without_one_row_assumption(tmp_path):
+    args = _args(tmp_path, profile_mode="off", basic_timing="on")
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root, batches_per_window=2)
+    rows = []
+    batch_index = 1
+    for epoch in range(1, 7):
+        for window_index in range(2):
+            for events in (2, 3):
+                rows.append({
+                    "batch_index": batch_index,
+                    "epoch": epoch,
+                    "window_index": window_index,
+                    "batch_events": events,
+                    "total_seconds": 0.25,
+                })
+                batch_index += 1
+    _write_rows(root / "benchmark_timing/basic_batches.csv", rows)
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is True
+    assert evidence["batch_row_count"] == 24
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("batch_events", 0), ("total_seconds", 0), ("total_seconds", float("nan"))],
+)
+def test_nonpositive_or_nonfinite_batch_measurement_is_rejected(
+    tmp_path, field, value
+):
+    args = _args(tmp_path, profile_mode="off", basic_timing="on")
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root)
+    rows = _complete_rows()
+    rows[0][field] = value
+    _write_rows(root / "benchmark_timing/basic_batches.csv", rows)
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is False
+    assert "measurement_row_invalid" in evidence["error_codes"]
+
+
+def _mock_gpu_inventory(monkeypatch, output):
+    monkeypatch.setattr(run_runtime_benchmark.shutil, "which", lambda name: "/nvidia-smi")
+    monkeypatch.setattr(
+        run_runtime_benchmark.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=output),
+    )
+
+
+def test_execute_gpu_uuid_unresolved_is_rejected(monkeypatch):
+    _mock_gpu_inventory(monkeypatch, "0, GPU-zero\n1, GPU-one\n")
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("NVIDIA_VISIBLE_DEVICES", raising=False)
+    with pytest.raises(ValueError, match="unique GPU UUID"):
+        run_runtime_benchmark._gpu_identity(require_resolved=True)
+
+
+def test_execute_gpu_multi_device_mapping_is_rejected(monkeypatch):
+    _mock_gpu_inventory(monkeypatch, "1, GPU-one\n3, GPU-three\n")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1")
+    with pytest.raises(ValueError, match="exactly one"):
+        run_runtime_benchmark._gpu_identity(require_resolved=True)
+
+
+def test_execute_gpu_numeric_selector_on_multi_gpu_is_rejected(monkeypatch):
+    _mock_gpu_inventory(monkeypatch, "1, GPU-one\n3, GPU-three\n")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    monkeypatch.delenv("NVIDIA_VISIBLE_DEVICES", raising=False)
+    with pytest.raises(ValueError, match="cannot be mapped reliably"):
+        run_runtime_benchmark._gpu_identity(require_resolved=True)
+
+
+def test_execute_gpu_selector_inventory_mismatch_is_rejected(monkeypatch):
+    _mock_gpu_inventory(monkeypatch, "0, GPU-zero\n")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-not-present")
+    with pytest.raises(ValueError, match="does not match"):
+        run_runtime_benchmark._gpu_identity(require_resolved=True)
+
+
+def test_gpu_sampler_never_falls_back_to_all_devices(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_runtime_benchmark.shutil, "which", lambda name: "/nvidia-smi")
+    with pytest.raises(ValueError, match="GPU UUID"):
+        run_runtime_benchmark.start_gpu_sampler(tmp_path / "gpu.csv", 200, None)
+    assert not (tmp_path / "gpu.csv").exists()
+
+
+def test_gpu_sampler_is_explicitly_bound_to_uuid(tmp_path, monkeypatch):
+    captured = {}
+
+    class FakeProcess:
+        pass
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        return FakeProcess()
+
+    monkeypatch.setattr(run_runtime_benchmark.shutil, "which", lambda name: "/nvidia-smi")
+    monkeypatch.setattr(run_runtime_benchmark.subprocess, "Popen", fake_popen)
+    process, handle = run_runtime_benchmark.start_gpu_sampler(
+        tmp_path / "gpu.csv", 200, "GPU-test"
+    )
+    handle.close()
+    assert isinstance(process, FakeProcess)
+    assert "--id=GPU-test" in captured["command"]
+
+
+def test_gpu_sampler_start_failure_closes_output_handle(tmp_path, monkeypatch):
+    observed = {}
+
+    def fail_popen(command, **kwargs):
+        observed["handle"] = kwargs["stdout"]
+        raise OSError("cannot start")
+
+    monkeypatch.setattr(run_runtime_benchmark.shutil, "which", lambda name: "/nvidia-smi")
+    monkeypatch.setattr(run_runtime_benchmark.subprocess, "Popen", fail_popen)
+    with pytest.raises(OSError, match="cannot start"):
+        run_runtime_benchmark.start_gpu_sampler(
+            tmp_path / "gpu.csv", 200, "GPU-test"
+        )
+    assert observed["handle"].closed is True
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_source_sha", "missing required fields"),
+        ("bad_relation", "start/end/count"),
+        ("dataset", "dataset"),
+        ("source_mismatch", "source SHA256"),
+    ],
+)
+def test_manifest_strong_validation(tmp_path, mutation, message):
+    args = _args(tmp_path)
+    manifest = tmp_path / "manifest.json"
+    payload = _write_valid_manifest(manifest)
+    if mutation == "missing_source_sha":
+        payload.pop("source_sha256")
+    elif mutation == "bad_relation":
+        payload["selected_end_exclusive"] = 99
+    elif mutation == "dataset":
+        payload["dataset"] = "THEIA_E5"
+    else:
+        payload["source_sha256"] = "0" * 64
+    manifest.write_text(json.dumps(payload))
+    args.selection_manifest = str(manifest)
+    with pytest.raises(ValueError, match=message):
+        run_runtime_benchmark.validate_window_manifest(args, required=True)
+
+
+def test_manifest_unavailable_source_is_recorded_but_not_claimed_verified(tmp_path):
+    args = _args(tmp_path)
+    manifest = tmp_path / "manifest.json"
+    _write_valid_manifest(manifest, source_exists=False)
+    args.selection_manifest = str(manifest)
+    result = run_runtime_benchmark.validate_window_manifest(args, required=True)
+    assert result["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
+    assert result["source_verification_status"] == "not_revalidated_source_unavailable"
+    assert result["source_content_verified"] is False
+
+
+def test_manifest_eligible_epochs_must_be_ordered_and_contiguous(tmp_path):
+    args = _args(tmp_path)
+    manifest = tmp_path / "manifest.json"
+    payload = _write_valid_manifest(manifest)
+    payload["eligible_epochs"] = [2, 4, 3, 5, 6]
+    manifest.write_text(json.dumps(payload))
+    args.selection_manifest = str(manifest)
+    with pytest.raises(ValueError, match="ordered and contiguous"):
+        run_runtime_benchmark.validate_window_manifest(args, required=True)
+
+
+def test_batch_metadata_identity_is_scoped_and_pure_off_has_no_empty_digest(tmp_path):
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root)
+    result = run_runtime_benchmark.aggregate(
+        root, 0, 2, profile_mode="off", basic_timing="off", warmup_epochs=1
+    )
+    assert result["measurement_identity_sha256"] is None
+    assert result["batch_metadata_sha256"] is None
+    assert result["measurement_identity_scope"] == "unavailable:no_batch_rows"
+    assert result["statistics_status"] == "execution_complete_no_batch_throughput"
+    assert result["events"] is None
+
+
+def test_complete_detailed_evidence_is_accepted(tmp_path):
+    args = _args(tmp_path, profile_mode="on", basic_timing="on")
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root)
+    _write_rows(root / "profiling/perf_batches.csv", _complete_rows())
+    profile = root / "profiling/perf_profile.json"
+    profile.write_text(json.dumps({"enabled": True, "status": "completed"}))
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is True
+    assert evidence["measurement_source"] == "detailed_profile"
+    assert evidence["observed_measured_pair_count"] == 10
+
+
+def test_detailed_profile_must_be_completed_json_object(tmp_path):
+    args = _args(tmp_path, profile_mode="on", basic_timing="on")
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root)
+    _write_rows(root / "profiling/perf_batches.csv", _complete_rows())
+    profile = root / "profiling/perf_profile.json"
+    profile.write_text(json.dumps([]))
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is False
+    assert "detailed_profile_invalid" in evidence["error_codes"]
+
+
+def test_requested_torch_trace_requires_separate_trace_artifact(tmp_path):
+    args = _args(
+        tmp_path, profile_mode="on", basic_timing="on", torch_trace_batches=1
+    )
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root)
+    _write_rows(root / "profiling/perf_batches.csv", _complete_rows())
+    profile = root / "profiling/perf_profile.json"
+    profile.write_text(json.dumps({"enabled": True, "status": "completed"}))
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is False
+    assert "torch_trace_missing" in evidence["error_codes"]
+
+
+def test_trace_run_is_not_published_as_throughput(tmp_path):
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_rows(root / "profiling/perf_batches.csv", _complete_rows())
+    result = run_runtime_benchmark.aggregate(
+        root, 0, 2, profile_mode="on", basic_timing="on", warmup_epochs=1,
+        torch_trace_batches=1,
+    )
+    assert result["statistics_status"] == "diagnostic_trace_not_throughput"
+    assert result["events_per_second"] is None
+    assert result["batches_per_second"] is None
+
+
+def test_incomplete_execute_writes_failed_result_without_statistics(
+    tmp_path, monkeypatch
+):
+    args = _args(tmp_path, profile_mode="off", basic_timing="on")
+    manifest = tmp_path / "selection.json"
+    _write_valid_manifest(manifest)
+    shared = Path(args.shared_artifact_root)
+    before = _tree_content_snapshot(shared)
+    original_run = run_runtime_benchmark.subprocess.run
+
+    def fake_run(command, **kwargs):
+        if "--artifact-root" not in command:
+            return original_run(command, **kwargs)
+        output = Path(command[command.index("--artifact-root") + 1])
+        _write_runtime_receipt(output)
+        rows = [
+            row for row in _complete_rows()
+            if not (row["epoch"] == 6 and row["window_index"] == 1)
+        ]
+        _write_rows(output / "benchmark_timing/basic_batches.csv", rows)
+        return SimpleNamespace(returncode=0)
+
+    resolved_gpu = {
+        "gpu_uuid": "GPU-test",
+        "gpu_uuids": ["GPU-test"],
+        "cuda_visible_devices": "GPU-test",
+        "nvidia_visible_devices": None,
+        "cuda_device_order": None,
+        "gpu_identity_scope": "test",
+        "gpu_mapping_validation_status": "validated_test_mapping",
+        "gpu_identity_runtime_verified": True,
+    }
+    monkeypatch.setattr(run_runtime_benchmark.subprocess, "run", fake_run)
+    monkeypatch.setattr(run_runtime_benchmark, "start_gpu_sampler", lambda *a: None)
+    monkeypatch.setattr(
+        run_runtime_benchmark, "_gpu_identity", lambda **kwargs: resolved_gpu
+    )
+    argv = [
+        "--dataset", args.dataset,
+        "--config", args.config,
+        "--artifact-root", args.artifact_root,
+        "--shared-artifact-root", args.shared_artifact_root,
+        "--windows", "2",
+        "--profile-mode", "off",
+        "--selection-manifest", str(manifest),
+        "--basic-timing", "on",
+        "--execute",
+    ]
+    assert run_runtime_benchmark.main(argv) == 88
+    result_path = Path(args.artifact_root) / "benchmark_result.json"
+    assert result_path.is_file()
+    result = json.loads(result_path.read_text())
+    assert result["status"] == "failed"
+    assert result["child_returncode"] == 0
+    assert result["statistics_published"] is False
+    assert result["aggregate_published"] is False
+    assert result["aggregate"]["statistics_status"] == "invalid_not_published"
+    assert result["aggregate"]["events"] is None
+    assert any(
+        reason.startswith("execution_evidence:")
+        for reason in result["failure_reasons"]
+    )
+    assert _tree_content_snapshot(shared) == before
+
+
+def test_gpu_sampler_start_failure_writes_failed_result(tmp_path, monkeypatch):
+    args = _args(tmp_path, profile_mode="off", basic_timing="on")
+    manifest = tmp_path / "selection.json"
+    _write_valid_manifest(manifest)
+    shared = Path(args.shared_artifact_root)
+    before = _tree_content_snapshot(shared)
+    resolved_gpu = {
+        "gpu_uuid": "GPU-test",
+        "gpu_uuids": ["GPU-test"],
+        "cuda_visible_devices": "GPU-test",
+        "nvidia_visible_devices": None,
+        "cuda_device_order": None,
+        "gpu_identity_scope": "test",
+        "gpu_mapping_validation_status": "validated_test_mapping",
+        "gpu_identity_runtime_verified": True,
+    }
+    monkeypatch.setattr(
+        run_runtime_benchmark, "_gpu_identity", lambda **kwargs: resolved_gpu
+    )
+    monkeypatch.setattr(
+        run_runtime_benchmark,
+        "start_gpu_sampler",
+        lambda *args: (_ for _ in ()).throw(OSError("sampler unavailable")),
+    )
+    argv = [
+        "--dataset", args.dataset,
+        "--config", args.config,
+        "--artifact-root", args.artifact_root,
+        "--shared-artifact-root", args.shared_artifact_root,
+        "--windows", "2",
+        "--profile-mode", "off",
+        "--selection-manifest", str(manifest),
+        "--basic-timing", "on",
+        "--execute",
+    ]
+    assert run_runtime_benchmark.main(argv) == 89
+    result_path = Path(args.artifact_root) / "benchmark_result.json"
+    assert result_path.is_file()
+    result = json.loads(result_path.read_text())
+    assert result["status"] == "failed"
+    assert result["child_returncode"] is None
+    assert result["returncode"] == 89
+    assert result["statistics_published"] is False
+    assert result["aggregate_published"] is False
+    assert result["execution_evidence"]["error_codes"] == [
+        "gpu_sampler_start_failed"
+    ]
+    assert result["aggregate"]["statistics_status"] == "invalid_not_published"
+    assert result["aggregate"]["events_per_second"] is None
+    assert _tree_content_snapshot(shared) == before
+
+
+def test_complete_pure_off_execute_uses_receipt_without_publishing_throughput(
+    tmp_path, monkeypatch
+):
+    args = _args(tmp_path, profile_mode="off", basic_timing="off")
+    manifest = tmp_path / "selection.json"
+    _write_valid_manifest(manifest)
+    shared = Path(args.shared_artifact_root)
+    before = _tree_content_snapshot(shared)
+    original_run = run_runtime_benchmark.subprocess.run
+
+    def fake_run(command, **kwargs):
+        if "--artifact-root" not in command:
+            return original_run(command, **kwargs)
+        output = Path(command[command.index("--artifact-root") + 1])
+        _write_runtime_receipt(output)
+        return SimpleNamespace(returncode=0)
+
+    resolved_gpu = {
+        "gpu_uuid": "GPU-test",
+        "gpu_uuids": ["GPU-test"],
+        "cuda_visible_devices": "GPU-test",
+        "nvidia_visible_devices": None,
+        "cuda_device_order": None,
+        "gpu_identity_scope": "test",
+        "gpu_mapping_validation_status": "validated_test_mapping",
+        "gpu_identity_runtime_verified": True,
+    }
+    monkeypatch.setattr(run_runtime_benchmark.subprocess, "run", fake_run)
+    monkeypatch.setattr(run_runtime_benchmark, "start_gpu_sampler", lambda *a: None)
+    monkeypatch.setattr(
+        run_runtime_benchmark, "_gpu_identity", lambda **kwargs: resolved_gpu
+    )
+    argv = [
+        "--dataset", args.dataset,
+        "--config", args.config,
+        "--artifact-root", args.artifact_root,
+        "--shared-artifact-root", args.shared_artifact_root,
+        "--windows", "2",
+        "--profile-mode", "off",
+        "--selection-manifest", str(manifest),
+        "--basic-timing", "off",
+        "--execute",
+    ]
+    assert run_runtime_benchmark.main(argv) == 0
+    result_path = Path(args.artifact_root) / "benchmark_result.json"
+    assert result_path.is_file()
+    result = json.loads(result_path.read_text())
+    assert result["status"] == "completed"
+    assert result["execution_evidence"]["valid"] is True
+    assert result["execution_evidence"]["batch_rows_required"] is False
+    assert result["aggregate_published"] is True
+    assert result["statistics_published"] is False
+    assert result["aggregate"]["statistics_status"] == (
+        "execution_complete_no_batch_throughput"
+    )
+    assert result["aggregate"]["events"] is None
+    assert result["aggregate"]["events_per_second"] is None
+    assert result["aggregate"]["measurement_identity_sha256"] is None
+    assert _tree_content_snapshot(shared) == before
+
+
+def test_gpu_identity_preflight_failure_writes_status_without_starting_run(
+    tmp_path, monkeypatch
+):
+    args = _args(tmp_path, profile_mode="off", basic_timing="on")
+    manifest = tmp_path / "selection.json"
+    _write_valid_manifest(manifest)
+    shared = Path(args.shared_artifact_root)
+    before = _tree_content_snapshot(shared)
+    static_identity = {
+        "gpu_uuid": None,
+        "gpu_uuids": ["GPU-zero", "GPU-one"],
+        "cuda_visible_devices": None,
+        "nvidia_visible_devices": None,
+        "cuda_device_order": None,
+        "gpu_identity_scope": "test",
+        "gpu_mapping_validation_status": "not_runtime_verified",
+        "gpu_identity_runtime_verified": False,
+    }
+
+    def fake_gpu_identity(*, require_resolved=False):
+        if require_resolved:
+            raise ValueError("formal execute cannot resolve a unique GPU UUID")
+        return dict(static_identity)
+
+    monkeypatch.setattr(run_runtime_benchmark, "_gpu_identity", fake_gpu_identity)
+    monkeypatch.setattr(
+        run_runtime_benchmark,
+        "start_gpu_sampler",
+        lambda *args: pytest.fail("sampler must not start after GPU preflight failure"),
+    )
+    argv = [
+        "--dataset", args.dataset,
+        "--config", args.config,
+        "--artifact-root", args.artifact_root,
+        "--shared-artifact-root", args.shared_artifact_root,
+        "--windows", "2",
+        "--profile-mode", "off",
+        "--selection-manifest", str(manifest),
+        "--basic-timing", "on",
+        "--execute",
+    ]
+    assert run_runtime_benchmark.main(argv) == 84
+    result_path = Path(args.artifact_root) / "benchmark_result.json"
+    assert result_path.is_file()
+    result = json.loads(result_path.read_text())
+    assert result["status"] == "failed"
+    assert result["returncode"] == 84
+    assert result["child_returncode"] is None
+    assert result["experiment_identity"]["gpu_uuid"] is None
+    assert result["experiment_identity"]["gpu_identity_runtime_verified"] is False
+    assert result["execution_evidence"]["error_codes"] == [
+        "gpu_identity_unresolved"
+    ]
+    assert result["statistics_published"] is False
+    assert result["aggregate_published"] is False
+    assert result["aggregate"]["events_per_second"] is None
+    assert _tree_content_snapshot(shared) == before

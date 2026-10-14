@@ -13,9 +13,14 @@ This is NOT an nn.Module to avoid polluting model state_dict.
 from __future__ import annotations
 
 from typing import Dict, Literal, Optional, Sequence
+from time import perf_counter
 
 import torch
 from torch import Tensor
+try:
+    from runtime.runtime_profiler import get_profiler
+except ModuleNotFoundError:
+    from src.runtime.runtime_profiler import get_profiler
 
 
 def _stable_lexsort_desc(timestamp_ns: Tensor, event_id: Tensor) -> Tensor:
@@ -232,6 +237,9 @@ class HistoryStore:
         """
         device = nodes.device
         cap = self.candidate_capacity
+        profiler = get_profiler()
+        detail = profiler.detail_active
+        sort_started = perf_counter() if detail else None
 
         nodes_cpu = nodes.cpu()
         neighbors_cpu = neighbors.cpu()
@@ -248,9 +256,16 @@ class HistoryStore:
         sorted_dirs = directions_cpu[sorted_idx] if directions_cpu is not None else None
 
         node_list = sorted_nodes.unique().tolist()
+        if sort_started is not None:
+            profiler.record(
+                "training.history_store.insert_sort_prepare",
+                perf_counter() - sort_started,
+                parent="training.T_history_insert",
+            )
         if not node_list:
             return
 
+        merge_started = perf_counter() if detail else None
         for n in node_list:
             if n < 0 or n >= self.num_nodes:
                 continue
@@ -313,6 +328,13 @@ class HistoryStore:
                     self._direction[n, keep:].fill_(-1)
 
             self._count[n] = keep
+        if merge_started is not None:
+            profiler.record(
+                "training.history_store.insert_node_merge",
+                perf_counter() - merge_started,
+                parent="training.T_history_insert",
+            )
+        profiler.record_batch_stat("history_insert_nodes", len(node_list))
 
     # ------------------------------------------------------------------
     # query
@@ -351,10 +373,16 @@ class HistoryStore:
                 f"got {node_ids.shape} and {reference_time_ns.shape}"
             )
 
+        profiler = get_profiler()
+        clone_started = perf_counter() if profiler.detail_active else None
+        if profiler.detail_active and self._count.device.type == "cpu":
+            profiler.record_batch_stat(
+                "history_total_slots", int(self._count.sum().item())
+            )
         node_ids_long = node_ids.long()
         reference_time_ns_long = reference_time_ns.long()
 
-        return {
+        result = {
             "neighbor_id": self._neighbor_id[node_ids_long].clone(),
             "event_id": self._event_id[node_ids_long].clone(),
             "timestamp_ns": self._timestamp_ns[node_ids_long].clone(),
@@ -371,6 +399,13 @@ class HistoryStore:
             "node_ids": node_ids_long.clone(),
             "reference_time_ns": reference_time_ns_long.clone(),
         }
+        if clone_started is not None:
+            profiler.record(
+                "training.history_store.query_clone",
+                perf_counter() - clone_started,
+                parent="training.history_store.query",
+            )
+        return result
 
     # ------------------------------------------------------------------
     # state_dict / load_state_dict

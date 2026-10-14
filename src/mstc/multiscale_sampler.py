@@ -18,6 +18,7 @@ Separates query (read-only, before current batch) from insert
 from __future__ import annotations
 
 import math
+from time import perf_counter
 from typing import Dict, Literal, Optional, Sequence
 
 import torch
@@ -219,6 +220,8 @@ class MultiScaleNeighborLoader:
         """
         batch_size = src.shape[0]
         device = src.device
+        profiler = get_profiler()
+        prepare_started = perf_counter() if profiler.detail_active else None
 
         src_cpu = src.cpu()
         dst_cpu = dst.cpu()
@@ -247,9 +250,22 @@ class MultiScaleNeighborLoader:
         for idx, node in enumerate(all_nodes_list):
             reference_time_ns[idx] = ref_time_per_node[node]
 
-        with get_profiler().timer("training.T_history_query", detail=True,
-                                  parent="training.T_total_batch"):
+        if prepare_started is not None:
+            profiler.record(
+                "training.sampler.query_prepare", perf_counter() - prepare_started,
+                parent="training.T_neighbor_sample",
+            )
+        profiler.record_batch_stat("query_nodes", Q)
+        with profiler.timer(
+            "training.history_store.query", detail=True,
+            parent="training.T_neighbor_sample",
+        ):
             history = self.history_store.query(query_nodes, reference_time_ns)
+        if profiler.detail_active and history["count"].device.type == "cpu":
+            profiler.record_batch_stat(
+                "history_valid_slots", int(history["count"].sum().item())
+            )
+        index_started = perf_counter() if profiler.detail_active else None
 
         src_query_index = torch.zeros(batch_size, dtype=torch.long)
         node_to_qidx = {node: idx for idx, node in enumerate(all_nodes_list)}
@@ -266,6 +282,11 @@ class MultiScaleNeighborLoader:
             "src_query_index": src_query_index.to(device),
             "dst_query_index": dst_query_index.to(device),
         }
+        if index_started is not None:
+            profiler.record(
+                "training.sampler.index_and_query_h2d", perf_counter() - index_started,
+                parent="training.T_neighbor_sample",
+            )
 
         for scale_name, tau_low, tau_high, budget, has_upper in [
             ("short", 0, self.tau_short_ns, self.short_budget, True),
@@ -293,6 +314,11 @@ class MultiScaleNeighborLoader:
                 (Q, budget), dtype=torch.bool, device=device
             )
 
+            scale_detail = profiler.detail_active
+            filter_seconds = 0.0
+            sort_seconds = 0.0
+            h2d_seconds = 0.0
+            selected_count = 0
             ref_cpu = reference_time_ns.cpu()
             ts_cpu = timestamps.cpu()
             ev_cpu = event_ids.cpu()
@@ -300,6 +326,7 @@ class MultiScaleNeighborLoader:
             dir_cpu = directions.cpu()
 
             for q_idx in range(Q):
+                filter_started = perf_counter() if scale_detail else None
                 # First filter out invalid timestamps (marked as -1)
                 valid_ts_mask = ts_cpu[q_idx] >= 0
                 delta = ref_cpu[q_idx] - ts_cpu[q_idx]
@@ -317,20 +344,44 @@ class MultiScaleNeighborLoader:
                 valid_ev = ev_cpu[q_idx][in_range]
                 valid_nb = nb_cpu[q_idx][in_range]
                 valid_dir = dir_cpu[q_idx][in_range]
+                if filter_started is not None:
+                    filter_seconds += perf_counter() - filter_started
 
+                sort_started = perf_counter() if scale_detail else None
                 sorted_idx = _recency_order(valid_ts, valid_ev)
                 sorted_ts = valid_ts[sorted_idx]
                 sorted_ev = valid_ev[sorted_idx]
                 sorted_nb = valid_nb[sorted_idx]
                 sorted_dir = valid_dir[sorted_idx]
+                if sort_started is not None:
+                    sort_seconds += perf_counter() - sort_started
 
                 num_valid = min(len(sorted_ts), budget)
+                selected_count += num_valid
                 if num_valid > 0:
+                    h2d_started = perf_counter() if scale_detail else None
                     scale_neighbor[q_idx, :num_valid] = sorted_nb[:num_valid].to(device)
                     scale_event_id[q_idx, :num_valid] = sorted_ev[:num_valid].to(device)
                     scale_timestamp[q_idx, :num_valid] = sorted_ts[:num_valid].to(device)
                     scale_direction[q_idx, :num_valid] = sorted_dir[:num_valid].to(device)
                     scale_mask[q_idx, :num_valid] = True
+                    if h2d_started is not None:
+                        h2d_seconds += perf_counter() - h2d_started
+
+            if scale_detail:
+                profiler.record(
+                    f"training.sampler.{scale_name}.time_filter",
+                    filter_seconds, parent="training.T_neighbor_sample",
+                )
+                profiler.record(
+                    f"training.sampler.{scale_name}.sort_select",
+                    sort_seconds, parent="training.T_neighbor_sample",
+                )
+                profiler.record(
+                    f"training.sampler.{scale_name}.h2d_enqueue",
+                    h2d_seconds, parent="training.T_neighbor_sample",
+                )
+                profiler.record_batch_stat(f"{scale_name}_sampled_edges", selected_count)
 
             result[f"{scale_name}_neighbor_id"] = scale_neighbor
             result[f"{scale_name}_event_id"] = scale_event_id
