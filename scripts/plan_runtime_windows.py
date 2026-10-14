@@ -45,6 +45,18 @@ def main(argv=None):
     indices = sorted(grouped)
     if len(indices) < args.window_count:
         raise ValueError("inventory has fewer windows than requested")
+    if indices != list(range(indices[0], indices[-1] + 1)):
+        raise ValueError("inventory window indices must be contiguous")
+
+    eligible_epochs = sorted({int(row["epoch"]) for row in eligible})
+    expected_epochs = set(eligible_epochs)
+    for index in indices:
+        observed_epochs = {int(row["epoch"]) for row in grouped[index]}
+        if observed_epochs != expected_epochs:
+            raise ValueError(
+                "inventory does not cover every eligible epoch for window "
+                f"{index}"
+            )
 
     features = {}
     for index in indices:
@@ -113,7 +125,11 @@ def main(argv=None):
         "source_sha256": digest,
         "source_sha256_scope": "content_sha256_of_batches_csv_file",
         "warmup_epochs_excluded": args.warmup_epochs,
-        "eligible_epochs": sorted({int(row["epoch"]) for row in eligible}),
+        "eligible_epochs": eligible_epochs,
+        "inventory_window_start": indices[0],
+        "inventory_window_end_exclusive": indices[-1] + 1,
+        "inventory_window_count": len(indices),
+        "inventory_window_indices_contiguous": True,
         "selected_start": start,
         "selected_end_exclusive": start + args.window_count,
         "window_count": args.window_count,

@@ -53,6 +53,11 @@ def parse_args(argv=None):
     parser.add_argument("--windows", required=True, type=int, choices=(2, 10, 20))
     parser.add_argument("--window-start", type=int, default=0)
     parser.add_argument("--selection-manifest")
+    parser.add_argument(
+        "--bootstrap-inventory",
+        action="store_true",
+        help="Run a bounded diagnostic inventory; never publishes a formal baseline.",
+    )
     parser.add_argument("--warmup-epochs", type=int, default=1)
     parser.add_argument("--profile-mode", choices=("on", "off"), required=True)
     parser.add_argument("--basic-timing", choices=("on", "off"), default="on")
@@ -202,7 +207,9 @@ def _is_sha256(value: Any) -> bool:
     )
 
 
-def validate_window_manifest(args, *, required: bool) -> dict[str, Any] | None:
+def validate_window_manifest(
+    args, *, required: bool, expected_num_epochs: int | None = None
+) -> dict[str, Any] | None:
     """Validate a frozen planner manifest and report its provenance honestly."""
     if not args.selection_manifest:
         if required:
@@ -275,16 +282,68 @@ def validate_window_manifest(args, *, required: bool) -> dict[str, Any] | None:
             "selection manifest eligible_epochs must be ordered and contiguous "
             "after the excluded warmup epochs"
         )
+    if expected_num_epochs is not None:
+        protocol_epochs = list(
+            range(args.warmup_epochs + 1, expected_num_epochs + 1)
+        )
+        if eligible_epochs != protocol_epochs:
+            raise ValueError(
+                "selection manifest eligible_epochs do not match benchmark epochs"
+            )
+
 
     source = Path(plan["source"]).expanduser()
-    source_verified = False
-    source_status = "not_revalidated_source_unavailable"
-    if source.is_file():
-        actual_source_sha256 = _sha256_file(source)
-        if actual_source_sha256 != plan["source_sha256"].lower():
-            raise ValueError("selection manifest source SHA256 verification failed")
-        source_verified = True
-        source_status = "verified_against_available_source_file"
+    if not source.is_absolute():
+        source = path.parent / source
+    source = source.resolve(strict=False)
+    if not source.is_file():
+        raise ValueError(
+            f"selection manifest source Batch CSV does not exist: {source}"
+        )
+    actual_source_sha256 = _sha256_file(source)
+    if actual_source_sha256 != plan["source_sha256"].lower():
+        raise ValueError("selection manifest source SHA256 verification failed")
+
+    try:
+        with source.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if not {"epoch", "window_index"} <= set(reader.fieldnames or []):
+                raise ValueError(
+                    "selection manifest source Batch CSV lacks epoch/window_index"
+                )
+            source_pairs = set()
+            for position, row in enumerate(reader):
+                try:
+                    epoch = int(row["epoch"])
+                    window_index = int(row["window_index"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "selection manifest source Batch CSV has invalid "
+                        f"epoch/window_index at row {position + 2}"
+                    ) from exc
+                if epoch > args.warmup_epochs:
+                    source_pairs.add((epoch, window_index))
+    except OSError as exc:
+        raise ValueError(
+            f"selection manifest source Batch CSV cannot be read: {source}"
+        ) from exc
+    source_epochs = sorted({epoch for epoch, _ in source_pairs})
+    if source_epochs != eligible_epochs:
+        raise ValueError(
+            "selection manifest eligible_epochs do not match source Batch CSV"
+        )
+    required_source_pairs = {
+        (epoch, window_index)
+        for epoch in eligible_epochs
+        for window_index in range(start, end)
+    }
+    if not required_source_pairs <= source_pairs:
+        raise ValueError(
+            "selection manifest source Batch CSV does not cover every selected "
+            "eligible epoch/window"
+        )
+    source_verified = True
+    source_status = "verified_against_available_source_file"
 
     return {
         "path": str(path),
@@ -297,11 +356,12 @@ def validate_window_manifest(args, *, required: bool) -> dict[str, Any] | None:
         "window_count": count,
         "warmup_epochs_excluded": plan["warmup_epochs_excluded"],
         "eligible_epochs": list(eligible_epochs),
-        "source": plan["source"],
+        "source": str(source),
         "source_sha256": plan["source_sha256"].lower(),
         "source_sha256_scope": plan["source_sha256_scope"],
         "source_content_verified": source_verified,
         "source_verification_status": source_status,
+        "source_observed_epoch_window_count": len(source_pairs),
     }
 
 
@@ -508,6 +568,7 @@ def validate_shared_training_inputs(args, shared: Path) -> dict[str, Any]:
 
 def validate(args):
     epochs = validate_config_semantics(args.config)
+    bootstrap_inventory = bool(getattr(args, "bootstrap_inventory", False))
     if args.seed != 0:
         raise ValueError("formal E3/E5 benchmark requires --seed 0")
     if args.window_start < 0 or args.torch_trace_batches < 0:
@@ -518,17 +579,37 @@ def validate(args):
         )
     if args.gpu_sample_ms <= 0:
         raise ValueError("gpu sample interval must be positive")
-    if args.windows != 20 and args.window_start != 0:
-        raise ValueError("non-zero --window-start requires the 20-window manifest case")
-    manifest = validate_window_manifest(
-        args, required=bool(args.execute or args.windows == 20)
-    )
+    if bootstrap_inventory:
+        if args.windows not in (2, 10):
+            raise ValueError("bootstrap inventory allows only 2 or 10 windows")
+        if args.window_start != 0:
+            raise ValueError("bootstrap inventory requires --window-start 0")
+        if args.selection_manifest:
+            raise ValueError("bootstrap inventory must not use a selection manifest")
+        if args.profile_mode != "on":
+            raise ValueError("bootstrap inventory requires --profile-mode on")
+        if args.torch_trace_batches:
+            raise ValueError("bootstrap inventory does not allow Torch trace")
+        manifest = None
+    else:
+        if args.windows != 20 and args.window_start != 0:
+            raise ValueError(
+                "non-zero --window-start requires the 20-window manifest case"
+            )
+        manifest = validate_window_manifest(
+            args,
+            required=bool(args.execute or args.windows == 20),
+            expected_num_epochs=epochs,
+        )
     if args.profile_mode == "off" and args.torch_trace_batches:
         raise ValueError("torch trace requires --profile-mode on")
     roots = resolve_isolated_roots(args)
     validate_shared_training_inputs(args, roots[1])
     args._benchmark_num_epochs = epochs
     args._validated_manifest = manifest
+    args._benchmark_protocol = (
+        "bootstrap_inventory" if bootstrap_inventory else "formal"
+    )
     return roots
 
 
@@ -1009,6 +1090,7 @@ def aggregate(
 def main(argv=None):
     args = parse_args(argv)
     roots = validate(args)
+    bootstrap_inventory = args._benchmark_protocol == "bootstrap_inventory"
     output, shared = roots
     command = build_command(args, roots=roots)
     manifest_validation = getattr(args, "_validated_manifest", None)
@@ -1039,9 +1121,19 @@ def main(argv=None):
         "requested_profile_mode": args.profile_mode,
         "requested_basic_timing": args.basic_timing,
         "run_protocol": (
-            "torch_trace_diagnostic" if args.torch_trace_batches
-            else "throughput_benchmark"
+            "bootstrap_inventory_diagnostic"
+            if bootstrap_inventory
+            else (
+                "torch_trace_diagnostic"
+                if args.torch_trace_batches
+                else "formal_throughput_benchmark"
+            )
         ),
+        "protocol_schema_version": 1,
+        "formal_baseline_eligible": False,
+        "selection_manifest_required": not bootstrap_inventory,
+        "bootstrap_inventory": bootstrap_inventory,
+        "formal_manifest_source_verified_at_publish": None,
         "shared_artifact_root": str(shared),
         "shared_input_preflight": validate_shared_training_inputs(args, shared),
         "artifact_root": str(output),
@@ -1106,6 +1198,7 @@ def main(argv=None):
             "shared_root_unchanged": before == after,
             "execution_evidence": evidence,
             "aggregate_published": False,
+            "diagnostic_statistics_published": False,
             "statistics_published": False,
             "aggregate": {
                 "measurement_source": measurement_source,
@@ -1179,6 +1272,7 @@ def main(argv=None):
             "shared_root_unchanged": before == after,
             "execution_evidence": evidence,
             "aggregate_published": False,
+            "diagnostic_statistics_published": False,
             "statistics_published": False,
             "aggregate": {
                 "measurement_source": evidence["measurement_source"],
@@ -1226,6 +1320,19 @@ def main(argv=None):
     )
 
     final_returncode = completed.returncode
+    formal_manifest_source_verified_at_publish = None
+    if not bootstrap_inventory:
+        try:
+            source_path = Path(manifest_validation["source"])
+            formal_manifest_source_verified_at_publish = (
+                manifest_validation.get("source_content_verified") is True
+                and source_path.is_file()
+                and _sha256_file(source_path)
+                == manifest_validation["source_sha256"]
+            )
+        except (KeyError, OSError, TypeError):
+            formal_manifest_source_verified_at_publish = False
+
     failure_reasons = []
     if completed.returncode != 0:
         failure_reasons.append(f"child_returncode:{completed.returncode}")
@@ -1244,6 +1351,11 @@ def main(argv=None):
         if final_returncode == 0:
             final_returncode = 88
 
+    if formal_manifest_source_verified_at_publish is False:
+        failure_reasons.append("formal_manifest_source_not_verified_at_publish")
+        if final_returncode == 0:
+            final_returncode = 90
+
     publish_statistics = (
         final_returncode == 0 and evidence["valid"] and profile_mode_matches
         and shared_unchanged
@@ -1258,6 +1370,12 @@ def main(argv=None):
             warmup_epochs=args.warmup_epochs,
             torch_trace_batches=args.torch_trace_batches,
         )
+        if bootstrap_inventory:
+            aggregate_payload["statistics_status"] = (
+                "diagnostic_bootstrap_inventory_not_formal_baseline"
+            )
+            aggregate_payload["events_per_second"] = None
+            aggregate_payload["batches_per_second"] = None
     else:
         aggregate_payload = {
             "measurement_source": evidence["measurement_source"],
@@ -1274,8 +1392,13 @@ def main(argv=None):
 
     throughput_statistics_published = (
         publish_statistics
+        and not bootstrap_inventory
         and not args.torch_trace_batches
         and aggregate_payload.get("measured_batch_count", 0) > 0
+    )
+    diagnostic_statistics_published = (
+        publish_statistics
+        and (bootstrap_inventory or bool(args.torch_trace_batches))
     )
     request.update({
         "status": "completed" if final_returncode == 0 else "failed",
@@ -1297,7 +1420,13 @@ def main(argv=None):
         "execution_evidence": evidence,
         "aggregate_published": publish_statistics,
         "statistics_published": throughput_statistics_published,
+        "diagnostic_statistics_published": diagnostic_statistics_published,
+        "formal_baseline_eligible": throughput_statistics_published,
+        "bootstrap_inventory": bootstrap_inventory,
         "aggregate": aggregate_payload,
+        "formal_manifest_source_verified_at_publish": (
+            formal_manifest_source_verified_at_publish
+        ),
     })
     (output / "benchmark_result.json").write_text(
         json.dumps(request, ensure_ascii=False, indent=2)

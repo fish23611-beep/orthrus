@@ -46,6 +46,7 @@ def _args(tmp_path, **overrides):
         windows=2,
         window_start=0,
         selection_manifest=None,
+        bootstrap_inventory=False,
         warmup_epochs=1,
         profile_mode="on",
         basic_timing="on",
@@ -72,7 +73,7 @@ def _args(tmp_path, **overrides):
 
 
 def _write_rows(path: Path, rows):
-    path.parent.mkdir(parents=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
@@ -139,7 +140,7 @@ def _write_valid_manifest(path: Path, *, dataset="THEIA_E3", start=0, count=2,
                           warmup=1, source_exists=True):
     source = path.with_suffix(".csv")
     if source_exists:
-        source.write_text("epoch,window_index\n2,0\n")
+        _write_rows(source, _complete_rows(window_end=start + count))
     source_sha256 = hashlib.sha256(
         source.read_bytes() if source_exists else b"frozen-source"
     ).hexdigest()
@@ -810,15 +811,13 @@ def test_manifest_strong_validation(tmp_path, mutation, message):
         run_runtime_benchmark.validate_window_manifest(args, required=True)
 
 
-def test_manifest_unavailable_source_is_recorded_but_not_claimed_verified(tmp_path):
+def test_formal_manifest_missing_source_is_rejected(tmp_path):
     args = _args(tmp_path)
     manifest = tmp_path / "manifest.json"
     _write_valid_manifest(manifest, source_exists=False)
     args.selection_manifest = str(manifest)
-    result = run_runtime_benchmark.validate_window_manifest(args, required=True)
-    assert result["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
-    assert result["source_verification_status"] == "not_revalidated_source_unavailable"
-    assert result["source_content_verified"] is False
+    with pytest.raises(ValueError, match="source Batch CSV does not exist"):
+        run_runtime_benchmark.validate_window_manifest(args, required=True)
 
 
 def test_manifest_eligible_epochs_must_be_ordered_and_contiguous(tmp_path):
@@ -829,6 +828,37 @@ def test_manifest_eligible_epochs_must_be_ordered_and_contiguous(tmp_path):
     manifest.write_text(json.dumps(payload))
     args.selection_manifest = str(manifest)
     with pytest.raises(ValueError, match="ordered and contiguous"):
+        run_runtime_benchmark.validate_window_manifest(args, required=True)
+
+
+def test_manifest_eligible_epochs_must_match_six_epoch_protocol(tmp_path):
+    args = _args(tmp_path, execute=True)
+    manifest = tmp_path / "manifest.json"
+    payload = _write_valid_manifest(manifest)
+    source = manifest.with_suffix(".csv")
+    _write_rows(source, _complete_rows(epochs=range(1, 4)))
+    payload["eligible_epochs"] = [2, 3]
+    payload["source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+    manifest.write_text(json.dumps(payload))
+    args.selection_manifest = str(manifest)
+    with pytest.raises(ValueError, match="do not match benchmark epochs"):
+        run_runtime_benchmark.validate(args)
+
+
+def test_manifest_source_must_cover_every_selected_eligible_epoch_window(tmp_path):
+    args = _args(tmp_path)
+    manifest = tmp_path / "manifest.json"
+    payload = _write_valid_manifest(manifest)
+    source = manifest.with_suffix(".csv")
+    rows = [
+        row for row in _complete_rows()
+        if not (row["epoch"] == 6 and row["window_index"] == 1)
+    ]
+    _write_rows(source, rows)
+    payload["source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+    manifest.write_text(json.dumps(payload))
+    args.selection_manifest = str(manifest)
+    with pytest.raises(ValueError, match="does not cover every selected"):
         run_runtime_benchmark.validate_window_manifest(args, required=True)
 
 
@@ -1082,6 +1112,7 @@ def test_complete_pure_off_execute_uses_receipt_without_publishing_throughput(
     assert result["aggregate"]["events"] is None
     assert result["aggregate"]["events_per_second"] is None
     assert result["aggregate"]["measurement_identity_sha256"] is None
+    assert result["formal_manifest_source_verified_at_publish"] is True
     assert _tree_content_snapshot(shared) == before
 
 
@@ -1142,3 +1173,415 @@ def test_gpu_identity_preflight_failure_writes_status_without_starting_run(
     assert result["aggregate_published"] is False
     assert result["aggregate"]["events_per_second"] is None
     assert _tree_content_snapshot(shared) == before
+
+
+def test_formal_execute_without_manifest_is_rejected(tmp_path):
+    args = _args(tmp_path, execute=True)
+    with pytest.raises(ValueError, match="formal execute requires --selection-manifest"):
+        run_runtime_benchmark.validate(args)
+    assert not Path(args.artifact_root).exists()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"windows": 20}, "only 2 or 10"),
+        ({"window_start": 1}, "window-start 0"),
+        ({"profile_mode": "off"}, "profile-mode on"),
+        ({"torch_trace_batches": 1}, "does not allow Torch trace"),
+    ],
+)
+def test_invalid_bootstrap_parameters_are_rejected(tmp_path, overrides, message):
+    args = _args(tmp_path, bootstrap_inventory=True, **overrides)
+    with pytest.raises(ValueError, match=message):
+        run_runtime_benchmark.validate(args)
+    assert not Path(args.artifact_root).exists()
+
+
+def test_bootstrap_rejects_selection_manifest(tmp_path):
+    manifest = tmp_path / "selection.json"
+    _write_valid_manifest(manifest)
+    args = _args(
+        tmp_path,
+        bootstrap_inventory=True,
+        selection_manifest=str(manifest),
+    )
+    with pytest.raises(ValueError, match="must not use a selection manifest"):
+        run_runtime_benchmark.validate(args)
+
+
+@pytest.mark.parametrize(
+    ("dataset", "windows"),
+    [
+        ("THEIA_E3", 2),
+        ("THEIA_E3", 10),
+        ("THEIA_E5", 2),
+        ("THEIA_E5", 10),
+    ],
+)
+def test_bootstrap_uses_common_e3_e5_bounded_command_path(
+    tmp_path, dataset, windows
+):
+    args = _args(
+        tmp_path,
+        dataset=dataset,
+        windows=windows,
+        bootstrap_inventory=True,
+    )
+    roots = run_runtime_benchmark.validate(args)
+    command = run_runtime_benchmark.build_command(args, roots=roots)
+    assert args._benchmark_protocol == "bootstrap_inventory"
+    assert args._validated_manifest is None
+    assert command[command.index("--dataset") + 1] == dataset
+    assert command[command.index("--max-windows-per-split") + 1] == str(windows)
+    assert "--perf-profile" in command
+    assert "--shared-artifact-readonly" in command
+
+
+def test_bootstrap_execute_is_diagnostic_and_still_requires_strict_gpu(
+    tmp_path, monkeypatch
+):
+    args = _args(tmp_path, bootstrap_inventory=True)
+    shared = Path(args.shared_artifact_root)
+    before = _tree_content_snapshot(shared)
+    original_run = run_runtime_benchmark.subprocess.run
+
+    def fake_run(command, **kwargs):
+        if "--artifact-root" not in command:
+            return original_run(command, **kwargs)
+        output = Path(command[command.index("--artifact-root") + 1])
+        _write_runtime_receipt(output)
+        _write_rows(output / "profiling/perf_batches.csv", _complete_rows())
+        profile = output / "profiling/perf_profile.json"
+        profile.write_text(json.dumps({"enabled": True, "status": "completed"}))
+        return SimpleNamespace(returncode=0)
+
+    gpu_calls = []
+    resolved_gpu = {
+        "gpu_uuid": "GPU-test",
+        "gpu_uuids": ["GPU-test"],
+        "cuda_visible_devices": "GPU-test",
+        "nvidia_visible_devices": None,
+        "cuda_device_order": None,
+        "gpu_identity_scope": "test",
+        "gpu_mapping_validation_status": "validated_test_mapping",
+        "gpu_identity_runtime_verified": True,
+    }
+
+    def fake_gpu_identity(*, require_resolved=False):
+        gpu_calls.append(require_resolved)
+        result = dict(resolved_gpu)
+        result["gpu_identity_runtime_verified"] = require_resolved
+        return result
+
+    monkeypatch.setattr(run_runtime_benchmark.subprocess, "run", fake_run)
+    monkeypatch.setattr(run_runtime_benchmark, "_gpu_identity", fake_gpu_identity)
+    monkeypatch.setattr(run_runtime_benchmark, "start_gpu_sampler", lambda *a: None)
+    argv = [
+        "--dataset", args.dataset,
+        "--config", args.config,
+        "--artifact-root", args.artifact_root,
+        "--shared-artifact-root", args.shared_artifact_root,
+        "--windows", "2",
+        "--window-start", "0",
+        "--profile-mode", "on",
+        "--basic-timing", "on",
+        "--bootstrap-inventory",
+        "--execute",
+    ]
+    assert run_runtime_benchmark.main(argv) == 0
+    result_path = Path(args.artifact_root) / "benchmark_result.json"
+    assert result_path.is_file()
+    result = json.loads(result_path.read_text())
+    assert gpu_calls == [False, True]
+    assert result["status"] == "completed"
+    assert result["run_protocol"] == "bootstrap_inventory_diagnostic"
+    assert result["protocol_schema_version"] == 1
+    assert result["bootstrap_inventory"] is True
+    assert result["selection_manifest_required"] is False
+    assert result["formal_manifest_source_verified_at_publish"] is None
+    assert result["formal_baseline_eligible"] is False
+    assert result["statistics_published"] is False
+    assert result["diagnostic_statistics_published"] is True
+    assert result["aggregate_published"] is True
+    assert result["execution_evidence"]["valid"] is True
+    assert result["aggregate"]["statistics_status"] == (
+        "diagnostic_bootstrap_inventory_not_formal_baseline"
+    )
+    assert result["aggregate"]["events_per_second"] is None
+    assert result["aggregate"]["batches_per_second"] is None
+    assert result["experiment_identity"]["window_manifest_sha256"] is None
+    assert (Path(args.artifact_root) / "profiling/perf_batches.csv").is_file()
+    assert _tree_content_snapshot(shared) == before
+
+
+def test_bootstrap_dry_run_stays_static_and_writes_no_result(
+    tmp_path, monkeypatch, capsys
+):
+    args = _args(tmp_path, bootstrap_inventory=True)
+    original_run = run_runtime_benchmark.subprocess.run
+    gpu_calls = []
+
+    def fake_run(command, **kwargs):
+        if "--artifact-root" in command:
+            pytest.fail("bootstrap dry-run must not start the training child")
+        return original_run(command, **kwargs)
+
+    def fake_gpu_identity(*, require_resolved=False):
+        gpu_calls.append(require_resolved)
+        return {
+            "gpu_uuid": None,
+            "gpu_uuids": [],
+            "cuda_visible_devices": None,
+            "nvidia_visible_devices": None,
+            "cuda_device_order": None,
+            "gpu_identity_scope": "test",
+            "gpu_mapping_validation_status": "not_runtime_verified",
+            "gpu_identity_runtime_verified": False,
+        }
+
+    monkeypatch.setattr(run_runtime_benchmark.subprocess, "run", fake_run)
+    monkeypatch.setattr(run_runtime_benchmark, "_gpu_identity", fake_gpu_identity)
+    monkeypatch.setattr(
+        run_runtime_benchmark,
+        "start_gpu_sampler",
+        lambda *args: pytest.fail("bootstrap dry-run must not start GPU sampling"),
+    )
+    argv = [
+        "--dataset", args.dataset,
+        "--config", args.config,
+        "--artifact-root", args.artifact_root,
+        "--shared-artifact-root", args.shared_artifact_root,
+        "--windows", "2",
+        "--profile-mode", "on",
+        "--bootstrap-inventory",
+    ]
+    assert run_runtime_benchmark.main(argv) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert gpu_calls == [False]
+    assert payload["dry_run"] is True
+    assert payload["run_protocol"] == "bootstrap_inventory_diagnostic"
+    assert payload["formal_baseline_eligible"] is False
+    assert payload["experiment_identity"]["gpu_identity_runtime_verified"] is False
+    assert not Path(args.artifact_root).exists()
+
+
+def test_bootstrap_fails_closed_when_gpu_uuid_cannot_be_resolved(
+    tmp_path, monkeypatch
+):
+    args = _args(tmp_path, bootstrap_inventory=True)
+
+    def fake_gpu_identity(*, require_resolved=False):
+        if require_resolved:
+            raise ValueError("cannot resolve unique GPU UUID")
+        return {
+            "gpu_uuid": None,
+            "gpu_uuids": ["GPU-zero", "GPU-one"],
+            "cuda_visible_devices": None,
+            "nvidia_visible_devices": None,
+            "cuda_device_order": None,
+            "gpu_identity_scope": "test",
+            "gpu_mapping_validation_status": "ambiguous",
+            "gpu_identity_runtime_verified": False,
+        }
+
+    monkeypatch.setattr(run_runtime_benchmark, "_gpu_identity", fake_gpu_identity)
+    monkeypatch.setattr(
+        run_runtime_benchmark,
+        "start_gpu_sampler",
+        lambda *args: pytest.fail("GPU sampler must not start"),
+    )
+    argv = [
+        "--dataset", args.dataset,
+        "--config", args.config,
+        "--artifact-root", args.artifact_root,
+        "--shared-artifact-root", args.shared_artifact_root,
+        "--windows", "2",
+        "--profile-mode", "on",
+        "--bootstrap-inventory",
+        "--execute",
+    ]
+    assert run_runtime_benchmark.main(argv) == 84
+    result = json.loads(
+        (Path(args.artifact_root) / "benchmark_result.json").read_text()
+    )
+    assert result["status"] == "failed"
+    assert result["bootstrap_inventory"] is True
+    assert result["execution_evidence"]["error_codes"] == [
+        "gpu_identity_unresolved"
+    ]
+    assert result["statistics_published"] is False
+    assert result["diagnostic_statistics_published"] is False
+
+
+def test_prefix_windows_execute_but_only_selected_windows_are_aggregated(tmp_path):
+    args = _args(
+        tmp_path,
+        windows=20,
+        window_start=4,
+        profile_mode="off",
+        basic_timing="on",
+    )
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root, window_end=24)
+    _write_rows(
+        root / "benchmark_timing/basic_batches.csv",
+        _complete_rows(window_end=24),
+    )
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is True
+    assert evidence["expected_execution_window_indices"] == list(range(24))
+    assert evidence["expected_measured_window_indices"] == list(range(4, 24))
+    assert evidence["receipt_pair_count"] == 6 * 24
+    assert evidence["observed_measured_pair_count"] == 5 * 20
+
+    result = run_runtime_benchmark.aggregate(
+        root,
+        4,
+        20,
+        profile_mode="off",
+        basic_timing="on",
+        warmup_epochs=1,
+    )
+    assert result["warmup_batch_count"] == 24
+    assert result["causal_replay_batch_count"] == 5 * 4
+    assert result["measured_batch_count"] == 5 * 20
+    assert result["measured_distinct_window_indices"] == list(range(4, 24))
+    assert result["excluded_other_batch_count"] == 0
+
+
+def test_ten_window_bootstrap_inventory_cannot_plan_twenty_windows(tmp_path):
+    source = tmp_path / "bootstrap_batches.csv"
+    with source.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "epoch",
+                "window_index",
+                "batch_events",
+                "history_valid_slots",
+                "total_seconds",
+            ],
+        )
+        writer.writeheader()
+        for epoch in range(1, 7):
+            for window_index in range(10):
+                writer.writerow({
+                    "epoch": epoch,
+                    "window_index": window_index,
+                    "batch_events": 100 + window_index,
+                    "history_valid_slots": window_index * 10,
+                    "total_seconds": 1.0,
+                })
+    with pytest.raises(ValueError, match="fewer windows than requested"):
+        plan_runtime_windows.main([
+            "--dataset", "THEIA_E5",
+            "--batches-csv", str(source),
+            "--window-count", "20",
+            "--warmup-epochs", "1",
+            "--output", str(tmp_path / "manifest.json"),
+        ])
+    assert not (tmp_path / "manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("gap", "indices must be contiguous"),
+        ("missing_epoch", "does not cover every eligible epoch"),
+    ],
+)
+def test_window_planner_rejects_incomplete_inventory(tmp_path, mutation, message):
+    source = tmp_path / "inventory.csv"
+    rows = []
+    for epoch in range(1, 4):
+        for window_index in range(25):
+            if mutation == "gap" and window_index == 12:
+                continue
+            if mutation == "missing_epoch" and epoch == 3 and window_index == 12:
+                continue
+            rows.append({
+                "epoch": epoch,
+                "window_index": window_index,
+                "batch_events": 100,
+                "history_valid_slots": 10,
+                "total_seconds": 1.0,
+            })
+    with source.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    output = tmp_path / "manifest.json"
+    with pytest.raises(ValueError, match=message):
+        plan_runtime_windows.main([
+            "--dataset", "THEIA_E3",
+            "--batches-csv", str(source),
+            "--window-count", "20",
+            "--warmup-epochs", "1",
+            "--output", str(output),
+        ])
+    assert not output.exists()
+
+
+def test_formal_source_change_during_run_blocks_statistics_publication(
+    tmp_path, monkeypatch
+):
+    args = _args(tmp_path, profile_mode="off", basic_timing="on")
+    manifest = tmp_path / "selection.json"
+    _write_valid_manifest(manifest)
+    source = manifest.with_suffix(".csv")
+    original_run = run_runtime_benchmark.subprocess.run
+
+    def fake_run(command, **kwargs):
+        if "--artifact-root" not in command:
+            return original_run(command, **kwargs)
+        output = Path(command[command.index("--artifact-root") + 1])
+        _write_runtime_receipt(output)
+        _write_rows(output / "benchmark_timing/basic_batches.csv", _complete_rows())
+        source.write_bytes(source.read_bytes() + b"\n")
+        return SimpleNamespace(returncode=0)
+
+    resolved_gpu = {
+        "gpu_uuid": "GPU-test",
+        "gpu_uuids": ["GPU-test"],
+        "cuda_visible_devices": "GPU-test",
+        "nvidia_visible_devices": None,
+        "cuda_device_order": None,
+        "gpu_identity_scope": "test",
+        "gpu_mapping_validation_status": "validated_test_mapping",
+        "gpu_identity_runtime_verified": True,
+    }
+    monkeypatch.setattr(run_runtime_benchmark.subprocess, "run", fake_run)
+    monkeypatch.setattr(run_runtime_benchmark, "start_gpu_sampler", lambda *a: None)
+    monkeypatch.setattr(
+        run_runtime_benchmark, "_gpu_identity", lambda **kwargs: resolved_gpu
+    )
+    argv = [
+        "--dataset", args.dataset,
+        "--config", args.config,
+        "--artifact-root", args.artifact_root,
+        "--shared-artifact-root", args.shared_artifact_root,
+        "--windows", "2",
+        "--profile-mode", "off",
+        "--selection-manifest", str(manifest),
+        "--basic-timing", "on",
+        "--execute",
+    ]
+    assert run_runtime_benchmark.main(argv) == 90
+    result = json.loads(
+        (Path(args.artifact_root) / "benchmark_result.json").read_text()
+    )
+    assert result["status"] == "failed"
+    assert result["child_returncode"] == 0
+    assert result["formal_manifest_source_verified_at_publish"] is False
+    assert result["aggregate_published"] is False
+    assert result["statistics_published"] is False
+    assert result["diagnostic_statistics_published"] is False
+    assert result["aggregate"]["statistics_status"] == "invalid_not_published"
+    assert result["aggregate"]["events_per_second"] is None
+    assert "formal_manifest_source_not_verified_at_publish" in result[
+        "failure_reasons"
+    ]
