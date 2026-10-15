@@ -10,15 +10,19 @@ import argparse
 from collections import Counter, defaultdict
 import contextlib
 import csv
+from dataclasses import dataclass, field
+from datetime import datetime
 import hashlib
 import io
 import json
 import math
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +34,35 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN_EXPERIMENT = ROOT / "src" / "experiments" / "run_experiment.py"
 PROFILE_ENV = "ORTHRUS_PERF_PROFILE"
 PROFILE_SAMPLE_ENV = "ORTHRUS_PERF_PROFILE_SAMPLE_EVERY_N_BATCHES"
+GPU_QUERY_FIELDS = (
+    "timestamp",
+    "index",
+    "uuid",
+    "name",
+    "utilization.gpu",
+    "utilization.memory",
+    "memory.used",
+    "power.draw",
+    "clocks.sm",
+    "clocks.mem",
+)
+
+
+@dataclass
+class GpuSampler:
+    process: Any
+    stdout_handle: Any
+    stderr_handle: Any
+    csv_path: Path
+    stderr_path: Path
+    interval_seconds: float
+    started_epoch_seconds: float
+    started_monotonic: float
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    monitor_thread: threading.Thread | None = None
+    unexpected_exit_returncode: int | None = None
+    unexpected_exit_epoch_seconds: float | None = None
+    monitor_error: str | None = None
 
 
 def percentile(values, q):
@@ -687,30 +720,392 @@ def shared_tree_snapshot(root: Path) -> dict[str, Any]:
     }
 
 
+def _observe_gpu_sampler(sampler: GpuSampler) -> int | None:
+    try:
+        returncode = sampler.process.poll()
+    except Exception as exc:
+        if sampler.monitor_error is None:
+            sampler.monitor_error = f"{type(exc).__name__}: {exc}"
+        return None
+    if (
+        returncode is not None
+        and sampler.unexpected_exit_returncode is None
+        and not sampler.stop_event.is_set()
+    ):
+        sampler.unexpected_exit_returncode = returncode
+        sampler.unexpected_exit_epoch_seconds = time.time()
+    return returncode
+
+
+def _monitor_gpu_sampler(sampler: GpuSampler) -> None:
+    poll_seconds = min(max(sampler.interval_seconds, 0.05), 1.0)
+    while not sampler.stop_event.is_set():
+        if _observe_gpu_sampler(sampler) is not None:
+            return
+        sampler.stop_event.wait(poll_seconds)
+
+
 def start_gpu_sampler(path, interval_ms, gpu_uuid=None):
     if not gpu_uuid:
         raise ValueError("GPU UUID is required; sampler may not fall back to all devices")
+    if interval_ms <= 0:
+        raise ValueError("GPU sampling interval must be positive")
     executable = shutil.which("nvidia-smi")
     if not executable:
         raise ValueError("nvidia-smi is required for bound GPU sampling")
-    handle = path.open("w", encoding="utf-8")
+
+    path = Path(path)
+    stderr_path = path.with_name("gpu_sampler.stderr.log")
+    stdout_handle = path.open("w", encoding="utf-8")
+    try:
+        stderr_handle = stderr_path.open("w", encoding="utf-8")
+    except Exception:
+        stdout_handle.close()
+        raise
     command = [
         executable,
         f"--id={gpu_uuid}",
-        "--query-gpu=timestamp,index,name,utilization.gpu,"
-        "utilization.memory,memory.used,power.draw,clocks.sm,clocks.mem",
-        "--format=csv",
+        f"--query-gpu={','.join(GPU_QUERY_FIELDS)}",
+        "--format=csv,nounits",
         "-lms",
         str(interval_ms),
     ]
+    started_epoch_seconds = time.time()
+    started_monotonic = time.perf_counter()
     try:
         process = subprocess.Popen(
-            command, stdout=handle, stderr=subprocess.STDOUT
+            command, stdout=stdout_handle, stderr=stderr_handle
         )
     except Exception:
-        handle.close()
+        stderr_handle.close()
+        stdout_handle.close()
         raise
-    return process, handle
+
+    sampler = GpuSampler(
+        process=process,
+        stdout_handle=stdout_handle,
+        stderr_handle=stderr_handle,
+        csv_path=path,
+        stderr_path=stderr_path,
+        interval_seconds=interval_ms / 1000.0,
+        started_epoch_seconds=started_epoch_seconds,
+        started_monotonic=started_monotonic,
+    )
+    sampler.monitor_thread = threading.Thread(
+        target=_monitor_gpu_sampler,
+        args=(sampler,),
+        name="gpu-sampler-monitor",
+        daemon=True,
+    )
+    sampler.monitor_thread.start()
+    return sampler
+
+
+def stop_gpu_sampler(sampler: GpuSampler | None) -> dict[str, Any]:
+    if sampler is None:
+        return {
+            "sampler_started": False,
+            "unexpected_exit": True,
+            "unexpected_exit_returncode": None,
+            "unexpected_exit_epoch_seconds": None,
+            "shutdown_returncode": None,
+            "termination_requested": False,
+            "kill_required": False,
+            "monitor_error": "sampler session is missing",
+        }
+
+    returncode_before_shutdown = _observe_gpu_sampler(sampler)
+    sampler.stop_event.set()
+    if sampler.monitor_thread is not None:
+        sampler.monitor_thread.join(timeout=max(2.0, sampler.interval_seconds * 5))
+        if sampler.monitor_thread.is_alive() and sampler.monitor_error is None:
+            sampler.monitor_error = "sampler monitor thread did not stop"
+
+    termination_requested = returncode_before_shutdown is None
+    kill_required = False
+    shutdown_returncode = returncode_before_shutdown
+    try:
+        if termination_requested:
+            sampler.process.terminate()
+            try:
+                shutdown_returncode = sampler.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                kill_required = True
+                sampler.process.kill()
+                shutdown_returncode = sampler.process.wait(timeout=5)
+    except Exception as exc:
+        if sampler.monitor_error is None:
+            sampler.monitor_error = f"shutdown {type(exc).__name__}: {exc}"
+    finally:
+        sampler.stdout_handle.close()
+        sampler.stderr_handle.close()
+
+    return {
+        "sampler_started": True,
+        "unexpected_exit": sampler.unexpected_exit_returncode is not None,
+        "unexpected_exit_returncode": sampler.unexpected_exit_returncode,
+        "unexpected_exit_epoch_seconds": sampler.unexpected_exit_epoch_seconds,
+        "shutdown_returncode": shutdown_returncode,
+        "termination_requested": termination_requested,
+        "kill_required": kill_required,
+        "monitor_error": sampler.monitor_error,
+        "sampler_started_epoch_seconds": sampler.started_epoch_seconds,
+        "sampler_runtime_seconds": time.perf_counter() - sampler.started_monotonic,
+    }
+
+
+def _canonical_gpu_header(value: str) -> str:
+    value = re.sub(r"\s*\[[^]]+\]\s*$", "", value.strip().lower())
+    aliases = {
+        "clocks.current.sm": "clocks.sm",
+        "clocks.current.memory": "clocks.mem",
+    }
+    return aliases.get(value, value)
+
+
+def _parse_gpu_timestamp(value: str) -> float:
+    for timestamp_format in ("%Y/%m/%d %H:%M:%S.%f", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value.strip(), timestamp_format).timestamp()
+        except ValueError:
+            pass
+    raise ValueError(f"unsupported nvidia-smi timestamp: {value!r}")
+
+
+def _parse_required_gpu_number(value: str, *, minimum=0.0, maximum=None) -> float:
+    number = float(value.strip())
+    if not math.isfinite(number) or number < minimum:
+        raise ValueError(f"invalid GPU metric: {value!r}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"GPU metric exceeds {maximum}: {value!r}")
+    return number
+
+
+def _parse_optional_gpu_number(value: str) -> float | None:
+    if value.strip().upper() in {"N/A", "NA", "-"}:
+        return None
+    return _parse_required_gpu_number(value)
+
+
+def validate_gpu_telemetry(
+    csv_path: Path,
+    stderr_path: Path,
+    *,
+    gpu_uuid: str,
+    interval_ms: int,
+    child_started_epoch_seconds: float,
+    child_ended_epoch_seconds: float,
+    sampler_status: dict[str, Any],
+) -> dict[str, Any]:
+    errors: list[dict[str, str]] = []
+
+    def reject(code: str, message: str) -> None:
+        if code not in {item["code"] for item in errors}:
+            errors.append({"code": code, "message": message})
+
+    if not sampler_status.get("sampler_started"):
+        reject("gpu_sampler_not_started", "GPU sampler session is missing")
+    if sampler_status.get("unexpected_exit"):
+        returncode = sampler_status.get("unexpected_exit_returncode")
+        reject(
+            "gpu_sampler_exited_early",
+            f"GPU sampler exited before runner shutdown with return code {returncode}",
+        )
+        if returncode not in (None, 0):
+            reject(
+                "gpu_sampler_abnormal_exit",
+                f"GPU sampler returned non-zero status {returncode}",
+            )
+    if sampler_status.get("monitor_error"):
+        reject(
+            "gpu_sampler_monitor_error",
+            str(sampler_status["monitor_error"]),
+        )
+
+    stderr_text = ""
+    try:
+        stderr_text = stderr_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        reject("gpu_sampler_stderr_unreadable", f"cannot read sampler stderr: {exc}")
+    if stderr_text.strip():
+        reject(
+            "gpu_sampler_stderr_nonempty",
+            "nvidia-smi wrote diagnostics to gpu_sampler.stderr.log",
+        )
+
+    rows: list[list[str]] = []
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.reader(handle))
+    except (OSError, UnicodeError, csv.Error) as exc:
+        reject("gpu_csv_unreadable", f"cannot parse GPU CSV: {exc}")
+
+    expected_header = list(GPU_QUERY_FIELDS)
+    sample_rows: list[list[str]] = []
+    if not rows:
+        reject("gpu_csv_empty", "GPU CSV is empty")
+    else:
+        actual_header = [_canonical_gpu_header(value) for value in rows[0]]
+        if actual_header != expected_header:
+            reject(
+                "gpu_csv_header_invalid",
+                f"GPU CSV header does not match query fields: {actual_header}",
+            )
+        sample_rows = rows[1:]
+        if not sample_rows:
+            reject("gpu_samples_missing", "GPU CSV contains no samples")
+
+    timestamps: list[float] = []
+    utilizations: list[float] = []
+    for position, row in enumerate(sample_rows, start=2):
+        try:
+            if len(row) != len(GPU_QUERY_FIELDS):
+                raise ValueError(
+                    f"expected {len(GPU_QUERY_FIELDS)} fields, found {len(row)}"
+                )
+            timestamp = _parse_gpu_timestamp(row[0])
+            int(row[1].strip())
+            if row[2].strip() != gpu_uuid:
+                raise ValueError(
+                    f"sample UUID {row[2].strip()!r} differs from {gpu_uuid!r}"
+                )
+            if not row[3].strip():
+                raise ValueError("GPU name is empty")
+            utilization = _parse_required_gpu_number(
+                row[4], minimum=0.0, maximum=100.0
+            )
+            _parse_required_gpu_number(row[5], minimum=0.0, maximum=100.0)
+            _parse_required_gpu_number(row[6], minimum=0.0)
+            _parse_optional_gpu_number(row[7])
+            _parse_optional_gpu_number(row[8])
+            _parse_optional_gpu_number(row[9])
+        except (TypeError, ValueError) as exc:
+            reject(
+                "gpu_sample_row_invalid",
+                f"GPU CSV row {position} is invalid: {exc}",
+            )
+            continue
+        timestamps.append(timestamp)
+        utilizations.append(utilization)
+
+    interval_seconds = interval_ms / 1000.0
+    edge_tolerance_seconds = max(1.0, 2.0 * interval_seconds)
+    max_gap_allowed_seconds = max(2.0, 5.0 * interval_seconds)
+    child_duration_seconds = max(
+        0.0, child_ended_epoch_seconds - child_started_epoch_seconds
+    )
+    first_sample = timestamps[0] if timestamps else None
+    last_sample = timestamps[-1] if timestamps else None
+    sample_span_seconds = (
+        max(0.0, last_sample - first_sample)
+        if first_sample is not None and last_sample is not None
+        else 0.0
+    )
+    sample_gaps = [
+        current - previous for previous, current in zip(timestamps, timestamps[1:])
+    ]
+    max_sample_gap_seconds = max(sample_gaps, default=None)
+
+    if any(gap <= 0 for gap in sample_gaps):
+        reject(
+            "gpu_sample_timestamps_non_monotonic",
+            "GPU sample timestamps must be strictly increasing",
+        )
+    if (
+        max_sample_gap_seconds is not None
+        and max_sample_gap_seconds > max_gap_allowed_seconds
+    ):
+        reject(
+            "gpu_sample_gap_excessive",
+            "GPU CSV contains an interval longer than the allowed gap "
+            f"({max_sample_gap_seconds:.6f}s > {max_gap_allowed_seconds:.6f}s)",
+        )
+
+    coverage_seconds = 0.0
+    coverage_ratio = 0.0
+    start_lag_seconds = None
+    end_lag_seconds = None
+    if first_sample is not None and last_sample is not None:
+        start_lag_seconds = max(
+            0.0, first_sample - child_started_epoch_seconds
+        )
+        end_lag_seconds = max(0.0, child_ended_epoch_seconds - last_sample)
+        coverage_start = max(first_sample, child_started_epoch_seconds)
+        coverage_end = min(
+            last_sample + interval_seconds, child_ended_epoch_seconds
+        )
+        coverage_seconds = max(0.0, coverage_end - coverage_start)
+        if child_duration_seconds > 0:
+            coverage_ratio = min(1.0, coverage_seconds / child_duration_seconds)
+
+        if start_lag_seconds > edge_tolerance_seconds:
+            reject(
+                "gpu_coverage_start_late",
+                "first GPU sample is too late after child start "
+                f"({start_lag_seconds:.6f}s > {edge_tolerance_seconds:.6f}s)",
+            )
+        if end_lag_seconds > edge_tolerance_seconds:
+            reject(
+                "gpu_coverage_end_early",
+                "last GPU sample is too early before child end "
+                f"({end_lag_seconds:.6f}s > {edge_tolerance_seconds:.6f}s)",
+            )
+        minimum_coverage_seconds = max(
+            0.0,
+            child_duration_seconds - 2.0 * edge_tolerance_seconds,
+        )
+        if coverage_seconds < minimum_coverage_seconds:
+            reject(
+                "gpu_coverage_insufficient",
+                "GPU telemetry does not cover the child lifecycle within edge "
+                f"tolerances ({coverage_seconds:.6f}s < "
+                f"{minimum_coverage_seconds:.6f}s)",
+            )
+    else:
+        minimum_coverage_seconds = max(
+            0.0,
+            child_duration_seconds - 2.0 * edge_tolerance_seconds,
+        )
+
+    statistics = None
+    if not errors and utilizations:
+        statistics = {
+            "sample_count": len(utilizations),
+            "utilization_gpu_mean_percent": sum(utilizations) / len(utilizations),
+            "utilization_gpu_p50_percent": percentile(utilizations, 0.50),
+            "utilization_gpu_p95_percent": percentile(utilizations, 0.95),
+            "utilization_gpu_max_percent": max(utilizations),
+        }
+
+    return {
+        "schema_version": 1,
+        "valid": not errors,
+        "errors": errors,
+        "error_codes": [item["code"] for item in errors],
+        "csv_path": str(csv_path),
+        "stderr_path": str(stderr_path),
+        "stderr_nonempty": bool(stderr_text.strip()),
+        "sampler_process": sampler_status,
+        "gpu_uuid": gpu_uuid,
+        "requested_interval_ms": interval_ms,
+        "sample_count": len(timestamps),
+        "first_sample_epoch_seconds": first_sample,
+        "last_sample_epoch_seconds": last_sample,
+        "sample_span_seconds": sample_span_seconds,
+        "child_started_epoch_seconds": child_started_epoch_seconds,
+        "child_ended_epoch_seconds": child_ended_epoch_seconds,
+        "child_duration_seconds": child_duration_seconds,
+        "start_lag_seconds": start_lag_seconds,
+        "end_lag_seconds": end_lag_seconds,
+        "coverage_seconds": coverage_seconds,
+        "coverage_ratio": coverage_ratio,
+        "edge_tolerance_seconds": edge_tolerance_seconds,
+        "minimum_coverage_seconds": minimum_coverage_seconds,
+        "max_sample_gap_seconds": max_sample_gap_seconds,
+        "max_gap_allowed_seconds": max_gap_allowed_seconds,
+        "statistics_status": "validated_not_published" if statistics is not None else "invalid_not_published",
+        "utilization_statistics": statistics,
+    }
 
 
 def _latest(root: Path, pattern: str) -> Path | None:
@@ -1111,7 +1506,7 @@ def main(argv=None):
         PROFILE_SAMPLE_ENV: os.environ.get(PROFILE_SAMPLE_ENV),
     }
     request = {
-        "result_schema_version": 2,
+        "result_schema_version": 3,
         "command": command,
         "dataset": args.dataset,
         "seed": args.seed,
@@ -1129,8 +1524,11 @@ def main(argv=None):
                 else "formal_throughput_benchmark"
             )
         ),
-        "protocol_schema_version": 1,
+        "protocol_schema_version": 2,
         "formal_baseline_eligible": False,
+        "gpu_telemetry_required": True,
+        "gpu_telemetry": None,
+        "gpu_statistics_published": False,
         "selection_manifest_required": not bootstrap_inventory,
         "bootstrap_inventory": bootstrap_inventory,
         "formal_manifest_source_verified_at_publish": None,
@@ -1292,6 +1690,7 @@ def main(argv=None):
         )
         return 89
 
+    child_started_epoch_seconds = time.time()
     try:
         completed = subprocess.run(
             command,
@@ -1300,14 +1699,8 @@ def main(argv=None):
             env=controlled_child_environment(),
         )
     finally:
-        if sampler:
-            process, handle = sampler
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            handle.close()
+        child_ended_epoch_seconds = time.time()
+        sampler_status = stop_gpu_sampler(sampler)
     child_wall_seconds = time.perf_counter() - started
     after = shared_tree_snapshot(shared)
     effective_profile_mode = (
@@ -1317,6 +1710,15 @@ def main(argv=None):
     shared_unchanged = before == after
     evidence = validate_execution_evidence(
         output, args, num_epochs=args._benchmark_num_epochs
+    )
+    gpu_telemetry = validate_gpu_telemetry(
+        output / "gpu_utilization.csv",
+        output / "gpu_sampler.stderr.log",
+        gpu_uuid=identity["gpu_uuid"],
+        interval_ms=args.gpu_sample_ms,
+        child_started_epoch_seconds=child_started_epoch_seconds,
+        child_ended_epoch_seconds=child_ended_epoch_seconds,
+        sampler_status=sampler_status,
     )
 
     final_returncode = completed.returncode
@@ -1350,6 +1752,12 @@ def main(argv=None):
         )
         if final_returncode == 0:
             final_returncode = 88
+    if not gpu_telemetry["valid"]:
+        failure_reasons.extend(
+            f"gpu_telemetry:{code}" for code in gpu_telemetry["error_codes"]
+        )
+        if final_returncode == 0:
+            final_returncode = 91
 
     if formal_manifest_source_verified_at_publish is False:
         failure_reasons.append("formal_manifest_source_not_verified_at_publish")
@@ -1357,7 +1765,10 @@ def main(argv=None):
             final_returncode = 90
 
     publish_statistics = (
-        final_returncode == 0 and evidence["valid"] and profile_mode_matches
+        final_returncode == 0
+        and evidence["valid"]
+        and gpu_telemetry["valid"]
+        and profile_mode_matches
         and shared_unchanged
     )
     if publish_statistics:
@@ -1385,7 +1796,7 @@ def main(argv=None):
             "batches_per_second": None,
             "batch_metadata_sha256": None,
             "measurement_identity_sha256": None,
-            "measurement_identity_scope": "unavailable:execution_evidence_invalid",
+            "measurement_identity_scope": "unavailable:publication_gate_failed",
             "measurement_identity_is_content_hash": False,
             "stages": {},
         }
@@ -1400,6 +1811,18 @@ def main(argv=None):
         publish_statistics
         and (bootstrap_inventory or bool(args.torch_trace_batches))
     )
+    gpu_statistics_published = (
+        throughput_statistics_published and gpu_telemetry["valid"]
+    )
+    if gpu_telemetry["valid"]:
+        if gpu_statistics_published:
+            gpu_telemetry["statistics_status"] = "published_formal_benchmark"
+        elif diagnostic_statistics_published:
+            gpu_telemetry["statistics_status"] = (
+                "diagnostic_only_not_formal_baseline"
+            )
+        else:
+            gpu_telemetry["statistics_status"] = "validated_not_published"
     request.update({
         "status": "completed" if final_returncode == 0 else "failed",
         "failure_reasons": failure_reasons,
@@ -1418,9 +1841,11 @@ def main(argv=None):
         "shared_snapshot_after": after,
         "shared_root_unchanged": shared_unchanged,
         "execution_evidence": evidence,
+        "gpu_telemetry": gpu_telemetry,
         "aggregate_published": publish_statistics,
         "statistics_published": throughput_statistics_published,
         "diagnostic_statistics_published": diagnostic_statistics_published,
+        "gpu_statistics_published": gpu_statistics_published,
         "formal_baseline_eligible": throughput_statistics_published,
         "bootstrap_inventory": bootstrap_inventory,
         "aggregate": aggregate_payload,

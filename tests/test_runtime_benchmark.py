@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime
 import hashlib
 import json
 import sys
@@ -70,6 +71,77 @@ def _args(tmp_path, **overrides):
             split_dir.mkdir(parents=True)
             (split_dir / "window.pt").write_bytes(split.encode())
     return args
+
+
+def _valid_gpu_telemetry_payload():
+    return {
+        "schema_version": 1,
+        "valid": True,
+        "errors": [],
+        "error_codes": [],
+        "statistics_status": "published",
+        "utilization_statistics": {
+            "sample_count": 2,
+            "utilization_gpu_mean_percent": 50.0,
+        },
+    }
+
+
+def _mock_valid_gpu_sampler(monkeypatch):
+    monkeypatch.setattr(
+        run_runtime_benchmark, "start_gpu_sampler", lambda *args: None
+    )
+    monkeypatch.setattr(
+        run_runtime_benchmark,
+        "stop_gpu_sampler",
+        lambda sampler: {
+            "sampler_started": True,
+            "unexpected_exit": False,
+            "monitor_error": None,
+        },
+    )
+    monkeypatch.setattr(
+        run_runtime_benchmark,
+        "validate_gpu_telemetry",
+        lambda *args, **kwargs: _valid_gpu_telemetry_payload(),
+    )
+
+
+def _write_gpu_csv(path: Path, timestamps, *, gpu_uuid="GPU-test", corrupt_row=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(run_runtime_benchmark.GPU_QUERY_FIELDS)
+        for timestamp in timestamps:
+            writer.writerow([
+                datetime.fromtimestamp(timestamp).strftime(
+                    "%Y/%m/%d %H:%M:%S.%f"
+                )[:-3],
+                "0",
+                gpu_uuid,
+                "Test GPU",
+                "50",
+                "25",
+                "1024",
+                "100",
+                "1200",
+                "5000",
+            ])
+        if corrupt_row is not None:
+            writer.writerow(corrupt_row)
+
+
+def _healthy_sampler_status():
+    return {
+        "sampler_started": True,
+        "unexpected_exit": False,
+        "unexpected_exit_returncode": None,
+        "unexpected_exit_epoch_seconds": None,
+        "shutdown_returncode": -15,
+        "termination_requested": True,
+        "kill_required": False,
+        "monitor_error": None,
+    }
 
 
 def _write_rows(path: Path, rows):
@@ -400,7 +472,7 @@ def test_execute_keeps_shared_file_list_and_content_hash_unchanged(
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(run_runtime_benchmark.subprocess, "run", fake_run)
-    monkeypatch.setattr(run_runtime_benchmark, "start_gpu_sampler", lambda *a: None)
+    _mock_valid_gpu_sampler(monkeypatch)
     monkeypatch.setattr(
         run_runtime_benchmark, "_gpu_identity",
         lambda **kwargs: {
@@ -426,6 +498,10 @@ def test_execute_keeps_shared_file_list_and_content_hash_unchanged(
     assert _tree_content_snapshot(shared) == before
     result = json.loads((Path(args.artifact_root) / "benchmark_result.json").read_text())
     assert result["shared_root_unchanged"] is True
+    assert result["gpu_statistics_published"] is True
+    assert result["gpu_telemetry"]["statistics_status"] == (
+        "published_formal_benchmark"
+    )
     assert result["effective_profile_mode"] == "off"
     assert result["profile_mode_matches_request"] is True
 
@@ -748,31 +824,55 @@ def test_gpu_sampler_never_falls_back_to_all_devices(tmp_path, monkeypatch):
     assert not (tmp_path / "gpu.csv").exists()
 
 
-def test_gpu_sampler_is_explicitly_bound_to_uuid(tmp_path, monkeypatch):
+def test_gpu_sampler_is_explicitly_bound_to_uuid_and_separates_stderr(
+    tmp_path, monkeypatch
+):
     captured = {}
 
     class FakeProcess:
-        pass
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
 
     def fake_popen(command, **kwargs):
         captured["command"] = command
+        captured["stdout"] = kwargs["stdout"]
+        captured["stderr"] = kwargs["stderr"]
         return FakeProcess()
 
     monkeypatch.setattr(run_runtime_benchmark.shutil, "which", lambda name: "/nvidia-smi")
     monkeypatch.setattr(run_runtime_benchmark.subprocess, "Popen", fake_popen)
-    process, handle = run_runtime_benchmark.start_gpu_sampler(
+    sampler = run_runtime_benchmark.start_gpu_sampler(
         tmp_path / "gpu.csv", 200, "GPU-test"
     )
-    handle.close()
-    assert isinstance(process, FakeProcess)
+    status = run_runtime_benchmark.stop_gpu_sampler(sampler)
+    assert isinstance(sampler.process, FakeProcess)
     assert "--id=GPU-test" in captured["command"]
+    assert "--format=csv,nounits" in captured["command"]
+    assert captured["stdout"] is not captured["stderr"]
+    assert sampler.stderr_path.name == "gpu_sampler.stderr.log"
+    assert captured["stdout"].closed is True
+    assert captured["stderr"].closed is True
+    assert status["unexpected_exit"] is False
+    assert status["shutdown_returncode"] == -15
 
 
-def test_gpu_sampler_start_failure_closes_output_handle(tmp_path, monkeypatch):
+def test_gpu_sampler_start_failure_closes_output_handles(tmp_path, monkeypatch):
     observed = {}
 
     def fail_popen(command, **kwargs):
-        observed["handle"] = kwargs["stdout"]
+        observed["stdout"] = kwargs["stdout"]
+        observed["stderr"] = kwargs["stderr"]
         raise OSError("cannot start")
 
     monkeypatch.setattr(run_runtime_benchmark.shutil, "which", lambda name: "/nvidia-smi")
@@ -781,7 +881,132 @@ def test_gpu_sampler_start_failure_closes_output_handle(tmp_path, monkeypatch):
         run_runtime_benchmark.start_gpu_sampler(
             tmp_path / "gpu.csv", 200, "GPU-test"
         )
-    assert observed["handle"].closed is True
+    assert observed["stdout"].closed is True
+    assert observed["stderr"].closed is True
+
+
+def test_gpu_telemetry_normal_run_covers_child_lifecycle(tmp_path):
+    base = datetime(2026, 1, 1, 0, 0, 0).timestamp()
+    csv_path = tmp_path / "gpu_utilization.csv"
+    stderr_path = tmp_path / "gpu_sampler.stderr.log"
+    _write_gpu_csv(csv_path, [base + step * 0.2 for step in range(26)])
+    stderr_path.write_text("")
+    result = run_runtime_benchmark.validate_gpu_telemetry(
+        csv_path,
+        stderr_path,
+        gpu_uuid="GPU-test",
+        interval_ms=200,
+        child_started_epoch_seconds=base + 0.1,
+        child_ended_epoch_seconds=base + 4.9,
+        sampler_status=_healthy_sampler_status(),
+    )
+    assert result["valid"] is True
+    assert result["sample_count"] == 26
+    assert result["coverage_ratio"] == pytest.approx(1.0)
+    assert result["max_sample_gap_seconds"] == pytest.approx(0.2, abs=0.002)
+    assert result["utilization_statistics"]["utilization_gpu_mean_percent"] == 50.0
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected_codes"),
+    [
+        (0, {"gpu_sampler_exited_early"}),
+        (7, {"gpu_sampler_exited_early", "gpu_sampler_abnormal_exit"}),
+    ],
+)
+def test_gpu_telemetry_rejects_early_and_abnormal_exit(
+    tmp_path, returncode, expected_codes
+):
+    base = datetime(2026, 1, 1, 0, 0, 0).timestamp()
+    csv_path = tmp_path / "gpu_utilization.csv"
+    stderr_path = tmp_path / "gpu_sampler.stderr.log"
+    _write_gpu_csv(csv_path, [base + step * 0.2 for step in range(11)])
+    stderr_path.write_text("")
+    status = _healthy_sampler_status()
+    status.update(
+        unexpected_exit=True,
+        unexpected_exit_returncode=returncode,
+        unexpected_exit_epoch_seconds=base + 1.0,
+        termination_requested=False,
+        shutdown_returncode=returncode,
+    )
+    result = run_runtime_benchmark.validate_gpu_telemetry(
+        csv_path,
+        stderr_path,
+        gpu_uuid="GPU-test",
+        interval_ms=200,
+        child_started_epoch_seconds=base,
+        child_ended_epoch_seconds=base + 2.0,
+        sampler_status=status,
+    )
+    assert result["valid"] is False
+    assert expected_codes <= set(result["error_codes"])
+    assert result["utilization_statistics"] is None
+
+
+def test_gpu_telemetry_rejects_corrupt_output(tmp_path):
+    base = datetime(2026, 1, 1, 0, 0, 0).timestamp()
+    csv_path = tmp_path / "gpu_utilization.csv"
+    stderr_path = tmp_path / "gpu_sampler.stderr.log"
+    _write_gpu_csv(
+        csv_path,
+        [base, base + 0.2],
+        corrupt_row=["Unable to determine the device handle"],
+    )
+    stderr_path.write_text("")
+    result = run_runtime_benchmark.validate_gpu_telemetry(
+        csv_path,
+        stderr_path,
+        gpu_uuid="GPU-test",
+        interval_ms=200,
+        child_started_epoch_seconds=base,
+        child_ended_epoch_seconds=base + 0.4,
+        sampler_status=_healthy_sampler_status(),
+    )
+    assert result["valid"] is False
+    assert "gpu_sample_row_invalid" in result["error_codes"]
+    assert result["utilization_statistics"] is None
+
+
+def test_gpu_telemetry_rejects_sampling_interruption(tmp_path):
+    base = datetime(2026, 1, 1, 0, 0, 0).timestamp()
+    csv_path = tmp_path / "gpu_utilization.csv"
+    stderr_path = tmp_path / "gpu_sampler.stderr.log"
+    _write_gpu_csv(csv_path, [base, base + 0.2, base + 3.0, base + 3.2])
+    stderr_path.write_text("")
+    result = run_runtime_benchmark.validate_gpu_telemetry(
+        csv_path,
+        stderr_path,
+        gpu_uuid="GPU-test",
+        interval_ms=200,
+        child_started_epoch_seconds=base,
+        child_ended_epoch_seconds=base + 3.2,
+        sampler_status=_healthy_sampler_status(),
+    )
+    assert result["valid"] is False
+    assert "gpu_sample_gap_excessive" in result["error_codes"]
+
+
+def test_gpu_telemetry_rejects_insufficient_coverage(tmp_path):
+    base = datetime(2026, 1, 1, 0, 0, 0).timestamp()
+    csv_path = tmp_path / "gpu_utilization.csv"
+    stderr_path = tmp_path / "gpu_sampler.stderr.log"
+    _write_gpu_csv(csv_path, [base + step * 0.2 for step in range(6)])
+    stderr_path.write_text("")
+    result = run_runtime_benchmark.validate_gpu_telemetry(
+        csv_path,
+        stderr_path,
+        gpu_uuid="GPU-test",
+        interval_ms=200,
+        child_started_epoch_seconds=base,
+        child_ended_epoch_seconds=base + 10.0,
+        sampler_status=_healthy_sampler_status(),
+    )
+    assert result["valid"] is False
+    assert "gpu_coverage_end_early" in result["error_codes"]
+    assert "gpu_coverage_insufficient" in result["error_codes"]
+    assert result["coverage_ratio"] < 0.2
+    assert result["utilization_statistics"] is None
 
 
 @pytest.mark.parametrize(
@@ -970,7 +1195,7 @@ def test_incomplete_execute_writes_failed_result_without_statistics(
         "gpu_identity_runtime_verified": True,
     }
     monkeypatch.setattr(run_runtime_benchmark.subprocess, "run", fake_run)
-    monkeypatch.setattr(run_runtime_benchmark, "start_gpu_sampler", lambda *a: None)
+    _mock_valid_gpu_sampler(monkeypatch)
     monkeypatch.setattr(
         run_runtime_benchmark, "_gpu_identity", lambda **kwargs: resolved_gpu
     )
@@ -1054,6 +1279,84 @@ def test_gpu_sampler_start_failure_writes_failed_result(tmp_path, monkeypatch):
     assert _tree_content_snapshot(shared) == before
 
 
+def test_formal_statistics_rejected_when_gpu_telemetry_is_invalid(
+    tmp_path, monkeypatch
+):
+    args = _args(tmp_path, profile_mode="on", basic_timing="on")
+    manifest = tmp_path / "selection.json"
+    _write_valid_manifest(manifest)
+    original_run = run_runtime_benchmark.subprocess.run
+
+    def fake_run(command, **kwargs):
+        if "--artifact-root" not in command:
+            return original_run(command, **kwargs)
+        output = Path(command[command.index("--artifact-root") + 1])
+        _write_runtime_receipt(output)
+        _write_rows(output / "profiling/perf_batches.csv", _complete_rows())
+        (output / "profiling/perf_profile.json").write_text(
+            json.dumps({"enabled": True, "status": "completed"})
+        )
+        return SimpleNamespace(returncode=0)
+
+    resolved_gpu = {
+        "gpu_uuid": "GPU-test",
+        "gpu_uuids": ["GPU-test"],
+        "cuda_visible_devices": "GPU-test",
+        "nvidia_visible_devices": None,
+        "cuda_device_order": None,
+        "gpu_identity_scope": "test",
+        "gpu_mapping_validation_status": "validated_test_mapping",
+        "gpu_identity_runtime_verified": True,
+    }
+    monkeypatch.setattr(run_runtime_benchmark.subprocess, "run", fake_run)
+    _mock_valid_gpu_sampler(monkeypatch)
+    monkeypatch.setattr(
+        run_runtime_benchmark,
+        "validate_gpu_telemetry",
+        lambda *args, **kwargs: {
+            "schema_version": 1,
+            "valid": False,
+            "errors": [{
+                "code": "gpu_coverage_insufficient",
+                "message": "fault-injected incomplete coverage",
+            }],
+            "error_codes": ["gpu_coverage_insufficient"],
+            "statistics_status": "invalid_not_published",
+            "utilization_statistics": None,
+        },
+    )
+    monkeypatch.setattr(
+        run_runtime_benchmark, "_gpu_identity", lambda **kwargs: resolved_gpu
+    )
+    argv = [
+        "--dataset", args.dataset,
+        "--config", args.config,
+        "--artifact-root", args.artifact_root,
+        "--shared-artifact-root", args.shared_artifact_root,
+        "--windows", "2",
+        "--profile-mode", "on",
+        "--selection-manifest", str(manifest),
+        "--basic-timing", "on",
+        "--execute",
+    ]
+    assert run_runtime_benchmark.main(argv) == 91
+    output = Path(args.artifact_root)
+    result = json.loads((output / "benchmark_result.json").read_text())
+    assert result["status"] == "failed"
+    assert result["child_returncode"] == 0
+    assert result["gpu_telemetry"]["valid"] is False
+    assert result["gpu_telemetry"]["utilization_statistics"] is None
+    assert result["aggregate_published"] is False
+    assert result["statistics_published"] is False
+    assert result["gpu_statistics_published"] is False
+    assert result["formal_baseline_eligible"] is False
+    assert result["aggregate"]["statistics_status"] == "invalid_not_published"
+    assert "gpu_telemetry:gpu_coverage_insufficient" in result["failure_reasons"]
+    assert (output / "runtime.json").is_file()
+    assert (output / "profiling/perf_batches.csv").is_file()
+    assert (output / "profiling/perf_profile.json").is_file()
+
+
 def test_complete_pure_off_execute_uses_receipt_without_publishing_throughput(
     tmp_path, monkeypatch
 ):
@@ -1082,7 +1385,7 @@ def test_complete_pure_off_execute_uses_receipt_without_publishing_throughput(
         "gpu_identity_runtime_verified": True,
     }
     monkeypatch.setattr(run_runtime_benchmark.subprocess, "run", fake_run)
-    monkeypatch.setattr(run_runtime_benchmark, "start_gpu_sampler", lambda *a: None)
+    _mock_valid_gpu_sampler(monkeypatch)
     monkeypatch.setattr(
         run_runtime_benchmark, "_gpu_identity", lambda **kwargs: resolved_gpu
     )
@@ -1276,7 +1579,7 @@ def test_bootstrap_execute_is_diagnostic_and_still_requires_strict_gpu(
 
     monkeypatch.setattr(run_runtime_benchmark.subprocess, "run", fake_run)
     monkeypatch.setattr(run_runtime_benchmark, "_gpu_identity", fake_gpu_identity)
-    monkeypatch.setattr(run_runtime_benchmark, "start_gpu_sampler", lambda *a: None)
+    _mock_valid_gpu_sampler(monkeypatch)
     argv = [
         "--dataset", args.dataset,
         "--config", args.config,
@@ -1296,13 +1599,17 @@ def test_bootstrap_execute_is_diagnostic_and_still_requires_strict_gpu(
     assert gpu_calls == [False, True]
     assert result["status"] == "completed"
     assert result["run_protocol"] == "bootstrap_inventory_diagnostic"
-    assert result["protocol_schema_version"] == 1
+    assert result["protocol_schema_version"] == 2
     assert result["bootstrap_inventory"] is True
     assert result["selection_manifest_required"] is False
     assert result["formal_manifest_source_verified_at_publish"] is None
     assert result["formal_baseline_eligible"] is False
     assert result["statistics_published"] is False
     assert result["diagnostic_statistics_published"] is True
+    assert result["gpu_statistics_published"] is False
+    assert result["gpu_telemetry"]["statistics_status"] == (
+        "diagnostic_only_not_formal_baseline"
+    )
     assert result["aggregate_published"] is True
     assert result["execution_evidence"]["valid"] is True
     assert result["aggregate"]["statistics_status"] == (
@@ -1555,7 +1862,7 @@ def test_formal_source_change_during_run_blocks_statistics_publication(
         "gpu_identity_runtime_verified": True,
     }
     monkeypatch.setattr(run_runtime_benchmark.subprocess, "run", fake_run)
-    monkeypatch.setattr(run_runtime_benchmark, "start_gpu_sampler", lambda *a: None)
+    _mock_valid_gpu_sampler(monkeypatch)
     monkeypatch.setattr(
         run_runtime_benchmark, "_gpu_identity", lambda **kwargs: resolved_gpu
     )
