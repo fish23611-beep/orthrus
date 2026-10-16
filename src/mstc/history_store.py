@@ -235,7 +235,9 @@ class HistoryStore:
         3. Scatter into per-node slots
         4. Merge with existing history and keep top-K
         """
-        device = nodes.device
+        # History storage may intentionally remain on CPU while the encoder
+        # and its input batch live on CUDA.
+        device = self._count.device
         cap = self.candidate_capacity
         profiler = get_profiler()
         detail = profiler.detail_active
@@ -247,94 +249,102 @@ class HistoryStore:
         timestamps_cpu = timestamps.cpu()
         directions_cpu = directions.cpu() if directions is not None else None
 
-        sorted_idx = _stable_lexsort_desc(timestamps_cpu, event_ids_cpu)
-
-        sorted_nodes = nodes_cpu[sorted_idx]
-        sorted_neighbors = neighbors_cpu[sorted_idx]
-        sorted_events = event_ids_cpu[sorted_idx]
-        sorted_times = timestamps_cpu[sorted_idx]
-        sorted_dirs = directions_cpu[sorted_idx] if directions_cpu is not None else None
-
-        node_list = sorted_nodes.unique().tolist()
+        valid_node_mask = (nodes_cpu >= 0) & (nodes_cpu < self.num_nodes)
+        touched_nodes = nodes_cpu[valid_node_mask].unique(sorted=True)
         if sort_started is not None:
             profiler.record(
                 "training.history_store.insert_sort_prepare",
                 perf_counter() - sort_started,
                 parent="training.T_history_insert",
             )
-        if not node_list:
+        num_touched = int(touched_nodes.numel())
+        if num_touched == 0:
             return
 
         merge_started = perf_counter() if detail else None
-        for n in node_list:
-            if n < 0 or n >= self.num_nodes:
-                continue
+        existing_counts = self._count[touched_nodes.to(device)].cpu().long()
+        existing_mask = (
+            torch.arange(cap, dtype=torch.long).unsqueeze(0)
+            < existing_counts.unsqueeze(1)
+        )
+        existing_nodes = touched_nodes.unsqueeze(1).expand(-1, cap)[existing_mask]
+        touched_on_store = touched_nodes.to(device)
+        existing_neighbors = self._neighbor_id[touched_on_store].cpu()[existing_mask]
+        existing_events = self._event_id[touched_on_store].cpu()[existing_mask]
+        existing_times = self._timestamp_ns[touched_on_store].cpu()[existing_mask]
 
-            mask = sorted_nodes == n
-            n_events = mask.sum().item()
+        new_nodes = nodes_cpu[valid_node_mask]
+        all_nodes = torch.cat([existing_nodes, new_nodes])
+        all_neighbors = torch.cat([
+            existing_neighbors,
+            neighbors_cpu[valid_node_mask],
+        ])
+        all_events = torch.cat([
+            existing_events,
+            event_ids_cpu[valid_node_mask],
+        ])
+        all_times = torch.cat([
+            existing_times,
+            timestamps_cpu[valid_node_mask],
+        ])
+        all_dirs = None
+        if self._direction is not None:
+            if directions_cpu is None:
+                raise ValueError("directions are required when store_direction is enabled")
+            existing_dirs = self._direction[touched_on_store].cpu()[existing_mask]
+            all_dirs = torch.cat([existing_dirs, directions_cpu[valid_node_mask]])
 
-            n_neighbors = sorted_neighbors[mask]
-            n_events_ids = sorted_events[mask]
-            n_times = sorted_times[mask]
-            n_dirs = sorted_dirs[mask] if sorted_dirs is not None else None
+        # Stable least-significant-key-first sorting is overflow safe and
+        # preserves the old tie semantics: existing equal-key records precede
+        # new records, and equal-key new records retain expanded input order.
+        order = torch.argsort(all_events, descending=True, stable=True)
+        order = order[
+            torch.argsort(all_times[order], descending=True, stable=True)
+        ]
+        order = order[torch.argsort(all_nodes[order], stable=True)]
 
-            existing_count = int(self._count[n].item())
+        sorted_nodes = all_nodes[order]
+        _, records_per_node = torch.unique_consecutive(
+            sorted_nodes, return_counts=True
+        )
+        group_starts = records_per_node.cumsum(0) - records_per_node
+        rank_within_node = torch.arange(sorted_nodes.numel()) - torch.repeat_interleave(
+            group_starts, records_per_node
+        )
+        keep_mask = rank_within_node < cap
+        kept_order = order[keep_mask]
+        kept_nodes = all_nodes[kept_order]
+        kept_columns = rank_within_node[keep_mask]
+        kept_rows = torch.searchsorted(touched_nodes, kept_nodes)
 
-            all_neighbors = torch.cat([
-                self._neighbor_id[n, :existing_count].cpu(),
-                n_neighbors,
-            ])
-            all_events = torch.cat([
-                self._event_id[n, :existing_count].cpu(),
-                n_events_ids,
-            ])
-            all_times = torch.cat([
-                self._timestamp_ns[n, :existing_count].cpu(),
-                n_times,
-            ])
-            all_dirs = (
-                torch.cat([
-                    self._direction[n, :existing_count].cpu(),
-                    n_dirs,
-                ])
-                if self._direction is not None and n_dirs is not None
-                else (
-                    self._direction[n, :existing_count].cpu()
-                    if self._direction is not None
-                    else None
-                )
+        merged_neighbors = torch.full((num_touched, cap), -1, dtype=torch.int64)
+        merged_events = torch.full_like(merged_neighbors, -1)
+        merged_times = torch.full_like(merged_neighbors, -1)
+        merged_neighbors[kept_rows, kept_columns] = all_neighbors[kept_order]
+        merged_events[kept_rows, kept_columns] = all_events[kept_order]
+        merged_times[kept_rows, kept_columns] = all_times[kept_order]
+
+        self._neighbor_id[touched_on_store] = merged_neighbors.to(device)
+        self._event_id[touched_on_store] = merged_events.to(device)
+        self._timestamp_ns[touched_on_store] = merged_times.to(device)
+        if self._direction is not None and all_dirs is not None:
+            merged_dirs = torch.full(
+                (num_touched, cap), -1, dtype=self._direction.dtype
             )
-
-            sorted_idx_all = _stable_lexsort_desc(all_times, all_events)
-
-            all_neighbors = all_neighbors[sorted_idx_all]
-            all_events = all_events[sorted_idx_all]
-            all_times = all_times[sorted_idx_all]
-            if all_dirs is not None:
-                all_dirs = all_dirs[sorted_idx_all]
-
-            keep = min(len(all_neighbors), cap)
-
-            self._neighbor_id[n, :keep] = all_neighbors[:keep].to(device)
-            self._event_id[n, :keep] = all_events[:keep].to(device)
-            self._timestamp_ns[n, :keep] = all_times[:keep].to(device)
-            if self._direction is not None and all_dirs is not None:
-                self._direction[n, :keep] = all_dirs[:keep].to(device)
-            if keep < cap:
-                self._neighbor_id[n, keep:].fill_(-1)
-                self._event_id[n, keep:].fill_(-1)
-                self._timestamp_ns[n, keep:].fill_(-1)
-                if self._direction is not None:
-                    self._direction[n, keep:].fill_(-1)
-
-            self._count[n] = keep
+            merged_dirs[kept_rows, kept_columns] = all_dirs[kept_order].to(
+                merged_dirs.dtype
+            )
+            self._direction[touched_on_store] = merged_dirs.to(device)
+        self._count[touched_on_store] = records_per_node.clamp_max(cap).to(
+            device=device, dtype=self._count.dtype
+        )
         if merge_started is not None:
             profiler.record(
                 "training.history_store.insert_node_merge",
                 perf_counter() - merge_started,
                 parent="training.T_history_insert",
             )
-        profiler.record_batch_stat("history_insert_nodes", len(node_list))
+        profiler.record_batch_stat("history_insert_nodes", num_touched)
 
     # ------------------------------------------------------------------
     # query
