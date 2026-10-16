@@ -214,6 +214,43 @@ def test_dedup_by_event_id_preserves_reverse_events_and_features():
     assert call["edge_feats"].size(0) == 2
 
 
+def test_scan_scale_batches_full_data_validation_without_reordering():
+    encoder, _, _ = _make_encoder()
+
+    class CountingFullData:
+        def __init__(self):
+            self.src = torch.zeros(14, dtype=torch.long)
+            self.dst = torch.zeros(14, dtype=torch.long)
+            self.t = torch.zeros(14, dtype=torch.long)
+            self.src[10], self.dst[10], self.t[10] = 0, 1, 90
+            self.src[11], self.dst[11], self.t[11] = 2, 0, 80
+            self.src[12], self.dst[12], self.t[12] = 1, 3, 70
+            self.calls = []
+
+        def get_event_values(self, field, event_ids):
+            self.calls.append((field, event_ids.clone()))
+            return getattr(self, field)[event_ids]
+
+    full = CountingFullData()
+    sampled = {
+        "query_nodes": torch.tensor([0, 1]),
+        "long_event_id": torch.tensor([[10, 11, -1], [10, 12, 13]]),
+        "long_neighbor_id": torch.tensor([[1, 2, -1], [7, 3, 4]]),
+        # The duplicate event 10 has an invalid direction deliberately: it
+        # must be skipped before direction validation, as in the scalar path.
+        "long_direction": torch.tensor([[0, 1, -1], [-1, 0, 0]], dtype=torch.int8),
+        "long_timestamp_ns": torch.tensor([[90, 80, -1], [90, 70, 60]]),
+        "long_mask": torch.tensor([[True, True, False], [True, True, False]]),
+    }
+
+    records = encoder._scan_scale("long", sampled, full, torch.device("cpu"))
+
+    assert records == [(10, 0, 1, 0), (11, 0, 2, 1), (12, 1, 3, 0)]
+    assert [field for field, _ in full.calls] == ["src", "dst", "t"]
+    for _, event_ids in full.calls:
+        assert event_ids.tolist() == [10, 11, 12]
+
+
 def test_causal_query_happens_before_insert_and_history_is_visible_next_forward():
     encoder, _, graph = _make_encoder()
     full = _full_data()

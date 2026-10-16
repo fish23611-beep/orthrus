@@ -146,8 +146,9 @@ class MultiScaleOrthrusEncoder(nn.Module):
         neighbors = sampled[f"{scale}_neighbor_id"].cpu()
         directions = sampled[f"{scale}_direction"].cpu()
         masks = sampled[f"{scale}_mask"].cpu()
+        sampled_timestamps = sampled[f"{scale}_timestamp_ns"].cpu()
         query_nodes = sampled["query_nodes"].cpu()
-        records: list[tuple[int, int, int, int]] = []
+        candidates: list[tuple[int, int, int, int, int]] = []
         seen_event_ids: set[int] = set()
         if materialize_started is not None:
             profiler.record(
@@ -156,7 +157,6 @@ class MultiScaleOrthrusEncoder(nn.Module):
                 parent=f"training.scan_scale.{scale}.total",
             )
         loop_started = perf_counter() if detail else None
-        lookup_seconds = 0.0
 
         for q_idx in range(event_ids.size(0)):
             for slot in range(event_ids.size(1)):
@@ -170,21 +170,58 @@ class MultiScaleOrthrusEncoder(nn.Module):
                     raise ValueError(f"history direction must be 0 or 1, got {direction}")
                 query = int(query_nodes[q_idx])
                 neighbor = int(neighbors[q_idx, slot])
-                lookup_started = perf_counter() if detail else None
-                full_src = int(self._full_values(full_data, "src", torch.tensor([event_id]), device)[0])
-                full_dst = int(self._full_values(full_data, "dst", torch.tensor([event_id]), device)[0])
-                full_timestamp = int(self._full_values(full_data, "t", torch.tensor([event_id]), device)[0])
-                if lookup_started is not None:
-                    lookup_seconds += perf_counter() - lookup_started
-                sampled_timestamp = int(sampled[f"{scale}_timestamp_ns"].cpu()[q_idx, slot])
-                expected_src = query if direction == 0 else neighbor
-                expected_dst = neighbor if direction == 0 else query
-                if (full_src, full_dst) != (expected_src, expected_dst):
-                    raise ValueError("history direction and full_data edge endpoints disagree")
-                if full_timestamp != sampled_timestamp:
-                    raise ValueError("history timestamp and full_data timestamp disagree")
+                sampled_timestamp = int(sampled_timestamps[q_idx, slot])
                 seen_event_ids.add(event_id)
-                records.append((event_id, query, neighbor, direction))
+                candidates.append(
+                    (event_id, query, neighbor, direction, sampled_timestamp)
+                )
+
+        lookup_started = perf_counter() if detail else None
+        if candidates:
+            candidate_values = torch.tensor(candidates, dtype=torch.long)
+            lookup_event_ids = candidate_values[:, 0]
+            cpu = lookup_event_ids.device
+            full_src_values = self._full_values(
+                full_data, "src", lookup_event_ids, cpu
+            )
+            full_dst_values = self._full_values(
+                full_data, "dst", lookup_event_ids, cpu
+            )
+            full_timestamp_values = self._full_values(
+                full_data, "t", lookup_event_ids, cpu
+            )
+
+            full_src_values = full_src_values.reshape(-1)
+            full_dst_values = full_dst_values.reshape(-1)
+            full_timestamp_values = full_timestamp_values.reshape(-1)
+            expected_size = len(candidates)
+            if not (
+                full_src_values.numel()
+                == full_dst_values.numel()
+                == full_timestamp_values.numel()
+                == expected_size
+            ):
+                raise ValueError("full_data validation fields have inconsistent sizes")
+
+            queries = candidate_values[:, 1]
+            neighbors = candidate_values[:, 2]
+            forward = candidate_values[:, 3] == 0
+            expected_src = torch.where(forward, queries, neighbors)
+            expected_dst = torch.where(forward, neighbors, queries)
+            if not (
+                torch.equal(full_src_values.long(), expected_src)
+                and torch.equal(full_dst_values.long(), expected_dst)
+            ):
+                raise ValueError("history direction and full_data edge endpoints disagree")
+            if not torch.equal(
+                full_timestamp_values.long(), candidate_values[:, 4]
+            ):
+                raise ValueError("history timestamp and full_data timestamp disagree")
+        lookup_seconds = (
+            perf_counter() - lookup_started if lookup_started is not None else 0.0
+        )
+
+        records = [record[:4] for record in candidates]
         if loop_started is not None:
             loop_seconds = perf_counter() - loop_started
             profiler.record(
