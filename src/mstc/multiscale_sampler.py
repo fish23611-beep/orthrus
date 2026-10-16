@@ -261,9 +261,17 @@ class MultiScaleNeighborLoader:
             parent="training.T_neighbor_sample",
         ):
             history = self.history_store.query(query_nodes, reference_time_ns)
-        if profiler.detail_active and history["count"].device.type == "cpu":
+        if (
+            (profiler.detail_active or profiler.inventory_history_stats)
+            and history["count"].device.type == "cpu"
+        ):
+            history_valid_slots = int(history["count"].sum().item())
+            if profiler.inventory_history_stats:
+                profiler.record_basic_batch_stat(
+                    "history_valid_slots", history_valid_slots
+                )
             profiler.record_batch_stat(
-                "history_valid_slots", int(history["count"].sum().item())
+                "history_valid_slots", history_valid_slots
             )
         index_started = perf_counter() if profiler.detail_active else None
 

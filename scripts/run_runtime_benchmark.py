@@ -83,13 +83,21 @@ def parse_args(argv=None):
     parser.add_argument("--artifact-root", required=True)
     parser.add_argument("--shared-artifact-root", required=True)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--windows", required=True, type=int, choices=(2, 10, 20))
+    parser.add_argument("--windows", required=True, type=int)
     parser.add_argument("--window-start", type=int, default=0)
     parser.add_argument("--selection-manifest")
     parser.add_argument(
         "--bootstrap-inventory",
         action="store_true",
         help="Run a bounded diagnostic inventory; never publishes a formal baseline.",
+    )
+    parser.add_argument(
+        "--selection-inventory",
+        action="store_true",
+        help=(
+            "Collect more than 20 contiguous training windows for selection; "
+            "never publishes a formal baseline."
+        ),
     )
     parser.add_argument("--warmup-epochs", type=int, default=1)
     parser.add_argument("--profile-mode", choices=("on", "off"), required=True)
@@ -261,6 +269,8 @@ def validate_window_manifest(
         "schema_version", "dataset", "source", "source_sha256",
         "source_sha256_scope", "warmup_epochs_excluded", "eligible_epochs",
         "selected_start", "selected_end_exclusive", "window_count",
+        "inventory_result", "inventory_result_sha256",
+        "inventory_result_sha256_scope",
     }
     missing = sorted(required_fields - set(plan))
     if missing:
@@ -277,6 +287,15 @@ def validate_window_manifest(
         raise ValueError("selection manifest source_sha256 must be 64 hexadecimal characters")
     if plan["source_sha256_scope"] != "content_sha256_of_batches_csv_file":
         raise ValueError("selection manifest source_sha256_scope is unsupported")
+    if not isinstance(plan["inventory_result"], str) or not plan["inventory_result"].strip():
+        raise ValueError("selection manifest inventory_result must be a non-empty path")
+    if not _is_sha256(plan["inventory_result_sha256"]):
+        raise ValueError("selection manifest inventory_result_sha256 is invalid")
+    if (
+        plan["inventory_result_sha256_scope"]
+        != "content_sha256_of_benchmark_result_json_file"
+    ):
+        raise ValueError("selection manifest inventory_result_sha256_scope is unsupported")
 
     integer_fields = (
         "warmup_epochs_excluded", "selected_start",
@@ -337,25 +356,91 @@ def validate_window_manifest(
     if actual_source_sha256 != plan["source_sha256"].lower():
         raise ValueError("selection manifest source SHA256 verification failed")
 
+    inventory_result_path = Path(plan["inventory_result"]).expanduser()
+    if not inventory_result_path.is_absolute():
+        inventory_result_path = path.parent / inventory_result_path
+    inventory_result_path = inventory_result_path.resolve(strict=False)
+    if not inventory_result_path.is_file():
+        raise ValueError("selection manifest inventory result does not exist")
+    if _sha256_file(inventory_result_path) != plan["inventory_result_sha256"].lower():
+        raise ValueError("selection manifest inventory result SHA256 verification failed")
+    try:
+        inventory_result = json.loads(inventory_result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("selection manifest inventory result cannot be parsed") from exc
+    evidence = (
+        inventory_result.get("execution_evidence")
+        if isinstance(inventory_result, dict) else None
+    )
+    recorded_measurement = evidence.get("measurement_path") if isinstance(evidence, dict) else None
+    if isinstance(recorded_measurement, str):
+        recorded_measurement_path = Path(recorded_measurement).expanduser()
+        if not recorded_measurement_path.is_absolute():
+            recorded_measurement_path = inventory_result_path.parent / recorded_measurement_path
+        recorded_measurement_path = recorded_measurement_path.resolve(strict=False)
+    else:
+        recorded_measurement_path = None
+    if (
+        not isinstance(inventory_result, dict)
+        or inventory_result.get("result_schema_version") != 3
+        or inventory_result.get("status") != "completed"
+        or inventory_result.get("returncode") != 0
+        or inventory_result.get("run_protocol") != "selection_inventory_diagnostic"
+        or inventory_result.get("selection_inventory") is not True
+        or inventory_result.get("formal_baseline_eligible") is not False
+        or inventory_result.get("statistics_published") is not False
+        or inventory_result.get("diagnostic_statistics_published") is not True
+        or inventory_result.get("dataset") != args.dataset
+        or not isinstance(evidence, dict)
+        or evidence.get("valid") is not True
+        or evidence.get("measurement_source") != "basic_timing"
+        or evidence.get("measurement_sha256") != plan["source_sha256"].lower()
+        or recorded_measurement_path != source
+    ):
+        raise ValueError("selection manifest inventory result provenance is invalid")
+
     try:
         with source.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
-            if not {"epoch", "window_index"} <= set(reader.fieldnames or []):
+            required_columns = {
+                "batch_index", "epoch", "window_index", "batch_events",
+                "history_valid_slots", "total_seconds",
+            }
+            if not required_columns <= set(reader.fieldnames or []):
                 raise ValueError(
-                    "selection manifest source Batch CSV lacks epoch/window_index"
+                    "selection manifest source Batch CSV lacks required fields"
                 )
             source_pairs = set()
+            batch_indices = []
             for position, row in enumerate(reader):
                 try:
+                    batch_index = int(row["batch_index"])
                     epoch = int(row["epoch"])
                     window_index = int(row["window_index"])
+                    batch_events = int(row["batch_events"])
+                    history_valid_slots = int(row["history_valid_slots"])
+                    total_seconds = float(row["total_seconds"])
                 except (KeyError, TypeError, ValueError) as exc:
                     raise ValueError(
-                        "selection manifest source Batch CSV has invalid "
-                        f"epoch/window_index at row {position + 2}"
+                        "selection manifest source Batch CSV has invalid record "
+                        f"at row {position + 2}"
                     ) from exc
+                if (
+                    batch_index <= 0 or epoch <= 0 or window_index < 0
+                    or batch_events <= 0 or history_valid_slots < 0
+                    or not math.isfinite(total_seconds) or total_seconds <= 0
+                ):
+                    raise ValueError(
+                        "selection manifest source Batch CSV has invalid record "
+                        f"at row {position + 2}"
+                    )
+                batch_indices.append(batch_index)
                 if epoch > args.warmup_epochs:
                     source_pairs.add((epoch, window_index))
+            if len(batch_indices) != len(set(batch_indices)):
+                raise ValueError("selection manifest source Batch CSV has duplicate records")
+            if sorted(batch_indices) != list(range(1, len(batch_indices) + 1)):
+                raise ValueError("selection manifest source Batch CSV is incomplete")
     except OSError as exc:
         raise ValueError(
             f"selection manifest source Batch CSV cannot be read: {source}"
@@ -395,6 +480,8 @@ def validate_window_manifest(
         "source_content_verified": source_verified,
         "source_verification_status": source_status,
         "source_observed_epoch_window_count": len(source_pairs),
+        "inventory_result": str(inventory_result_path),
+        "inventory_result_sha256": plan["inventory_result_sha256"].lower(),
     }
 
 
@@ -602,10 +689,15 @@ def validate_shared_training_inputs(args, shared: Path) -> dict[str, Any]:
 def validate(args):
     epochs = validate_config_semantics(args.config)
     bootstrap_inventory = bool(getattr(args, "bootstrap_inventory", False))
+    selection_inventory = bool(getattr(args, "selection_inventory", False))
+    if bootstrap_inventory and selection_inventory:
+        raise ValueError("inventory modes are mutually exclusive")
     if args.seed != 0:
         raise ValueError("formal E3/E5 benchmark requires --seed 0")
     if args.window_start < 0 or args.torch_trace_batches < 0:
         raise ValueError("window and trace counts must be non-negative")
+    if args.windows <= 0:
+        raise ValueError("window count must be positive")
     if args.warmup_epochs < 0 or args.warmup_epochs >= epochs:
         raise ValueError(
             f"warmup epochs must be in [0, {epochs - 1}], got {args.warmup_epochs}"
@@ -624,7 +716,23 @@ def validate(args):
         if args.torch_trace_batches:
             raise ValueError("bootstrap inventory does not allow Torch trace")
         manifest = None
+    elif selection_inventory:
+        if args.windows <= 20:
+            raise ValueError("selection inventory requires more than 20 windows")
+        if args.window_start != 0:
+            raise ValueError("selection inventory requires --window-start 0")
+        if args.selection_manifest:
+            raise ValueError("selection inventory must not use a selection manifest")
+        if args.profile_mode != "off" or args.basic_timing != "on":
+            raise ValueError(
+                "selection inventory requires --profile-mode off --basic-timing on"
+            )
+        if args.torch_trace_batches:
+            raise ValueError("selection inventory does not allow Torch trace")
+        manifest = None
     else:
+        if args.windows not in (2, 10, 20):
+            raise ValueError("formal benchmark allows only 2, 10, or 20 windows")
         if args.windows != 20 and args.window_start != 0:
             raise ValueError(
                 "non-zero --window-start requires the 20-window manifest case"
@@ -637,11 +745,17 @@ def validate(args):
     if args.profile_mode == "off" and args.torch_trace_batches:
         raise ValueError("torch trace requires --profile-mode on")
     roots = resolve_isolated_roots(args)
-    validate_shared_training_inputs(args, roots[1])
+    shared_inputs = validate_shared_training_inputs(args, roots[1])
+    if selection_inventory and shared_inputs["split_file_counts"]["train"] < args.windows:
+        raise ValueError(
+            "selection inventory requested more windows than the shared train split provides"
+        )
     args._benchmark_num_epochs = epochs
     args._validated_manifest = manifest
     args._benchmark_protocol = (
-        "bootstrap_inventory" if bootstrap_inventory else "formal"
+        "bootstrap_inventory" if bootstrap_inventory else (
+            "selection_inventory" if selection_inventory else "formal"
+        )
     )
     return roots
 
@@ -670,6 +784,8 @@ def build_command(args, *, roots=None):
     ]
     if args.basic_timing == "on":
         command.append("--benchmark-basic-timing")
+    if bool(getattr(args, "selection_inventory", False)):
+        command.append("--benchmark-inventory-history-stats")
     if args.profile_mode == "on":
         command += ["--perf-profile", "--perf-profile-sample-every-n-batches", "1"]
         if args.torch_trace_batches:
@@ -1188,6 +1304,8 @@ def validate_execution_evidence(root: Path, args, *, num_epochs: int) -> dict[st
     }
 
     receipt_by_pair: dict[tuple[int, int], dict[str, Any]] = {}
+    window_id_by_index: dict[int, Any] = {}
+    window_index_by_id: dict[str, int] = {}
     for position, item in enumerate(receipt_windows):
         if not isinstance(item, dict):
             reject("execution_receipt_invalid", f"receipt window {position} is not an object")
@@ -1195,6 +1313,7 @@ def validate_execution_evidence(root: Path, args, *, num_epochs: int) -> dict[st
         try:
             epoch = int(item["epoch"])
             window_index = int(item["window_index"])
+            window_id = item["window_id"]
             event_count = int(item["event_count"])
             expected_batches = int(item["expected_batch_count"])
         except (KeyError, TypeError, ValueError):
@@ -1207,6 +1326,24 @@ def validate_execution_evidence(root: Path, args, *, num_epochs: int) -> dict[st
         if event_count < 0 or expected_batches < 0:
             reject("execution_receipt_invalid", f"receipt has negative counts for {pair}")
             continue
+        if window_id is None or isinstance(window_id, (dict, list, bool)):
+            reject("execution_receipt_invalid", f"receipt has invalid window_id for {pair}")
+            continue
+        window_id_key = json.dumps(window_id, ensure_ascii=False, sort_keys=True)
+        if (
+            window_index in window_id_by_index
+            and window_id_by_index[window_index] != window_id
+        ) or (
+            window_id_key in window_index_by_id
+            and window_index_by_id[window_id_key] != window_index
+        ):
+            reject(
+                "receipt_window_identity_mismatch",
+                "execution receipt window_id/window_index mapping is not one-to-one",
+            )
+            continue
+        window_id_by_index[window_index] = window_id
+        window_index_by_id[window_id_key] = window_index
         receipt_by_pair[pair] = {
             "event_count": event_count,
             "expected_batch_count": expected_batches,
@@ -1255,15 +1392,19 @@ def validate_execution_evidence(root: Path, args, *, num_epochs: int) -> dict[st
         reject("unexpected_measurement_rows", "pure-off run unexpectedly produced Batch timing rows")
 
     parsed_rows: list[dict[str, Any]] = []
+    selection_inventory = bool(getattr(args, "selection_inventory", False))
     for position, row in enumerate(rows):
         try:
-            parsed_rows.append({
+            parsed = {
                 "batch_index": int(row["batch_index"]),
                 "epoch": int(row["epoch"]),
                 "window_index": int(row["window_index"]),
                 "batch_events": int(row["batch_events"]),
                 "total_seconds": float(row["total_seconds"]),
-            })
+            }
+            if selection_inventory:
+                parsed["history_valid_slots"] = int(row["history_valid_slots"])
+            parsed_rows.append(parsed)
         except (KeyError, TypeError, ValueError):
             reject("measurement_row_invalid", f"Batch row {position} has invalid required fields")
 
@@ -1277,6 +1418,11 @@ def validate_execution_evidence(root: Path, args, *, num_epochs: int) -> dict[st
             reject(
                 "measurement_row_invalid",
                 f"Batch row {position} must contain a finite positive duration",
+            )
+        if selection_inventory and row["history_valid_slots"] < 0:
+            reject(
+                "measurement_row_invalid",
+                f"Batch row {position} must contain a non-negative history count",
             )
 
     if parsed_rows:
@@ -1342,6 +1488,7 @@ def validate_execution_evidence(root: Path, args, *, num_epochs: int) -> dict[st
         "runtime_path": str(runtime_path) if runtime_path else None,
         "measurement_source": source_kind,
         "measurement_path": str(source_path) if source_path else None,
+        "measurement_sha256": _sha256_file(source_path),
         "batch_rows_required": batch_rows_required,
         "batch_row_count": len(parsed_rows),
         "expected_execution_window_indices": sorted(execution_window_indices),
@@ -1486,6 +1633,8 @@ def main(argv=None):
     args = parse_args(argv)
     roots = validate(args)
     bootstrap_inventory = args._benchmark_protocol == "bootstrap_inventory"
+    selection_inventory = args._benchmark_protocol == "selection_inventory"
+    diagnostic_inventory = bootstrap_inventory or selection_inventory
     output, shared = roots
     command = build_command(args, roots=roots)
     manifest_validation = getattr(args, "_validated_manifest", None)
@@ -1518,6 +1667,8 @@ def main(argv=None):
         "run_protocol": (
             "bootstrap_inventory_diagnostic"
             if bootstrap_inventory
+            else "selection_inventory_diagnostic"
+            if selection_inventory
             else (
                 "torch_trace_diagnostic"
                 if args.torch_trace_batches
@@ -1529,8 +1680,9 @@ def main(argv=None):
         "gpu_telemetry_required": True,
         "gpu_telemetry": None,
         "gpu_statistics_published": False,
-        "selection_manifest_required": not bootstrap_inventory,
+        "selection_manifest_required": not diagnostic_inventory,
         "bootstrap_inventory": bootstrap_inventory,
+        "selection_inventory": selection_inventory,
         "formal_manifest_source_verified_at_publish": None,
         "shared_artifact_root": str(shared),
         "shared_input_preflight": validate_shared_training_inputs(args, shared),
@@ -1723,7 +1875,7 @@ def main(argv=None):
 
     final_returncode = completed.returncode
     formal_manifest_source_verified_at_publish = None
-    if not bootstrap_inventory:
+    if not diagnostic_inventory:
         try:
             source_path = Path(manifest_validation["source"])
             formal_manifest_source_verified_at_publish = (
@@ -1781,9 +1933,11 @@ def main(argv=None):
             warmup_epochs=args.warmup_epochs,
             torch_trace_batches=args.torch_trace_batches,
         )
-        if bootstrap_inventory:
+        if diagnostic_inventory:
             aggregate_payload["statistics_status"] = (
                 "diagnostic_bootstrap_inventory_not_formal_baseline"
+                if bootstrap_inventory
+                else "diagnostic_selection_inventory_not_formal_baseline"
             )
             aggregate_payload["events_per_second"] = None
             aggregate_payload["batches_per_second"] = None
@@ -1803,13 +1957,13 @@ def main(argv=None):
 
     throughput_statistics_published = (
         publish_statistics
-        and not bootstrap_inventory
+        and not diagnostic_inventory
         and not args.torch_trace_batches
         and aggregate_payload.get("measured_batch_count", 0) > 0
     )
     diagnostic_statistics_published = (
         publish_statistics
-        and (bootstrap_inventory or bool(args.torch_trace_batches))
+        and (diagnostic_inventory or bool(args.torch_trace_batches))
     )
     gpu_statistics_published = (
         throughput_statistics_published and gpu_telemetry["valid"]
@@ -1848,6 +2002,7 @@ def main(argv=None):
         "gpu_statistics_published": gpu_statistics_published,
         "formal_baseline_eligible": throughput_statistics_published,
         "bootstrap_inventory": bootstrap_inventory,
+        "selection_inventory": selection_inventory,
         "aggregate": aggregate_payload,
         "formal_manifest_source_verified_at_publish": (
             formal_manifest_source_verified_at_publish

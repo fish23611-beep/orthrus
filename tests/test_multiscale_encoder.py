@@ -498,9 +498,11 @@ def test_profiler_switch_preserves_outputs_gradients_optimizer_rng_and_history()
     full = _full_data()
     batch = _batch(src=(0,), dst=(2,), t=(100,), event_ids=(3,))
 
-    def execute(enabled):
+    def execute(enabled, *, basic_timing=False, inventory_history_stats=False):
         configure_profiler(
-            enabled=enabled, run_root=None, sample_every_n_batches=1,
+            enabled=enabled, basic_timing=basic_timing, run_root=None,
+            inventory_history_stats=inventory_history_stats,
+            sample_every_n_batches=1,
         )
         torch.manual_seed(202)
         encoder, loader, _ = _make_encoder()
@@ -531,9 +533,16 @@ def test_profiler_switch_preserves_outputs_gradients_optimizer_rng_and_history()
             "rng": torch.get_rng_state().clone(),
             "history": encoder.history_state_dict(),
         }
+        batch_row = dict(profiler._batch_rows[0]) if profiler._batch_rows else {}
         configure_profiler(enabled=False, run_root=None)
-        return result
+        return result, batch_row
 
-    disabled = execute(False)
-    enabled = execute(True)
+    disabled, disabled_row = execute(False)
+    enabled, enabled_row = execute(True)
+    basic, basic_row = execute(
+        False, basic_timing=True, inventory_history_stats=True
+    )
     _assert_nested_tensor_equal(disabled, enabled)
+    _assert_nested_tensor_equal(disabled, basic)
+    assert disabled_row == {}
+    assert basic_row["history_valid_slots"] == enabled_row["history_valid_slots"]

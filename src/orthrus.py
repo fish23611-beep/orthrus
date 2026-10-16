@@ -549,6 +549,9 @@ def run(args):
         enabled=profiler_enabled,
         run_root=run_dir,
         basic_timing=bool(getattr(args, "benchmark_basic_timing", False)),
+        inventory_history_stats=bool(
+            getattr(args, "benchmark_inventory_history_stats", False)
+        ),
         sample_every_n_batches=sample_every,
         metadata={
             "dataset": cfg_pre.dataset.name,
@@ -556,6 +559,9 @@ def run(args):
             "requested_profile_mode": "on" if getattr(args, "perf_profile", False) else "off",
             "effective_profile_mode": "on" if profiler_enabled else "off",
             "basic_timing": bool(getattr(args, "benchmark_basic_timing", False)),
+            "inventory_history_stats": bool(
+                getattr(args, "benchmark_inventory_history_stats", False)
+            ),
         },
         torch_trace_batches=(
             int(getattr(args, "perf_profile_torch_trace_batches", 0) or 0)

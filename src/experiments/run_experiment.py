@@ -74,6 +74,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Record minimal host Batch wall times without enabling detailed profiling.",
     )
     parser.add_argument(
+        "--benchmark-inventory-history-stats", action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--shared-artifact-readonly", action="store_true",
         help=argparse.SUPPRESS,
     )
@@ -136,6 +140,9 @@ def build_pipeline_args(namespace: argparse.Namespace) -> SimpleNamespace:
         max_windows_per_split=namespace.max_windows_per_split,
         perf_profile=getattr(namespace, "perf_profile", False),
         benchmark_basic_timing=getattr(namespace, "benchmark_basic_timing", False),
+        benchmark_inventory_history_stats=getattr(
+            namespace, "benchmark_inventory_history_stats", False
+        ),
         perf_profile_sample_every_n_batches=(
             getattr(namespace, "perf_profile_sample_every_n_batches", None)
         ),

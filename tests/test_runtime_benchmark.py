@@ -48,6 +48,7 @@ def _args(tmp_path, **overrides):
         window_start=0,
         selection_manifest=None,
         bootstrap_inventory=False,
+        selection_inventory=False,
         warmup_epochs=1,
         profile_mode="on",
         basic_timing="on",
@@ -154,6 +155,7 @@ def _write_rows(path: Path, rows):
                 "epoch",
                 "window_index",
                 "batch_events",
+                "history_valid_slots",
                 "total_seconds",
             ],
         )
@@ -171,6 +173,7 @@ def _complete_rows(*, epochs=range(1, 7), window_end=2, events=5):
                 "epoch": epoch,
                 "window_index": window_index,
                 "batch_events": events,
+                "history_valid_slots": window_index,
                 "total_seconds": 0.5,
             })
             batch_index += 1
@@ -208,6 +211,35 @@ def _write_runtime_receipt(root: Path, *, epochs=range(1, 7), window_end=2,
     (root / "runtime.json").write_text(json.dumps(payload))
 
 
+def _write_inventory_result(path: Path, source: Path, *, dataset="THEIA_E3",
+                            warmup=1):
+    with source.open(newline="", encoding="utf-8") as handle:
+        row_count = sum(1 for _ in csv.DictReader(handle))
+    payload = {
+        "result_schema_version": 3,
+        "status": "completed",
+        "returncode": 0,
+        "run_protocol": "selection_inventory_diagnostic",
+        "selection_inventory": True,
+        "formal_baseline_eligible": False,
+        "statistics_published": False,
+        "diagnostic_statistics_published": True,
+        "dataset": dataset,
+        "warmup_epochs": warmup,
+        "requested_profile_mode": "off",
+        "requested_basic_timing": "on",
+        "execution_evidence": {
+            "valid": True,
+            "measurement_source": "basic_timing",
+            "measurement_path": str(source.resolve()),
+            "measurement_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "batch_row_count": row_count,
+        },
+    }
+    path.write_text(json.dumps(payload))
+    return payload
+
+
 def _write_valid_manifest(path: Path, *, dataset="THEIA_E3", start=0, count=2,
                           warmup=1, source_exists=True):
     source = path.with_suffix(".csv")
@@ -216,6 +248,16 @@ def _write_valid_manifest(path: Path, *, dataset="THEIA_E3", start=0, count=2,
     source_sha256 = hashlib.sha256(
         source.read_bytes() if source_exists else b"frozen-source"
     ).hexdigest()
+    inventory_result = path.with_name(path.stem + "-inventory-result.json")
+    if source_exists:
+        _write_inventory_result(
+            inventory_result, source, dataset=dataset, warmup=warmup
+        )
+        inventory_result_sha256 = hashlib.sha256(
+            inventory_result.read_bytes()
+        ).hexdigest()
+    else:
+        inventory_result_sha256 = hashlib.sha256(b"missing-result").hexdigest()
     payload = {
         "schema_version": 2,
         "dataset": dataset,
@@ -223,6 +265,11 @@ def _write_valid_manifest(path: Path, *, dataset="THEIA_E3", start=0, count=2,
         "source": str(source),
         "source_sha256": source_sha256,
         "source_sha256_scope": "content_sha256_of_batches_csv_file",
+        "inventory_result": str(inventory_result),
+        "inventory_result_sha256": inventory_result_sha256,
+        "inventory_result_sha256_scope": (
+            "content_sha256_of_benchmark_result_json_file"
+        ),
         "warmup_epochs_excluded": warmup,
         "eligible_epochs": [2, 3, 4, 5, 6],
         "selected_start": start,
@@ -231,6 +278,17 @@ def _write_valid_manifest(path: Path, *, dataset="THEIA_E3", start=0, count=2,
     }
     path.write_text(json.dumps(payload))
     return payload
+
+
+def _ensure_train_window_count(args, count):
+    shared = Path(args.shared_artifact_root).resolve()
+    _, edge_embeds = run_runtime_benchmark.resolve_expected_shared_inputs(
+        args, shared
+    )
+    train_dir = edge_embeds / "train"
+    existing = sum(1 for path in train_dir.iterdir() if path.is_file())
+    for index in range(existing, count):
+        (train_dir / f"window-{index:03d}.simple").write_bytes(b"train")
 
 
 def test_benchmark_command_preserves_config_dual_roots_and_seed(tmp_path):
@@ -565,6 +623,7 @@ def test_window_planner_excludes_warmup_and_deduplicates_epochs(tmp_path):
         writer = csv.DictWriter(
             handle,
             fieldnames=[
+                "batch_index",
                 "epoch",
                 "window_index",
                 "batch_events",
@@ -573,9 +632,11 @@ def test_window_planner_excludes_warmup_and_deduplicates_epochs(tmp_path):
             ],
         )
         writer.writeheader()
+        batch_index = 1
         for epoch in (1, 2, 3):
             for window in range(25):
                 writer.writerow({
+                    "batch_index": batch_index,
                     "epoch": epoch,
                     "window_index": window,
                     "batch_events": 100 + window,
@@ -584,12 +645,17 @@ def test_window_planner_excludes_warmup_and_deduplicates_epochs(tmp_path):
                         100.0 if epoch == 1 else 1.0 + abs(window - 12) / 100
                     ),
                 })
+                batch_index += 1
+    inventory_result = tmp_path / "inventory-result.json"
+    _write_inventory_result(inventory_result, source)
     output = tmp_path / "plan.json"
     assert plan_runtime_windows.main([
         "--dataset", "THEIA_E3",
         "--batches-csv", str(source),
+        "--inventory-result", str(inventory_result),
         "--window-count", "20",
         "--warmup-epochs", "1",
+        "--expected-epochs", "3",
         "--output", str(output),
     ]) == 0
     plan = json.loads(output.read_text())
@@ -604,6 +670,79 @@ def test_window_planner_excludes_warmup_and_deduplicates_epochs(tmp_path):
     assert plan["window_features"]["0"]["events"] == 100
     assert len(plan["fast_windows"]) == 3
     assert len(plan["slow_windows"]) == 3
+
+
+def _run_planner(tmp_path, source, *, output_name="plan.json"):
+    inventory_result = tmp_path / "inventory-result.json"
+    _write_inventory_result(inventory_result, source)
+    output = tmp_path / output_name
+    plan_runtime_windows.main([
+        "--dataset", "THEIA_E3",
+        "--batches-csv", str(source),
+        "--inventory-result", str(inventory_result),
+        "--window-count", "20",
+        "--warmup-epochs", "1",
+        "--output", str(output),
+    ])
+    return output
+
+
+def test_window_planner_is_deterministic_and_uses_no_test_inputs(tmp_path):
+    source = tmp_path / "inventory.csv"
+    _write_rows(source, _complete_rows(window_end=25))
+    first = _run_planner(tmp_path, source, output_name="first.json")
+    second = _run_planner(tmp_path, source, output_name="second.json")
+    assert first.read_bytes() == second.read_bytes()
+    plan = json.loads(first.read_text())
+    assert not any(key.startswith("test") for key in plan)
+    assert set(plan["selected_feature_means"]) == {
+        "events", "history", "batch_seconds"
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_history", "missing required fields"),
+        ("nonfinite_time", "invalid record"),
+        ("duplicate_batch", "duplicate batch_index"),
+        ("missing_batch", "batch_index sequence is incomplete"),
+    ],
+)
+def test_window_planner_rejects_invalid_batch_records(tmp_path, mutation, message):
+    rows = _complete_rows(window_end=25)
+    if mutation == "nonfinite_time":
+        rows[0]["total_seconds"] = "nan"
+    elif mutation == "duplicate_batch":
+        rows[1]["batch_index"] = rows[0]["batch_index"]
+    elif mutation == "missing_batch":
+        rows.pop(1)
+    source = tmp_path / "inventory.csv"
+    if mutation == "missing_history":
+        with source.open("w", newline="", encoding="utf-8") as handle:
+            fieldnames = [
+                "batch_index", "epoch", "window_index", "batch_events",
+                "total_seconds",
+            ]
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows([
+                {key: row[key] for key in fieldnames} for row in rows
+            ])
+    else:
+        _write_rows(source, rows)
+    inventory_result = tmp_path / "inventory-result.json"
+    _write_inventory_result(inventory_result, source)
+    with pytest.raises(ValueError, match=message):
+        plan_runtime_windows.main([
+            "--dataset", "THEIA_E3",
+            "--batches-csv", str(source),
+            "--inventory-result", str(inventory_result),
+            "--window-count", "20",
+            "--warmup-epochs", "1",
+            "--output", str(tmp_path / "plan.json"),
+        ])
+    assert not (tmp_path / "plan.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -1081,6 +1220,11 @@ def test_manifest_source_must_cover_every_selected_eligible_epoch_window(tmp_pat
     ]
     _write_rows(source, rows)
     payload["source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+    inventory_result = Path(payload["inventory_result"])
+    _write_inventory_result(inventory_result, source)
+    payload["inventory_result_sha256"] = hashlib.sha256(
+        inventory_result.read_bytes()
+    ).hexdigest()
     manifest.write_text(json.dumps(payload))
     args.selection_manifest = str(manifest)
     with pytest.raises(ValueError, match="does not cover every selected"):
@@ -1485,6 +1629,105 @@ def test_formal_execute_without_manifest_is_rejected(tmp_path):
     assert not Path(args.artifact_root).exists()
 
 
+def test_selection_inventory_accepts_more_than_twenty_train_only_windows(tmp_path):
+    args = _args(
+        tmp_path,
+        windows=40,
+        profile_mode="off",
+        basic_timing="on",
+        selection_inventory=True,
+    )
+    _ensure_train_window_count(args, 40)
+    roots = run_runtime_benchmark.validate(args)
+    command = run_runtime_benchmark.build_command(args, roots=roots)
+    assert args._benchmark_protocol == "selection_inventory"
+    assert args._validated_manifest is None
+    assert command[command.index("--max-windows-per-split") + 1] == "40"
+    assert command[command.index("--stages") + 1] == "train"
+    assert "--benchmark-basic-timing" in command
+    assert "--benchmark-inventory-history-stats" in command
+    assert "--perf-profile" not in command
+    assert "--shared-artifact-readonly" in command
+
+
+def test_selection_inventory_rejects_insufficient_train_windows(tmp_path):
+    args = _args(
+        tmp_path,
+        windows=40,
+        profile_mode="off",
+        selection_inventory=True,
+    )
+    with pytest.raises(ValueError, match="more windows than the shared train split"):
+        run_runtime_benchmark.validate(args)
+
+
+def test_selection_inventory_execute_is_diagnostic_only(tmp_path, monkeypatch):
+    args = _args(
+        tmp_path,
+        windows=21,
+        profile_mode="off",
+        basic_timing="on",
+        selection_inventory=True,
+    )
+    _ensure_train_window_count(args, 21)
+    original_run = run_runtime_benchmark.subprocess.run
+
+    def fake_run(command, **kwargs):
+        if "--artifact-root" not in command:
+            return original_run(command, **kwargs)
+        output = Path(command[command.index("--artifact-root") + 1])
+        _write_runtime_receipt(output, window_end=21)
+        _write_rows(
+            output / "benchmark_timing/basic_batches.csv",
+            _complete_rows(window_end=21),
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(run_runtime_benchmark.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        run_runtime_benchmark,
+        "_gpu_identity",
+        lambda **kwargs: {
+            "gpu_uuid": "GPU-test",
+            "gpu_uuids": ["GPU-test"],
+            "cuda_visible_devices": "GPU-test",
+            "nvidia_visible_devices": None,
+            "cuda_device_order": None,
+            "gpu_identity_scope": "test",
+            "gpu_mapping_validation_status": "validated_test_mapping",
+            "gpu_identity_runtime_verified": kwargs.get("require_resolved", False),
+        },
+    )
+    _mock_valid_gpu_sampler(monkeypatch)
+    argv = [
+        "--dataset", args.dataset,
+        "--config", args.config,
+        "--artifact-root", args.artifact_root,
+        "--shared-artifact-root", args.shared_artifact_root,
+        "--windows", "21",
+        "--profile-mode", "off",
+        "--basic-timing", "on",
+        "--selection-inventory",
+        "--execute",
+    ]
+    assert run_runtime_benchmark.main(argv) == 0
+    result = json.loads(
+        (Path(args.artifact_root) / "benchmark_result.json").read_text()
+    )
+    assert result["run_protocol"] == "selection_inventory_diagnostic"
+    assert result["selection_inventory"] is True
+    assert result["selection_manifest_required"] is False
+    assert result["formal_baseline_eligible"] is False
+    assert result["statistics_published"] is False
+    assert result["diagnostic_statistics_published"] is True
+    assert result["execution_evidence"]["valid"] is True
+    assert result["execution_evidence"]["measurement_sha256"]
+    assert result["aggregate"]["statistics_status"] == (
+        "diagnostic_selection_inventory_not_formal_baseline"
+    )
+    assert result["aggregate"]["events_per_second"] is None
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
@@ -1760,12 +2003,33 @@ def test_prefix_windows_execute_but_only_selected_windows_are_aggregated(tmp_pat
     assert result["excluded_other_batch_count"] == 0
 
 
+def test_execution_evidence_rejects_non_unique_window_identity(tmp_path):
+    args = _args(tmp_path, profile_mode="off", basic_timing="on")
+    root = tmp_path / "run"
+    root.mkdir()
+    _write_runtime_receipt(root)
+    runtime_path = root / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    windows = runtime["training"]["execution_receipt"]["windows"]
+    for item in windows:
+        if item["window_index"] == 1:
+            item["window_id"] = 0
+    runtime_path.write_text(json.dumps(runtime))
+    _write_rows(root / "benchmark_timing/basic_batches.csv", _complete_rows())
+    evidence = run_runtime_benchmark.validate_execution_evidence(
+        root, args, num_epochs=6
+    )
+    assert evidence["valid"] is False
+    assert "receipt_window_identity_mismatch" in evidence["error_codes"]
+
+
 def test_ten_window_bootstrap_inventory_cannot_plan_twenty_windows(tmp_path):
     source = tmp_path / "bootstrap_batches.csv"
     with source.open("w", newline="") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=[
+                "batch_index",
                 "epoch",
                 "window_index",
                 "batch_events",
@@ -1774,19 +2038,25 @@ def test_ten_window_bootstrap_inventory_cannot_plan_twenty_windows(tmp_path):
             ],
         )
         writer.writeheader()
+        batch_index = 1
         for epoch in range(1, 7):
             for window_index in range(10):
                 writer.writerow({
+                    "batch_index": batch_index,
                     "epoch": epoch,
                     "window_index": window_index,
                     "batch_events": 100 + window_index,
                     "history_valid_slots": window_index * 10,
                     "total_seconds": 1.0,
                 })
+                batch_index += 1
+    inventory_result = tmp_path / "inventory-result.json"
+    _write_inventory_result(inventory_result, source, dataset="THEIA_E5")
     with pytest.raises(ValueError, match="fewer windows than requested"):
         plan_runtime_windows.main([
             "--dataset", "THEIA_E5",
             "--batches-csv", str(source),
+            "--inventory-result", str(inventory_result),
             "--window-count", "20",
             "--warmup-epochs", "1",
             "--output", str(tmp_path / "manifest.json"),
@@ -1811,6 +2081,7 @@ def test_window_planner_rejects_incomplete_inventory(tmp_path, mutation, message
             if mutation == "missing_epoch" and epoch == 3 and window_index == 12:
                 continue
             rows.append({
+                "batch_index": len(rows) + 1,
                 "epoch": epoch,
                 "window_index": window_index,
                 "batch_events": 100,
@@ -1821,13 +2092,17 @@ def test_window_planner_rejects_incomplete_inventory(tmp_path, mutation, message
         writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
+    inventory_result = tmp_path / "inventory-result.json"
+    _write_inventory_result(inventory_result, source)
     output = tmp_path / "manifest.json"
     with pytest.raises(ValueError, match=message):
         plan_runtime_windows.main([
             "--dataset", "THEIA_E3",
             "--batches-csv", str(source),
+            "--inventory-result", str(inventory_result),
             "--window-count", "20",
             "--warmup-epochs", "1",
+            "--expected-epochs", "3",
             "--output", str(output),
         ])
     assert not output.exists()

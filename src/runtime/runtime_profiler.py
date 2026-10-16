@@ -109,6 +109,7 @@ class RuntimeProfiler:
         enabled: bool,
         run_root: str | os.PathLike[str] | None = None,
         basic_timing: bool = False,
+        inventory_history_stats: bool = False,
         sample_every_n_batches: int = 10,
         raw_sample_limit: int = 2000,
         metadata: dict[str, Any] | None = None,
@@ -125,6 +126,7 @@ class RuntimeProfiler:
             raise ValueError("torch_trace_window_start must be non-negative")
         self.enabled = bool(enabled)
         self.basic_timing = bool(basic_timing)
+        self.inventory_history_stats = bool(inventory_history_stats)
         self.run_root = Path(run_root) if run_root is not None else None
         self.sample_every_n_batches = int(sample_every_n_batches)
         self.raw_sample_limit = int(raw_sample_limit)
@@ -699,6 +701,7 @@ def configure_profiler(
     enabled: bool,
     run_root: str | os.PathLike[str] | None,
     basic_timing: bool = False,
+    inventory_history_stats: bool = False,
     sample_every_n_batches: int = 10,
     raw_sample_limit: int = 2000,
     metadata: dict[str, Any] | None = None,
@@ -710,6 +713,7 @@ def configure_profiler(
         enabled=enabled,
         run_root=run_root,
         basic_timing=basic_timing,
+        inventory_history_stats=inventory_history_stats,
         sample_every_n_batches=sample_every_n_batches,
         raw_sample_limit=raw_sample_limit,
         metadata=metadata,
