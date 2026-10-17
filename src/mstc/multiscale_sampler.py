@@ -259,13 +259,18 @@ class MultiScaleNeighborLoader:
         with profiler.timer(
             "training.history_store.query", detail=True,
             parent="training.T_neighbor_sample",
-        ):
+        ), profiler.record_function("MSTC::history_query"):
             history = self.history_store.query(query_nodes, reference_time_ns)
         if (
             (profiler.detail_active or profiler.inventory_history_stats)
             and history["count"].device.type == "cpu"
         ):
-            history_valid_slots = int(history["count"].sum().item())
+            with profiler.timer(
+                "training.T_inventory_history_stats",
+                detail=True,
+                parent="training.T_neighbor_sample",
+            ), profiler.record_function("MSTC::inventory_history_valid_slots"):
+                history_valid_slots = int(history["count"].sum().item())
             if profiler.inventory_history_stats:
                 profiler.record_basic_batch_stat(
                     "history_valid_slots", history_valid_slots

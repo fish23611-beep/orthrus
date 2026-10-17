@@ -53,6 +53,7 @@ def _args(tmp_path, **overrides):
         profile_mode="on",
         basic_timing="on",
         torch_trace_batches=0,
+        torch_trace_warmup_batches=1,
         gpu_sample_ms=200,
         execute=False,
     )
@@ -307,6 +308,21 @@ def test_benchmark_command_preserves_config_dual_roots_and_seed(tmp_path):
     assert "--benchmark-basic-timing" in command
     assert "--perf-profile" in command
     assert "--cpu" not in command
+
+
+def test_trace_command_forwards_bounded_warmup_and_active_batches(tmp_path):
+    args = _args(
+        tmp_path,
+        torch_trace_batches=2,
+        torch_trace_warmup_batches=3,
+    )
+    roots = run_runtime_benchmark.validate(args)
+    command = run_runtime_benchmark.build_command(args, roots=roots)
+
+    assert command[command.index("--perf-profile-torch-trace-batches") + 1] == "2"
+    assert command[
+        command.index("--perf-profile-torch-trace-warmup-batches") + 1
+    ] == "3"
 
 
 def test_twenty_window_case_requires_matching_selection_manifest(tmp_path):

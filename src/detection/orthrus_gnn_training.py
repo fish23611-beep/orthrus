@@ -32,26 +32,30 @@ def train(data,
         profiler.record_basic_batch_stat("batch_events", batch_events)
         profiler.record_batch_stat("batch_events", batch_events)
         with profiler.timer("training.T_zero_grad", detail=True,
-                            parent="training.T_total_batch"):
+                            parent="training.T_total_batch"), \
+                profiler.record_function("MSTC::zero_grad"):
             optimizer.zero_grad()
 
         with profiler.timer("training.T_forward", detail=True, parent="training.T_total_batch"), \
-                profiler.cuda_timer("training.T_forward_cuda_interval", detail=True, parent="training.T_total_batch"):
+                profiler.cuda_timer("training.T_forward_cuda_interval", detail=True, parent="training.T_total_batch"), \
+                profiler.record_function("MSTC::forward"):
             outputs = model(batch, full_data)
         with profiler.timer("training.T_loss_extract", detail=True,
-                            parent="training.T_total_batch"):
+                            parent="training.T_total_batch"), \
+                profiler.record_function("MSTC::loss_extract"):
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs
         if isinstance(outputs, dict):
             sync_started = timer() if profiler.detail_active else None
-            log(
-                "MSTC batch loss={:.4f}, type={:.4f}, time={:.4f}, src={:.4f}, dst={:.4f}".format(
-                    outputs["loss"].item(),
-                    outputs["loss_type"].item(),
-                    outputs["loss_time"].item(),
-                    outputs["loss_time_src"].item(),
-                    outputs["loss_time_dst"].item(),
+            with profiler.record_function("MSTC::logging_scalar_items"):
+                log(
+                    "MSTC batch loss={:.4f}, type={:.4f}, time={:.4f}, src={:.4f}, dst={:.4f}".format(
+                        outputs["loss"].item(),
+                        outputs["loss_type"].item(),
+                        outputs["loss_time"].item(),
+                        outputs["loss_time_src"].item(),
+                        outputs["loss_time_dst"].item(),
+                    )
                 )
-            )
             if sync_started is not None:
                 profiler.record(
                     "training.T_logging_items", timer() - sync_started,
@@ -59,13 +63,16 @@ def train(data,
                 )
 
         with profiler.timer("training.T_backward", detail=True, parent="training.T_total_batch"), \
-                profiler.cuda_timer("training.T_backward_cuda_interval", detail=True, parent="training.T_total_batch"):
+                profiler.cuda_timer("training.T_backward_cuda_interval", detail=True, parent="training.T_total_batch"), \
+                profiler.record_function("MSTC::backward"):
             loss.backward()
         with profiler.timer("training.T_optimizer", detail=True, parent="training.T_total_batch"), \
-                profiler.cuda_timer("training.T_optimizer_cuda_interval", detail=True, parent="training.T_total_batch"):
+                profiler.cuda_timer("training.T_optimizer_cuda_interval", detail=True, parent="training.T_total_batch"), \
+                profiler.record_function("MSTC::optimizer_step"):
             optimizer.step()
         with profiler.timer("training.T_loss_item", detail=True,
-                            parent="training.T_total_batch"):
+                            parent="training.T_total_batch"), \
+                profiler.record_function("MSTC::loss_item"):
             losses.append(loss.item())
         profiler.end_batch(batch_token, "training.T_total_batch")
     return np.mean(losses)

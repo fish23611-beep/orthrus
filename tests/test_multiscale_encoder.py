@@ -546,3 +546,5 @@ def test_profiler_switch_preserves_outputs_gradients_optimizer_rng_and_history()
     _assert_nested_tensor_equal(disabled, basic)
     assert disabled_row == {}
     assert basic_row["history_valid_slots"] == enabled_row["history_valid_slots"]
+    assert enabled_row["time.training.T_inventory_history_stats"] >= 0.0
+    assert "time.training.T_inventory_history_stats" not in basic_row

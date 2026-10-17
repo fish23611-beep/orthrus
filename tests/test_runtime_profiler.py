@@ -12,6 +12,8 @@ if str(SRC_ROOT) not in sys.path:
 from runtime.runtime_profiler import (
     PROFILE_ENV,
     PROFILE_SAMPLE_ENV,
+    TORCH_TRACE_MAX_ACTIVE_BATCHES,
+    TORCH_TRACE_MAX_WARMUP_BATCHES,
     RuntimeProfiler,
     profile_requested,
     sample_every_from,
@@ -187,3 +189,64 @@ def test_pure_disabled_mode_remains_artifact_free_with_basic_timing_off(tmp_path
     assert profiler.flush() is None
     assert not (tmp_path / "benchmark_timing").exists()
     assert not (tmp_path / "profiling").exists()
+
+
+def test_torch_trace_capture_limits_are_enforced():
+    with pytest.raises(ValueError, match="at most"):
+        RuntimeProfiler(
+            enabled=True,
+            torch_trace_batches=TORCH_TRACE_MAX_ACTIVE_BATCHES + 1,
+        )
+    with pytest.raises(ValueError, match="at most"):
+        RuntimeProfiler(
+            enabled=True,
+            torch_trace_warmup_batches=TORCH_TRACE_MAX_WARMUP_BATCHES + 1,
+        )
+
+
+def test_disabled_record_function_does_not_enter_torch_profiler(monkeypatch):
+    import torch
+
+    profiler = RuntimeProfiler(enabled=False)
+    monkeypatch.setattr(
+        torch.profiler,
+        "record_function",
+        lambda *args, **kwargs: pytest.fail(
+            "disabled profiler must not enter record_function"
+        ),
+    )
+    with profiler.record_function("MSTC::disabled"):
+        pass
+
+
+def test_cpu_torch_trace_writes_bounded_machine_readable_summaries(tmp_path):
+    import torch
+
+    profiler = RuntimeProfiler(
+        enabled=True,
+        run_root=tmp_path,
+        sample_every_n_batches=1,
+        torch_trace_batches=1,
+        torch_trace_warmup_batches=1,
+    )
+    profiler.set_context(window_index=0)
+    linear = torch.nn.Linear(2, 2)
+    for _ in range(2):
+        token = profiler.begin_batch()
+        with profiler.record_function("MSTC::unit_stage"):
+            value = torch.ones((2, 2))
+            linear(value)
+        profiler.end_batch(token, "training.T_total_batch")
+    payload = profiler.flush()
+
+    profile_dir = tmp_path / "profiling"
+    summary = json.loads((profile_dir / "torch_profile_summary.json").read_text())
+    assert (profile_dir / "torch_trace.json").is_file()
+    assert (profile_dir / "torch_operator_summary.csv").is_file()
+    assert (profile_dir / "torch_stage_summary.csv").is_file()
+    assert summary["capture"]["active_batches"] == 1
+    assert any(row["name"] == "MSTC::unit_stage" for row in summary["stages"])
+    assert summary["target_operators"]["aten::linear"]["calls"] == 1
+    assert payload["torch_profile_summary_path"].endswith(
+        "torch_profile_summary.json"
+    )

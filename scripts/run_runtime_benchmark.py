@@ -103,6 +103,9 @@ def parse_args(argv=None):
     parser.add_argument("--profile-mode", choices=("on", "off"), required=True)
     parser.add_argument("--basic-timing", choices=("on", "off"), default="on")
     parser.add_argument("--torch-trace-batches", type=int, default=0)
+    parser.add_argument(
+        "--torch-trace-warmup-batches", type=int, default=1
+    )
     parser.add_argument("--gpu-sample-ms", type=int, default=200)
     parser.add_argument("--execute", action="store_true")
     return parser.parse_args(argv)
@@ -696,6 +699,11 @@ def validate(args):
         raise ValueError("formal E3/E5 benchmark requires --seed 0")
     if args.window_start < 0 or args.torch_trace_batches < 0:
         raise ValueError("window and trace counts must be non-negative")
+    if args.torch_trace_batches > 4:
+        raise ValueError("torch trace active capture is limited to 4 batches")
+    trace_warmup = int(getattr(args, "torch_trace_warmup_batches", 1))
+    if trace_warmup < 0 or trace_warmup > 16:
+        raise ValueError("torch trace warmup must be in [0, 16]")
     if args.windows <= 0:
         raise ValueError("window count must be positive")
     if args.warmup_epochs < 0 or args.warmup_epochs >= epochs:
@@ -792,6 +800,8 @@ def build_command(args, *, roots=None):
             command += [
                 "--perf-profile-torch-trace-batches",
                 str(args.torch_trace_batches),
+                "--perf-profile-torch-trace-warmup-batches",
+                str(getattr(args, "torch_trace_warmup_batches", 1)),
                 "--perf-profile-torch-trace-window-start",
                 str(args.window_start),
             ]
@@ -1378,9 +1388,15 @@ def validate_execution_evidence(root: Path, args, *, num_epochs: int) -> dict[st
             ):
                 reject("detailed_profile_invalid", "detailed profile is not completed/enabled")
         if args.torch_trace_batches:
-            trace_path = _latest(root, "profiling/torch_trace.json")
-            if trace_path is None:
-                reject("torch_trace_missing", "requested independent Torch trace is missing")
+            trace_artifacts = {
+                "torch_trace_missing": "profiling/torch_trace.json",
+                "torch_profile_summary_missing": "profiling/torch_profile_summary.json",
+                "torch_operator_summary_missing": "profiling/torch_operator_summary.csv",
+                "torch_stage_summary_missing": "profiling/torch_stage_summary.csv",
+            }
+            for code, pattern in trace_artifacts.items():
+                if _latest(root, pattern) is None:
+                    reject(code, f"requested Torch profile artifact is missing: {pattern}")
     elif profile_path is not None:
         reject("unexpected_detailed_profile", "profile-off run produced a detailed profile")
 
@@ -1619,7 +1635,10 @@ def aggregate(
         result["timing_semantics"] = {
             "cpu": "perf_counter inclusive/self",
             "cuda": "CUDA Event interval; not kernel sum",
-            "launch_gap": "torch_trace.json only",
+            "torch_profile": (
+                "diagnostic only: torch_profile_summary.json plus optional "
+                "Chrome inspection in torch_trace.json"
+            ),
         }
     elif basic_timing == "on":
         result["timing_semantics"] = {

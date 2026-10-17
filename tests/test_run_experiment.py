@@ -46,6 +46,21 @@ def test_cli_parses_and_forwards_required_parameters(tmp_path, monkeypatch):
     assert args.run_from_training is False
 
 
+def test_torch_trace_controls_are_forwarded(tmp_path):
+    args = run_experiment.build_pipeline_args(parse(
+        tmp_path,
+        "--perf-profile",
+        "--perf-profile-torch-trace-batches", "2",
+        "--perf-profile-torch-trace-warmup-batches", "3",
+        "--perf-profile-torch-trace-window-start", "7",
+    ))
+
+    assert args.perf_profile is True
+    assert args.perf_profile_torch_trace_batches == 2
+    assert args.perf_profile_torch_trace_warmup_batches == 3
+    assert args.perf_profile_torch_trace_window_start == 7
+
+
 def test_explicit_config_path_is_preserved(tmp_path, monkeypatch):
     captured = {}
     monkeypatch.setattr(run_experiment, "_run_pipeline", lambda args: captured.setdefault("args", args))

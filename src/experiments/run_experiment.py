@@ -87,7 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--perf-profile-torch-trace-batches", type=int, default=0, metavar="N",
-        help="Capture an expensive PyTorch CPU/CUDA trace for N batches.",
+        help="Capture an expensive PyTorch CPU/CUDA trace for 1-4 active batches.",
+    )
+    parser.add_argument(
+        "--perf-profile-torch-trace-warmup-batches", type=int, default=1, metavar="N",
+        help="Warm up torch.profiler for N batches before capture (default: 1; max: 16).",
     )
     parser.add_argument(
         "--perf-profile-torch-trace-window-start", type=int, default=0, metavar="N",
@@ -148,6 +152,9 @@ def build_pipeline_args(namespace: argparse.Namespace) -> SimpleNamespace:
         ),
         perf_profile_torch_trace_batches=(
             getattr(namespace, "perf_profile_torch_trace_batches", 0)
+        ),
+        perf_profile_torch_trace_warmup_batches=(
+            getattr(namespace, "perf_profile_torch_trace_warmup_batches", 1)
         ),
         perf_profile_torch_trace_window_start=(
             getattr(namespace, "perf_profile_torch_trace_window_start", 0)

@@ -252,7 +252,7 @@ class MultiScaleOrthrusEncoder(nn.Module):
         with profiler.timer(
             f"training.scan_scale.{scale}.total", detail=True,
             parent=f"training.encode_scale.{scale}.total",
-        ):
+        ), profiler.record_function(f"MSTC::scan_scale.{scale}"):
             records = self._scan_scale(scale, sampled, full_data, device)
         construct_started = perf_counter() if profiler.detail_active else None
         query_nodes = sampled["query_nodes"].to(device).long()
@@ -264,36 +264,38 @@ class MultiScaleOrthrusEncoder(nn.Module):
         src_has_history = torch.zeros(batch_size, dtype=torch.bool, device=device)
         dst_has_history = torch.zeros_like(src_has_history)
 
-        for _, query, neighbor, direction in records:
-            if direction == 0:
-                src_has_history |= src_query_nodes == query
-            else:
-                dst_has_history |= dst_query_nodes == query
+        with profiler.record_function(f"MSTC::encoder.{scale}.history_mask_loop"):
+            for _, query, neighbor, direction in records:
+                if direction == 0:
+                    src_has_history |= src_query_nodes == query
+                else:
+                    dst_has_history |= dst_query_nodes == query
 
         if not records:
             profiler.record_batch_stat(f"{scale}_graph_nodes", 0)
             profiler.record_batch_stat(f"{scale}_graph_edges", 0)
             return current_src_out, current_dst_out, src_has_history | dst_has_history
 
-        event_ids = torch.tensor([record[0] for record in records], dtype=torch.long, device=device)
-        edge_src_global = torch.tensor(
-            [query if direction == 0 else neighbor for _, query, neighbor, direction in records],
-            dtype=torch.long,
-            device=device,
-        )
-        edge_dst_global = torch.tensor(
-            [neighbor if direction == 0 else query for _, query, neighbor, direction in records],
-            dtype=torch.long,
-            device=device,
-        )
-        node_ids = torch.cat([query_nodes, edge_src_global, edge_dst_global]).unique(sorted=True)
-        node_to_local = {int(node): index for index, node in enumerate(node_ids.cpu().tolist())}
-        local_src = torch.tensor([node_to_local[int(node)] for node in edge_src_global.cpu()], dtype=torch.long, device=device)
-        local_dst = torch.tensor([node_to_local[int(node)] for node in edge_dst_global.cpu()], dtype=torch.long, device=device)
-        edge_index = torch.stack([local_src, local_dst])
+        with profiler.record_function(f"MSTC::encoder.{scale}.graph_tensor_build"):
+            event_ids = torch.tensor([record[0] for record in records], dtype=torch.long, device=device)
+            edge_src_global = torch.tensor(
+                [query if direction == 0 else neighbor for _, query, neighbor, direction in records],
+                dtype=torch.long,
+                device=device,
+            )
+            edge_dst_global = torch.tensor(
+                [neighbor if direction == 0 else query for _, query, neighbor, direction in records],
+                dtype=torch.long,
+                device=device,
+            )
+            node_ids = torch.cat([query_nodes, edge_src_global, edge_dst_global]).unique(sorted=True)
+            node_to_local = {int(node): index for index, node in enumerate(node_ids.cpu().tolist())}
+            local_src = torch.tensor([node_to_local[int(node)] for node in edge_src_global.cpu()], dtype=torch.long, device=device)
+            local_dst = torch.tensor([node_to_local[int(node)] for node in edge_dst_global.cpu()], dtype=torch.long, device=device)
+            edge_index = torch.stack([local_src, local_dst])
 
-        node_src_hidden = torch.zeros((node_ids.numel(), self.temporal_dim), dtype=current_src_hidden.dtype, device=device)
-        node_dst_hidden = torch.zeros_like(node_src_hidden)
+            node_src_hidden = torch.zeros((node_ids.numel(), self.temporal_dim), dtype=current_src_hidden.dtype, device=device)
+            node_dst_hidden = torch.zeros_like(node_src_hidden)
         if construct_started is not None:
             profiler.record(
                 f"training.encode_scale.{scale}.python_tensor_organize",
@@ -306,15 +308,17 @@ class MultiScaleOrthrusEncoder(nn.Module):
         ), profiler.cuda_timer(
             f"training.feature_gather.{scale}.node_cuda_interval", detail=True,
             parent=f"training.feature_gather.{scale}.node",
-        ):
+        ), profiler.record_function(f"MSTC::encoder.{scale}.node_feature_gather"):
             historical_src, historical_dst = self._historical_node_features(full_data, event_ids, device)
-        for row, (edge_src, edge_dst) in enumerate(zip(edge_src_global.tolist(), edge_dst_global.tolist())):
-            node_src_hidden[node_to_local[edge_src]] = self.src_linear(historical_src[row])
-            node_dst_hidden[node_to_local[edge_dst]] = self.dst_linear(historical_dst[row])
+        with profiler.record_function(f"MSTC::encoder.{scale}.history_linear_loop"):
+            for row, (edge_src, edge_dst) in enumerate(zip(edge_src_global.tolist(), edge_dst_global.tolist())):
+                node_src_hidden[node_to_local[edge_src]] = self.src_linear(historical_src[row])
+                node_dst_hidden[node_to_local[edge_dst]] = self.dst_linear(historical_dst[row])
 
-        for batch_index in range(batch_size):
-            node_src_hidden[node_to_local[int(src_query_nodes[batch_index])]] = current_src_hidden[batch_index]
-            node_dst_hidden[node_to_local[int(dst_query_nodes[batch_index])]] = current_dst_hidden[batch_index]
+        with profiler.record_function(f"MSTC::encoder.{scale}.current_assign_loop"):
+            for batch_index in range(batch_size):
+                node_src_hidden[node_to_local[int(src_query_nodes[batch_index])]] = current_src_hidden[batch_index]
+                node_dst_hidden[node_to_local[int(dst_query_nodes[batch_index])]] = current_dst_hidden[batch_index]
         node_features = node_src_hidden + node_dst_hidden
         if self.use_scale_embedding:
             scale_ids = torch.full((node_ids.numel(),), scale_index, dtype=torch.long, device=device)
@@ -326,7 +330,7 @@ class MultiScaleOrthrusEncoder(nn.Module):
         ), profiler.cuda_timer(
             f"training.feature_gather.{scale}.edge_cuda_interval", detail=True,
             parent=f"training.feature_gather.{scale}.edge",
-        ):
+        ), profiler.record_function(f"MSTC::encoder.{scale}.edge_feature_gather"):
             gathered_edge_features = self._edge_features(full_data, event_ids, device)
         with profiler.timer(
             f"training.graph_encoder.{scale}", detail=True,
@@ -334,7 +338,7 @@ class MultiScaleOrthrusEncoder(nn.Module):
         ), profiler.cuda_timer(
             f"training.graph_encoder.{scale}.cuda_interval", detail=True,
             parent=f"training.graph_encoder.{scale}",
-        ):
+        ), profiler.record_function(f"MSTC::encoder.{scale}.graph_encoder"):
             encoded = self.shared_graph_encoder(
                 node_features,
                 edge_index,
@@ -393,7 +397,8 @@ class MultiScaleOrthrusEncoder(nn.Module):
             )
 
         with profiler.timer("training.T_neighbor_sample", detail=True,
-                            parent="training.T_encoder"):
+                            parent="training.T_encoder"), \
+                profiler.record_function("MSTC::multiscale_sampling"):
             sampled = self.neighbor_loader(src, dst, timestamp_ns=t)
         scale_src, scale_dst, scale_masks = [], [], []
         for scale_index in range(3):
@@ -401,7 +406,7 @@ class MultiScaleOrthrusEncoder(nn.Module):
             with profiler.timer(
                 f"training.encode_scale.{scale_name}.total", detail=True,
                 parent="training.T_encoder",
-            ):
+            ), profiler.record_function(f"MSTC::encode_scale.{scale_name}"):
                 encoded_src, encoded_dst, scale_mask = self._encode_scale(
                     scale_index, sampled, current_src_hidden, current_dst_hidden,
                     current_src_out, current_dst_out, full_data, device,
@@ -440,7 +445,8 @@ class MultiScaleOrthrusEncoder(nn.Module):
                 parent="training.T_encoder",
             )
         with profiler.timer("training.T_history_insert", detail=True,
-                            parent="training.T_encoder"):
+                            parent="training.T_encoder"), \
+                profiler.record_function("MSTC::history_update"):
             self.neighbor_loader.insert(src, dst, timestamp_ns=t, global_event_index=global_event_index)
         return h_src, h_dst
 

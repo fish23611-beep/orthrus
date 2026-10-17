@@ -15,7 +15,7 @@ import os
 import resource
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +25,36 @@ from typing import Any, Iterator
 PROFILE_SCHEMA_VERSION = 2
 PROFILE_ENV = "ORTHRUS_PERF_PROFILE"
 PROFILE_SAMPLE_ENV = "ORTHRUS_PERF_PROFILE_SAMPLE_EVERY_N_BATCHES"
+TORCH_TRACE_MAX_ACTIVE_BATCHES = 4
+TORCH_TRACE_MAX_WARMUP_BATCHES = 16
+TORCH_PROFILE_TOP_LIMIT = 50
+
+_TARGET_OPERATOR_NAMES = (
+    "aten::linear",
+    "aten::addmm",
+    "aten::item",
+    "aten::_local_scalar_dense",
+    "aten::to",
+    "aten::_to_copy",
+    "aten::copy_",
+)
+_EXPLICIT_CUDA_SYNC_NAMES = (
+    "cudadevicesynchronize",
+    "cudastreamsynchronize",
+    "cudaeventsynchronize",
+    "cudacontextsynchronize",
+)
+_CUDA_TRANSFER_RUNTIME_NAMES = (
+    "cudamemcpy",
+    "memcpy hto",
+    "memcpy dto",
+    "memcpy dtoh",
+    "memcpy htod",
+)
+_CUDA_LAUNCH_NAMES = (
+    "cudalaunchkernel",
+    "cudalaunchcooperativekernel",
+)
 
 
 def _env_truthy(value: str | None) -> bool:
@@ -114,6 +144,7 @@ class RuntimeProfiler:
         raw_sample_limit: int = 2000,
         metadata: dict[str, Any] | None = None,
         torch_trace_batches: int = 0,
+        torch_trace_warmup_batches: int = 0,
         torch_trace_window_start: int = 0,
     ) -> None:
         if sample_every_n_batches <= 0:
@@ -122,6 +153,18 @@ class RuntimeProfiler:
             raise ValueError("raw_sample_limit must be non-negative")
         if torch_trace_batches < 0:
             raise ValueError("torch_trace_batches must be non-negative")
+        if torch_trace_batches > TORCH_TRACE_MAX_ACTIVE_BATCHES:
+            raise ValueError(
+                "torch_trace_batches must be at most "
+                f"{TORCH_TRACE_MAX_ACTIVE_BATCHES}"
+            )
+        if torch_trace_warmup_batches < 0:
+            raise ValueError("torch_trace_warmup_batches must be non-negative")
+        if torch_trace_warmup_batches > TORCH_TRACE_MAX_WARMUP_BATCHES:
+            raise ValueError(
+                "torch_trace_warmup_batches must be at most "
+                f"{TORCH_TRACE_MAX_WARMUP_BATCHES}"
+            )
         if torch_trace_window_start < 0:
             raise ValueError("torch_trace_window_start must be non-negative")
         self.enabled = bool(enabled)
@@ -131,6 +174,7 @@ class RuntimeProfiler:
         self.sample_every_n_batches = int(sample_every_n_batches)
         self.raw_sample_limit = int(raw_sample_limit)
         self.torch_trace_batches = int(torch_trace_batches)
+        self.torch_trace_warmup_batches = int(torch_trace_warmup_batches)
         self.torch_trace_window_start = int(torch_trace_window_start)
         self.metadata = dict(metadata or {})
         self._samples: dict[str, list[float]] = defaultdict(list)
@@ -152,6 +196,8 @@ class RuntimeProfiler:
         self._torch_profiler: Any = None
         self._torch_trace_seen = 0
         self._torch_trace_path: str | None = None
+        self._torch_profile_summary_path: str | None = None
+        self._torch_profile_callback_ran = False
         self._batch_index = 0
         self._detail_active = False
         self._start_wall = time.perf_counter()
@@ -286,12 +332,244 @@ class RuntimeProfiler:
             end.record()
             self._pending_cuda.append((name, start, end, parent, self._current_batch_row))
 
+    @contextmanager
+    def record_function(self, name: str) -> Iterator[None]:
+        """Add a Torch Profiler range only while an opt-in trace is active."""
+        if self._torch_profiler is None:
+            yield
+            return
+        import torch
+        with torch.profiler.record_function(name):
+            yield
+
+    @staticmethod
+    def _profile_number(event: Any, *names: str) -> float:
+        for name in names:
+            value = getattr(event, name, None)
+            if value is not None:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
+    @classmethod
+    def _profile_row(cls, event: Any) -> dict[str, Any]:
+        key = str(getattr(event, "key", getattr(event, "name", "<unknown>")))
+        shapes = getattr(event, "input_shapes", None)
+        return {
+            "name": key,
+            "calls": int(getattr(event, "count", 1) or 0),
+            "self_cpu_time_us": cls._profile_number(event, "self_cpu_time_total"),
+            "cpu_total_time_us": cls._profile_number(event, "cpu_time_total"),
+            "self_cuda_time_us": cls._profile_number(
+                event, "self_cuda_time_total", "self_device_time_total"
+            ),
+            "cuda_total_time_us": cls._profile_number(
+                event, "cuda_time_total", "device_time_total"
+            ),
+            "input_shapes": shapes if shapes is not None else [],
+        }
+
+    @staticmethod
+    def _aggregate_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "calls": sum(int(row["calls"]) for row in rows),
+            "self_cpu_time_us": sum(float(row["self_cpu_time_us"]) for row in rows),
+            "cpu_total_time_us": sum(float(row["cpu_total_time_us"]) for row in rows),
+            "self_cuda_time_us": sum(float(row["self_cuda_time_us"]) for row in rows),
+            "cuda_total_time_us": sum(float(row["cuda_total_time_us"]) for row in rows),
+        }
+
+    @classmethod
+    def _rows_matching(
+        cls, rows: list[dict[str, Any]], needles: tuple[str, ...]
+    ) -> dict[str, Any]:
+        lowered = tuple(value.lower() for value in needles)
+        matches = [
+            row for row in rows
+            if any(needle in str(row["name"]).lower() for needle in lowered)
+        ]
+        return {
+            **cls._aggregate_rows(matches),
+            "matched_names": sorted({row["name"] for row in matches}),
+        }
+
+    def _write_torch_profile_artifacts(self, torch_profiler: Any) -> None:
+        if self.run_root is None or self._torch_profile_callback_ran:
+            return
+        profile_dir = self.run_root / "profiling"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        trace_path = profile_dir / "torch_trace.json"
+        torch_profiler.export_chrome_trace(str(trace_path))
+        self._torch_trace_path = str(trace_path)
+
+        averaged = list(torch_profiler.key_averages(group_by_input_shape=True))
+        rows = [self._profile_row(event) for event in averaged]
+        operator_rows = [
+            row for row in rows
+            if row["name"].startswith(
+                ("aten::", "autograd::", "torch::autograd::")
+            )
+        ]
+        stage_rows = [row for row in rows if row["name"].startswith("MSTC::")]
+
+        raw_events = list(torch_profiler.events())
+        kernel_calls: Counter[str] = Counter()
+        kernel_time_us: defaultdict[str, float] = defaultdict(float)
+        device_transfer_calls: Counter[str] = Counter()
+        device_transfer_time_us: defaultdict[str, float] = defaultdict(float)
+        raw_event_rows: list[dict[str, Any]] = []
+        for event in raw_events:
+            name = str(getattr(event, "name", getattr(event, "key", "<unknown>")))
+            device_type = str(getattr(event, "device_type", "")).lower()
+            event_row = {
+                "name": name,
+                "calls": 1,
+                "self_cpu_time_us": self._profile_number(event, "self_cpu_time_total"),
+                "cpu_total_time_us": self._profile_number(event, "cpu_time_total"),
+                "self_cuda_time_us": self._profile_number(
+                    event, "self_cuda_time_total", "self_device_time_total"
+                ),
+                "cuda_total_time_us": self._profile_number(
+                    event, "cuda_time_total", "device_time_total"
+                ),
+            }
+            raw_event_rows.append(event_row)
+            if "cuda" in device_type:
+                device_duration = max(
+                    event_row["self_cuda_time_us"], event_row["cuda_total_time_us"]
+                )
+                if "memcpy" in name.lower() or "memset" in name.lower():
+                    device_transfer_calls[name] += 1
+                    device_transfer_time_us[name] += device_duration
+                else:
+                    kernel_calls[name] += 1
+                    kernel_time_us[name] += device_duration
+
+        top_kernels = [
+            {"name": name, "calls": kernel_calls[name], "device_time_us": duration}
+            for name, duration in sorted(
+                kernel_time_us.items(), key=lambda item: item[1], reverse=True
+            )[:TORCH_PROFILE_TOP_LIMIT]
+        ]
+        target_operators = {
+            name: self._aggregate_rows(
+                [row for row in operator_rows if row["name"] == name]
+            )
+            for name in _TARGET_OPERATOR_NAMES
+        }
+        autograd_scheduler = self._rows_matching(
+            rows, ("autograd::engine::evaluate_function",)
+        )
+        backward_ops = self._rows_matching(
+            rows, ("backward", "accumulategrad")
+        )
+        explicit_sync = self._rows_matching(raw_event_rows, _EXPLICIT_CUDA_SYNC_NAMES)
+        runtime_transfers = self._rows_matching(
+            raw_event_rows, _CUDA_TRANSFER_RUNTIME_NAMES
+        )
+        launches = self._rows_matching(raw_event_rows, _CUDA_LAUNCH_NAMES)
+
+        top_cpu = sorted(
+            operator_rows, key=lambda row: row["self_cpu_time_us"], reverse=True
+        )[:TORCH_PROFILE_TOP_LIMIT]
+        top_cuda = sorted(
+            operator_rows, key=lambda row: row["self_cuda_time_us"], reverse=True
+        )[:TORCH_PROFILE_TOP_LIMIT]
+        summary = {
+            "schema_version": 1,
+            "timing_unit": "microseconds",
+            "capture": {
+                "warmup_batches": self.torch_trace_warmup_batches,
+                "active_batches": self.torch_trace_batches,
+                "observed_steps": self._torch_trace_seen,
+                "window_start": self.torch_trace_window_start,
+                "chrome_trace": str(trace_path),
+                "record_shapes": True,
+                "profile_memory": False,
+            },
+            "target_operators": target_operators,
+            "synchronization": {
+                "explicit_cuda_runtime_sync": explicit_sync,
+                "scalar_extraction_operators": {
+                    name: target_operators[name]
+                    for name in ("aten::item", "aten::_local_scalar_dense")
+                },
+            },
+            "data_movement": {
+                "cuda_runtime_transfer_events": runtime_transfers,
+                "cuda_device_transfer_activities": {
+                    "calls": sum(device_transfer_calls.values()),
+                    "unique_names": len(device_transfer_calls),
+                    "device_time_us": sum(device_transfer_time_us.values()),
+                    "names": dict(sorted(device_transfer_calls.items())),
+                },
+                "operators": {
+                    name: target_operators[name]
+                    for name in ("aten::to", "aten::_to_copy", "aten::copy_")
+                },
+            },
+            "cuda_launch": launches,
+            "cuda_kernels": {
+                "calls": sum(kernel_calls.values()),
+                "unique_names": len(kernel_calls),
+                "device_time_us": sum(kernel_time_us.values()),
+                "top_by_device_time": top_kernels,
+            },
+            "autograd": {
+                "engine_evaluate_function": autograd_scheduler,
+                "backward_named_events": backward_ops,
+                "interpretation": (
+                    "CPU Autograd events include engine scheduling and do not by "
+                    "themselves prove that differentiable tensor math ran on CPU."
+                ),
+            },
+            "top_operators_by_self_cpu_time": top_cpu,
+            "top_operators_by_self_cuda_time": top_cuda,
+            "stages": stage_rows,
+        }
+        summary_path = profile_dir / "torch_profile_summary.json"
+        with summary_path.open("w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2, sort_keys=True, allow_nan=False)
+        self._torch_profile_summary_path = str(summary_path)
+
+        fields = [
+            "name", "calls", "self_cpu_time_us", "cpu_total_time_us",
+            "self_cuda_time_us", "cuda_total_time_us", "input_shapes",
+        ]
+        for filename, selected_rows in (
+            ("torch_operator_summary.csv", operator_rows),
+            ("torch_stage_summary.csv", stage_rows),
+        ):
+            with (profile_dir / filename).open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                for row in selected_rows:
+                    output = dict(row)
+                    output["input_shapes"] = json.dumps(
+                        output["input_shapes"], separators=(",", ":")
+                    )
+                    writer.writerow(output)
+        self._torch_profile_callback_ran = True
+
+    def _on_torch_trace_ready(self, torch_profiler: Any) -> None:
+        try:
+            self._write_torch_profile_artifacts(torch_profiler)
+        except Exception as exc:
+            self._tags["torch_trace_error"] = f"{type(exc).__name__}: {exc}"
+
     def _start_torch_trace_if_needed(self) -> None:
         if (
             self.torch_trace_batches <= 0
             or int(self._context.get("window_index", -1)) < self.torch_trace_window_start
             or self._torch_profiler is not None
-            or self._torch_trace_seen >= self.torch_trace_batches
+            or self._torch_trace_seen >= (
+                self.torch_trace_warmup_batches + self.torch_trace_batches
+            )
         ):
             return
         try:
@@ -301,27 +579,35 @@ class RuntimeProfiler:
                 activities.append(torch.profiler.ProfilerActivity.CUDA)
             self._torch_profiler = torch.profiler.profile(
                 activities=activities,
+                schedule=torch.profiler.schedule(
+                    wait=0,
+                    warmup=self.torch_trace_warmup_batches,
+                    active=self.torch_trace_batches,
+                    repeat=1,
+                ),
+                on_trace_ready=self._on_torch_trace_ready,
                 record_shapes=True,
-                profile_memory=True,
+                profile_memory=False,
                 with_stack=False,
+                with_flops=False,
+                with_modules=False,
             )
             self._torch_profiler.start()
         except Exception as exc:
             self._tags["torch_trace_error"] = f"{type(exc).__name__}: {exc}"
-            self._torch_trace_seen = self.torch_trace_batches
+            self._torch_trace_seen = (
+                self.torch_trace_warmup_batches + self.torch_trace_batches
+            )
             self._torch_profiler = None
 
     def _stop_torch_trace(self) -> None:
         if self._torch_profiler is None:
             return
         try:
-            self._torch_profiler.stop()
-            if self.run_root is not None:
-                profile_dir = self.run_root / "profiling"
-                profile_dir.mkdir(parents=True, exist_ok=True)
-                path = profile_dir / "torch_trace.json"
-                self._torch_profiler.export_chrome_trace(str(path))
-                self._torch_trace_path = str(path)
+            torch_profiler = self._torch_profiler
+            torch_profiler.stop()
+            if not self._torch_profile_callback_ran:
+                self._write_torch_profile_artifacts(torch_profiler)
         except Exception as exc:
             self._tags["torch_trace_error"] = f"{type(exc).__name__}: {exc}"
         finally:
@@ -330,9 +616,11 @@ class RuntimeProfiler:
     def _trace_step(self) -> None:
         if self._torch_profiler is None:
             return
-        self._torch_profiler.step()
         self._torch_trace_seen += 1
-        if self._torch_trace_seen >= self.torch_trace_batches:
+        self._torch_profiler.step()
+        if self._torch_trace_seen >= (
+            self.torch_trace_warmup_batches + self.torch_trace_batches
+        ):
             self._stop_torch_trace()
 
     def begin_batch(self) -> tuple[_TimerFrame, bool] | None:
@@ -399,7 +687,8 @@ class RuntimeProfiler:
             token = self.begin_batch()
             prepare_started = time.perf_counter()
             try:
-                batch = next(iterator)
+                with self.record_function("MSTC::batch_prepare"):
+                    batch = next(iterator)
             except StopIteration:
                 assert token is not None
                 frame, previous = token
@@ -571,8 +860,10 @@ class RuntimeProfiler:
             "sample_every_n_batches": self.sample_every_n_batches,
             "raw_sample_limit": self.raw_sample_limit,
             "torch_trace_batches": self.torch_trace_batches,
+            "torch_trace_warmup_batches": self.torch_trace_warmup_batches,
             "torch_trace_window_start": self.torch_trace_window_start,
             "torch_trace_path": self._torch_trace_path,
+            "torch_profile_summary_path": self._torch_profile_summary_path,
             "wall_seconds": elapsed,
             "cpu_seconds": max(0.0, time.process_time() - self._start_cpu),
             "metadata": self.metadata,
@@ -706,6 +997,7 @@ def configure_profiler(
     raw_sample_limit: int = 2000,
     metadata: dict[str, Any] | None = None,
     torch_trace_batches: int = 0,
+    torch_trace_warmup_batches: int = 0,
     torch_trace_window_start: int = 0,
 ) -> RuntimeProfiler:
     global _ACTIVE_PROFILER
@@ -718,6 +1010,7 @@ def configure_profiler(
         raw_sample_limit=raw_sample_limit,
         metadata=metadata,
         torch_trace_batches=torch_trace_batches,
+        torch_trace_warmup_batches=torch_trace_warmup_batches,
         torch_trace_window_start=torch_trace_window_start,
     )
     return _ACTIVE_PROFILER

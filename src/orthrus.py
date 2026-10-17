@@ -567,6 +567,10 @@ def run(args):
             int(getattr(args, "perf_profile_torch_trace_batches", 0) or 0)
             if profiler_enabled else 0
         ),
+        torch_trace_warmup_batches=(
+            int(getattr(args, "perf_profile_torch_trace_warmup_batches", 1) or 0)
+            if profiler_enabled else 0
+        ),
         torch_trace_window_start=(
             int(getattr(args, "perf_profile_torch_trace_window_start", 0) or 0)
             if profiler_enabled else 0

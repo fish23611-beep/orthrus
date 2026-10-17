@@ -130,7 +130,7 @@ class MSTCOrthrus(nn.Module):
         with profiler.timer(
             "training.T_timegap_target", detail=True,
             parent="training.T_forward",
-        ):
+        ), profiler.record_function("MSTC::timegap_target"):
             if self.time_task_enabled:
                 src_target, dst_target, updated_last_seen = self.time_gap_statistics.transform_batch(
                     batch, self.last_seen_per_node
@@ -149,7 +149,7 @@ class MSTCOrthrus(nn.Module):
                 encoder_kwargs["global_event_index"] = batch_global_event_index
             with profiler.timer(
                 "training.T_encoder", detail=True, parent="training.T_forward",
-            ):
+            ), profiler.record_function("MSTC::encoder"):
                 h = self.encoder(
                     edge_index=edge_index,
                     t=batch.t,
@@ -166,12 +166,12 @@ class MSTCOrthrus(nn.Module):
 
             with profiler.timer(
                 "training.T_loss", detail=True, parent="training.T_forward",
-            ):
+            ), profiler.record_function("MSTC::decoder_and_loss"):
                 zero_scalar = h_src.sum() * 0.0
                 zero_per_event = zero_scalar.expand(batch_size)
                 with profiler.timer(
                     "training.T_edge_head", detail=True, parent="training.T_loss",
-                ):
+                ), profiler.record_function("MSTC::edge_head"):
                     if self.edge_decoder is None:
                         edge_logits = h_src.new_empty((batch_size, 0))
                         loss_type = zero_per_event if inference else zero_scalar
@@ -183,7 +183,7 @@ class MSTCOrthrus(nn.Module):
 
                 with profiler.timer(
                     "training.T_time_head", detail=True, parent="training.T_loss",
-                ):
+                ), profiler.record_function("MSTC::timegap_head"):
                     if not self.time_task_enabled:
                         src_time_logits = h_src.new_empty((batch_size, 0))
                         dst_time_logits = h_src.new_empty((batch_size, 0))
