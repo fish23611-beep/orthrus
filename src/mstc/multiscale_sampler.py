@@ -40,6 +40,35 @@ def _recency_order(timestamps: Tensor, event_ids: Tensor) -> Tensor:
     return event_order[timestamp_order]
 
 
+def _recency_order_rows(
+    timestamps: Tensor, event_ids: Tensor, in_range: Tensor
+) -> Tensor:
+    """Return per-row recency order with the same semantics as _recency_order.
+
+    ``in_range`` marks the entries that participate in the selection. Entries
+    outside the range are replaced by ``-1`` sentinel keys, so they sort after
+    every valid entry without changing the stable relative order of valid
+    entries. The result is a [Q, capacity] tensor of column indices.
+    """
+    if timestamps.numel() == 0:
+        return torch.empty_like(timestamps, dtype=torch.long)
+
+    sort_timestamps = torch.where(
+        in_range, timestamps, torch.full_like(timestamps, -1)
+    )
+    sort_event_ids = torch.where(
+        in_range, event_ids, torch.full_like(event_ids, -1)
+    )
+    event_order = torch.argsort(
+        sort_event_ids, dim=1, descending=True, stable=True
+    )
+    timestamps_by_event = sort_timestamps.gather(1, event_order)
+    timestamp_order = torch.argsort(
+        timestamps_by_event, dim=1, descending=True, stable=True
+    )
+    return event_order.gather(1, timestamp_order)
+
+
 # ------------------------------------------------------------------
 # Boundary conversion utility (for legacy compatibility)
 # ------------------------------------------------------------------
@@ -174,6 +203,136 @@ class MultiScaleNeighborLoader:
         self.medium_budget = int(medium_budget)
         self.long_budget = int(long_budget)
 
+    @staticmethod
+    def _sample_scale_vectorized(
+        history: Dict[str, Tensor],
+        reference_time_ns: Tensor,
+        scale_name: str,
+        tau_low: int,
+        tau_high: Optional[int],
+        budget: int,
+        device: torch.device,
+        detail: bool = False,
+    ) -> tuple[Dict[str, Tensor], int, float, float, float]:
+        """Select one scale for all query rows using batched tensor operations.
+
+        Returns the five scale tensors plus the optional profiling timings for
+        filter, sort/select and H2D enqueue. The selection order is identical
+        to the scalar implementation: timestamp descending, event id
+        descending, stable tie order, top-k, then -1/False padding.
+        """
+        timestamps = history["timestamp_ns"].cpu()
+        event_ids = history["event_id"].cpu()
+        neighbor_ids = history["neighbor_id"].cpu()
+        directions = history["direction"].cpu()
+        ref_cpu = reference_time_ns.cpu()
+        Q = ref_cpu.numel()
+        capacity = timestamps.size(1)
+
+        if Q == 0:
+            scale_result = {
+                f"{scale_name}_neighbor_id": torch.full(
+                    (0, budget), fill_value=-1, dtype=torch.int64, device=device
+                ),
+                f"{scale_name}_event_id": torch.full(
+                    (0, budget), fill_value=-1, dtype=torch.int64, device=device
+                ),
+                f"{scale_name}_timestamp_ns": torch.full(
+                    (0, budget), fill_value=-1, dtype=torch.int64, device=device
+                ),
+                f"{scale_name}_direction": torch.full(
+                    (0, budget), fill_value=-1, dtype=torch.int8, device=device
+                ),
+                f"{scale_name}_mask": torch.zeros(
+                    (0, budget), dtype=torch.bool, device=device
+                ),
+            }
+            return scale_result, 0, 0.0, 0.0, 0.0
+
+        filter_started = perf_counter() if detail else None
+        delta = ref_cpu.unsqueeze(1) - timestamps
+        valid_ts_mask = timestamps >= 0
+        if scale_name == "short":
+            in_range = valid_ts_mask & (delta > 0) & (delta <= tau_high)
+        elif scale_name == "medium":
+            in_range = valid_ts_mask & (delta > tau_low) & (delta <= tau_high)
+        else:  # long: delta > tau_medium, no upper bound
+            in_range = valid_ts_mask & (delta > tau_low)
+        filter_seconds = (
+            perf_counter() - filter_started if filter_started is not None else 0.0
+        )
+
+        sort_started = perf_counter() if detail else None
+        order = _recency_order_rows(timestamps, event_ids, in_range)
+        selected_columns = min(budget, capacity)
+        top_order = order[:, :selected_columns]
+        top_mask = in_range.gather(1, top_order)
+
+        def gather_pad(values: Tensor, fill_value: int, dtype: torch.dtype) -> Tensor:
+            selected = torch.where(
+                top_mask,
+                values.gather(1, top_order),
+                torch.full(
+                    top_order.shape,
+                    fill_value,
+                    dtype=dtype,
+                    device=top_order.device,
+                ),
+            )
+            if selected_columns < budget:
+                selected = torch.cat(
+                    [
+                        selected,
+                        torch.full(
+                            (Q, budget - selected_columns),
+                            fill_value,
+                            dtype=dtype,
+                            device=top_order.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+            return selected
+
+        selected_neighbor = gather_pad(neighbor_ids, -1, torch.int64)
+        selected_event_id = gather_pad(event_ids, -1, torch.int64)
+        selected_timestamp = gather_pad(timestamps, -1, torch.int64)
+        selected_direction = gather_pad(directions, -1, directions.dtype)
+        selected_mask = top_mask
+        if selected_columns < budget:
+            selected_mask = torch.cat(
+                [
+                    selected_mask,
+                    torch.zeros(
+                        (Q, budget - selected_columns),
+                        dtype=torch.bool,
+                        device=top_order.device,
+                    ),
+                ],
+                dim=1,
+            )
+        sort_seconds = (
+            perf_counter() - sort_started if sort_started is not None else 0.0
+        )
+        selected_count = int(top_mask.sum().item()) if detail else 0
+
+        h2d_started = perf_counter() if detail else None
+        scale_result = {
+            f"{scale_name}_neighbor_id": selected_neighbor.to(device),
+            f"{scale_name}_event_id": selected_event_id.to(device),
+            f"{scale_name}_timestamp_ns": selected_timestamp.to(device),
+            f"{scale_name}_direction": selected_direction.to(device),
+            f"{scale_name}_mask": selected_mask.to(device),
+        }
+        h2d_seconds = perf_counter() - h2d_started if h2d_started is not None else 0.0
+        return (
+            scale_result,
+            selected_count,
+            filter_seconds,
+            sort_seconds,
+            h2d_seconds,
+        )
+
     # ------------------------------------------------------------------
     # __call__ (query)
     # ------------------------------------------------------------------
@@ -223,32 +382,25 @@ class MultiScaleNeighborLoader:
         profiler = get_profiler()
         prepare_started = perf_counter() if profiler.detail_active else None
 
-        src_cpu = src.cpu()
-        dst_cpu = dst.cpu()
-        t_cpu = timestamp_ns.cpu().long()
+        src_cpu = src.detach().cpu().long()
+        dst_cpu = dst.detach().cpu().long()
+        t_cpu = timestamp_ns.detach().cpu().long()
 
-        all_nodes_list = torch.cat([src_cpu, dst_cpu]).unique().tolist()
-        Q = len(all_nodes_list)
-        query_nodes = torch.tensor(all_nodes_list, dtype=torch.long)
-
-        ref_time_per_node = {}
-        for i in range(batch_size):
-            node = int(src_cpu[i])
-            t = int(t_cpu[i])
-            if node not in ref_time_per_node:
-                ref_time_per_node[node] = t
-            else:
-                ref_time_per_node[node] = min(ref_time_per_node[node], t)
-
-            node = int(dst_cpu[i])
-            if node not in ref_time_per_node:
-                ref_time_per_node[node] = t
-            else:
-                ref_time_per_node[node] = min(ref_time_per_node[node], t)
-
-        reference_time_ns = torch.zeros(Q, dtype=torch.int64)
-        for idx, node in enumerate(all_nodes_list):
-            reference_time_ns[idx] = ref_time_per_node[node]
+        nodes = torch.cat([src_cpu, dst_cpu])
+        query_nodes, inverse = torch.unique(
+            nodes, sorted=True, return_inverse=True
+        )
+        Q = query_nodes.numel()
+        if Q:
+            t_all = torch.cat([t_cpu, t_cpu])
+            reference_time_ns = torch.full(
+                (Q,), torch.iinfo(torch.int64).max, dtype=torch.int64
+            )
+            reference_time_ns.scatter_reduce_(
+                0, inverse, t_all, reduce="amin"
+            )
+        else:
+            reference_time_ns = torch.zeros(0, dtype=torch.int64)
 
         if prepare_started is not None:
             profiler.record(
@@ -280,14 +432,8 @@ class MultiScaleNeighborLoader:
             )
         index_started = perf_counter() if profiler.detail_active else None
 
-        src_query_index = torch.zeros(batch_size, dtype=torch.long)
-        node_to_qidx = {node: idx for idx, node in enumerate(all_nodes_list)}
-        for i in range(batch_size):
-            src_query_index[i] = node_to_qidx[int(src_cpu[i])]
-
-        dst_query_index = torch.zeros(batch_size, dtype=torch.long)
-        for i in range(batch_size):
-            dst_query_index[i] = node_to_qidx[int(dst_cpu[i])]
+        src_query_index = inverse[:batch_size].clone()
+        dst_query_index = inverse[batch_size:].clone()
 
         result: Dict[str, Tensor] = {
             "query_nodes": query_nodes.to(device),
@@ -301,85 +447,28 @@ class MultiScaleNeighborLoader:
                 parent="training.T_neighbor_sample",
             )
 
-        for scale_name, tau_low, tau_high, budget, has_upper in [
-            ("short", 0, self.tau_short_ns, self.short_budget, True),
-            ("medium", self.tau_short_ns, self.tau_medium_ns, self.medium_budget, True),
-            ("long", self.tau_medium_ns, None, self.long_budget, False),  # No upper bound
+        scale_detail = profiler.detail_active
+        for scale_name, tau_low, tau_high, budget in [
+            ("short", 0, self.tau_short_ns, self.short_budget),
+            ("medium", self.tau_short_ns, self.tau_medium_ns, self.medium_budget),
+            ("long", self.tau_medium_ns, None, self.long_budget),  # No upper bound
         ]:
-            neighbor_ids = history["neighbor_id"]
-            event_ids = history["event_id"]
-            timestamps = history["timestamp_ns"]
-            directions = history["direction"]
-
-            scale_neighbor = torch.full(
-                (Q, budget), fill_value=-1, dtype=torch.int64, device=device
+            (
+                scale_result,
+                selected_count,
+                filter_seconds,
+                sort_seconds,
+                h2d_seconds,
+            ) = self._sample_scale_vectorized(
+                history,
+                reference_time_ns,
+                scale_name,
+                tau_low,
+                tau_high,
+                budget,
+                device,
+                detail=scale_detail,
             )
-            scale_event_id = torch.full(
-                (Q, budget), fill_value=-1, dtype=torch.int64, device=device
-            )
-            scale_timestamp = torch.full(
-                (Q, budget), fill_value=-1, dtype=torch.int64, device=device
-            )
-            scale_direction = torch.full(
-                (Q, budget), fill_value=-1, dtype=torch.int8, device=device
-            )
-            scale_mask = torch.zeros(
-                (Q, budget), dtype=torch.bool, device=device
-            )
-
-            scale_detail = profiler.detail_active
-            filter_seconds = 0.0
-            sort_seconds = 0.0
-            h2d_seconds = 0.0
-            selected_count = 0
-            ref_cpu = reference_time_ns.cpu()
-            ts_cpu = timestamps.cpu()
-            ev_cpu = event_ids.cpu()
-            nb_cpu = neighbor_ids.cpu()
-            dir_cpu = directions.cpu()
-
-            for q_idx in range(Q):
-                filter_started = perf_counter() if scale_detail else None
-                # First filter out invalid timestamps (marked as -1)
-                valid_ts_mask = ts_cpu[q_idx] >= 0
-                delta = ref_cpu[q_idx] - ts_cpu[q_idx]
-                # Short: 0 < delta <= tau_short
-                # Medium: tau_short < delta <= tau_medium
-                # Long: delta > tau_medium (no upper bound)
-                if scale_name == "short":
-                    in_range = valid_ts_mask & (delta > 0) & (delta <= tau_high)
-                elif scale_name == "medium":
-                    in_range = valid_ts_mask & (delta > tau_low) & (delta <= tau_high)
-                else:  # long
-                    in_range = valid_ts_mask & (delta > tau_low)
-
-                valid_ts = ts_cpu[q_idx][in_range]
-                valid_ev = ev_cpu[q_idx][in_range]
-                valid_nb = nb_cpu[q_idx][in_range]
-                valid_dir = dir_cpu[q_idx][in_range]
-                if filter_started is not None:
-                    filter_seconds += perf_counter() - filter_started
-
-                sort_started = perf_counter() if scale_detail else None
-                sorted_idx = _recency_order(valid_ts, valid_ev)
-                sorted_ts = valid_ts[sorted_idx]
-                sorted_ev = valid_ev[sorted_idx]
-                sorted_nb = valid_nb[sorted_idx]
-                sorted_dir = valid_dir[sorted_idx]
-                if sort_started is not None:
-                    sort_seconds += perf_counter() - sort_started
-
-                num_valid = min(len(sorted_ts), budget)
-                selected_count += num_valid
-                if num_valid > 0:
-                    h2d_started = perf_counter() if scale_detail else None
-                    scale_neighbor[q_idx, :num_valid] = sorted_nb[:num_valid].to(device)
-                    scale_event_id[q_idx, :num_valid] = sorted_ev[:num_valid].to(device)
-                    scale_timestamp[q_idx, :num_valid] = sorted_ts[:num_valid].to(device)
-                    scale_direction[q_idx, :num_valid] = sorted_dir[:num_valid].to(device)
-                    scale_mask[q_idx, :num_valid] = True
-                    if h2d_started is not None:
-                        h2d_seconds += perf_counter() - h2d_started
 
             if scale_detail:
                 profiler.record(
@@ -396,11 +485,7 @@ class MultiScaleNeighborLoader:
                 )
                 profiler.record_batch_stat(f"{scale_name}_sampled_edges", selected_count)
 
-            result[f"{scale_name}_neighbor_id"] = scale_neighbor
-            result[f"{scale_name}_event_id"] = scale_event_id
-            result[f"{scale_name}_timestamp_ns"] = scale_timestamp
-            result[f"{scale_name}_direction"] = scale_direction
-            result[f"{scale_name}_mask"] = scale_mask
+            result.update(scale_result)
 
         return result
 
