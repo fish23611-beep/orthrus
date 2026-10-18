@@ -148,8 +148,6 @@ class MultiScaleOrthrusEncoder(nn.Module):
         masks = sampled[f"{scale}_mask"].cpu()
         sampled_timestamps = sampled[f"{scale}_timestamp_ns"].cpu()
         query_nodes = sampled["query_nodes"].cpu()
-        candidates: list[tuple[int, int, int, int, int]] = []
-        seen_event_ids: set[int] = set()
         if materialize_started is not None:
             profiler.record(
                 f"training.scan_scale.{scale}.cpu_materialize",
@@ -158,27 +156,75 @@ class MultiScaleOrthrusEncoder(nn.Module):
             )
         loop_started = perf_counter() if detail else None
 
-        for q_idx in range(event_ids.size(0)):
-            for slot in range(event_ids.size(1)):
-                if not bool(masks[q_idx, slot]):
-                    continue
-                event_id = int(event_ids[q_idx, slot])
-                if event_id == -1 or event_id in seen_event_ids:
-                    continue
-                direction = int(directions[q_idx, slot])
-                if direction not in (0, 1):
-                    raise ValueError(f"history direction must be 0 or 1, got {direction}")
-                query = int(query_nodes[q_idx])
-                neighbor = int(neighbors[q_idx, slot])
-                sampled_timestamp = int(sampled_timestamps[q_idx, slot])
-                seen_event_ids.add(event_id)
-                candidates.append(
-                    (event_id, query, neighbor, direction, sampled_timestamp)
+        # Keep the scalar loop's exact semantics while removing the
+        # per-query/per-slot Python iteration:
+        #   1. flatten the [Q, B] slots in row-major order;
+        #   2. keep slots whose mask is set and whose event id is not -1;
+        #   3. record the first flat position of every event id;
+        #   4. sort those first positions to restore first-occurrence order.
+        # ``unique`` + ``scatter_reduce_(amin)`` is used instead of a Python
+        # set so that duplicate handling stays vectorized and deterministic.
+        candidate_values = torch.empty((0, 5), dtype=torch.long)
+        query_count = event_ids.size(0)
+        budget = event_ids.size(1)
+        if query_count > 0 and budget > 0:
+            flat_event_ids = event_ids.reshape(-1).contiguous()
+            flat_neighbors = neighbors.reshape(-1).contiguous()
+            flat_directions = directions.reshape(-1).contiguous()
+            flat_masks = masks.reshape(-1).contiguous().bool()
+            flat_timestamps = sampled_timestamps.reshape(-1).contiguous()
+
+            valid_positions = (
+                (flat_masks & flat_event_ids.ne(-1))
+                .nonzero(as_tuple=False)
+                .squeeze(1)
+            )
+            if valid_positions.numel() > 0:
+                valid_event_ids = flat_event_ids.index_select(0, valid_positions)
+                unique_event_ids, inverse = torch.unique(
+                    valid_event_ids, sorted=True, return_inverse=True
+                )
+                first_positions = torch.full(
+                    (unique_event_ids.numel(),),
+                    flat_event_ids.numel(),
+                    dtype=torch.long,
+                )
+                first_positions.scatter_reduce_(
+                    0, inverse, valid_positions, reduce="amin"
+                )
+                selected_positions = first_positions.sort().values
+                selected_queries = selected_positions // budget
+                selected_directions = flat_directions.index_select(
+                    0, selected_positions
+                ).long()
+
+                # Direction validation must happen before full_data lookups,
+                # and must report the first invalid record in record order.
+                invalid_direction = (selected_directions != 0) & (
+                    selected_directions != 1
+                )
+                if bool(invalid_direction.any()):
+                    first_invalid = int(
+                        invalid_direction.nonzero(as_tuple=False)[0, 0]
+                    )
+                    raise ValueError(
+                        "history direction must be 0 or 1, got "
+                        f"{int(selected_directions[first_invalid])}"
+                    )
+
+                candidate_values = torch.stack(
+                    [
+                        flat_event_ids.index_select(0, selected_positions),
+                        query_nodes.index_select(0, selected_queries),
+                        flat_neighbors.index_select(0, selected_positions),
+                        selected_directions,
+                        flat_timestamps.index_select(0, selected_positions),
+                    ],
+                    dim=1,
                 )
 
         lookup_started = perf_counter() if detail else None
-        if candidates:
-            candidate_values = torch.tensor(candidates, dtype=torch.long)
+        if candidate_values.size(0):
             lookup_event_ids = candidate_values[:, 0]
             cpu = lookup_event_ids.device
             full_src_values = self._full_values(
@@ -194,7 +240,7 @@ class MultiScaleOrthrusEncoder(nn.Module):
             full_src_values = full_src_values.reshape(-1)
             full_dst_values = full_dst_values.reshape(-1)
             full_timestamp_values = full_timestamp_values.reshape(-1)
-            expected_size = len(candidates)
+            expected_size = candidate_values.size(0)
             if not (
                 full_src_values.numel()
                 == full_dst_values.numel()
@@ -221,7 +267,7 @@ class MultiScaleOrthrusEncoder(nn.Module):
             perf_counter() - lookup_started if lookup_started is not None else 0.0
         )
 
-        records = [record[:4] for record in candidates]
+        records = [tuple(row) for row in candidate_values[:, :4].tolist()]
         if loop_started is not None:
             loop_seconds = perf_counter() - loop_started
             profiler.record(
