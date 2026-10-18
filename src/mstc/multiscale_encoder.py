@@ -236,6 +236,32 @@ class MultiScaleOrthrusEncoder(nn.Module):
         profiler.record_batch_stat(f"{scale}_scan_records", len(records))
         return records
 
+    @staticmethod
+    def _assign_current_hidden_last_write(
+        node_hidden: Tensor,
+        node_ids: Tensor,
+        query_nodes: Tensor,
+        current_hidden: Tensor,
+    ) -> None:
+        """Overwrite current-node rows, keeping the last write for duplicates.
+
+        ``node_ids`` must be sorted, unique, and contain every id in
+        ``query_nodes`` (guaranteed by ``torch.unique(sorted=True)`` above).
+        Duplicate query ids are collapsed to their last batch row before the
+        write so the in-place update never depends on a device-specific
+        duplicate-index overwrite order.
+        """
+        if query_nodes.numel() == 0:
+            return
+        local_index = torch.searchsorted(node_ids, query_nodes)
+        unique_index, inverse = torch.unique(local_index, return_inverse=True)
+        rows = torch.arange(
+            local_index.numel(), dtype=torch.long, device=local_index.device
+        )
+        last_row = torch.full_like(unique_index, -1)
+        last_row.scatter_reduce_(0, inverse, rows, reduce="amax")
+        node_hidden[unique_index] = current_hidden.index_select(0, last_row)
+
     def _encode_scale(
         self,
         scale_index: int,
@@ -316,9 +342,12 @@ class MultiScaleOrthrusEncoder(nn.Module):
                 node_dst_hidden[node_to_local[edge_dst]] = self.dst_linear(historical_dst[row])
 
         with profiler.record_function(f"MSTC::encoder.{scale}.current_assign_loop"):
-            for batch_index in range(batch_size):
-                node_src_hidden[node_to_local[int(src_query_nodes[batch_index])]] = current_src_hidden[batch_index]
-                node_dst_hidden[node_to_local[int(dst_query_nodes[batch_index])]] = current_dst_hidden[batch_index]
+            self._assign_current_hidden_last_write(
+                node_src_hidden, node_ids, src_query_nodes, current_src_hidden
+            )
+            self._assign_current_hidden_last_write(
+                node_dst_hidden, node_ids, dst_query_nodes, current_dst_hidden
+            )
         node_features = node_src_hidden + node_dst_hidden
         if self.use_scale_embedding:
             scale_ids = torch.full((node_ids.numel(),), scale_index, dtype=torch.long, device=device)
