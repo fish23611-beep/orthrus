@@ -1,0 +1,6 @@
+# Additions to an existing Windows CUDA environment; not a full environment.
+# Use with constraints-windows-compat.txt to protect the validated stack.
+igraph==0.11.5; sys_platform == 'win32'
+texttable==1.7.2; sys_platform == 'win32'
+psutil==7.2.2; sys_platform == 'win32'
+pytest-mock==3.15.1; sys_platform == 'win32'

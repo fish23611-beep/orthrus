@@ -13,6 +13,7 @@ import torch
 
 from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime, update_runtime_nested
 from runtime.runtime_profiler import get_profiler
+from artifact_names import time_window_filename
 from detection.inference_stability import deterministic_inference, enabled, inference_rng
 from detection.checkpoint_policy import (
     compute_validation_objective,
@@ -196,7 +197,7 @@ def test(
     end = time.perf_counter()
     logs_dir = os.path.join(cfg.detection.gnn_testing._edge_losses_dir, split, model_epoch_file)
     os.makedirs(logs_dir, exist_ok=True)
-    csv_file = os.path.join(logs_dir, time_interval + ".csv")
+    csv_file = os.path.join(logs_dir, time_window_filename(time_interval) + ".csv")
 
     df = pd.DataFrame(edge_list)
     with profiler.timer("evaluation.T_export"):

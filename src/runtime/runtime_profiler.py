@@ -12,7 +12,6 @@ import csv
 import json
 import math
 import os
-import resource
 import sys
 import time
 from collections import Counter, defaultdict
@@ -20,6 +19,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
+
+from runtime.memory_metrics import current_rss_mb, peak_rss_mb
 
 
 PROFILE_SCHEMA_VERSION = 2
@@ -80,20 +81,11 @@ def sample_every_from(cli_value: int | None = None) -> int:
 
 
 def _current_rss_mb() -> float | None:
-    try:
-        with open("/proc/self/statm", encoding="ascii") as handle:
-            pages = int(handle.read().split()[1])
-        return pages * os.sysconf("SC_PAGE_SIZE") / (1024 ** 2)
-    except (OSError, ValueError, IndexError):
-        return None
+    return current_rss_mb()
 
 
 def _peak_rss_mb() -> float | None:
-    try:
-        value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-        return value / (1024 * 1024) if sys.platform == "darwin" else value / 1024
-    except Exception:
-        return None
+    return peak_rss_mb()
 
 
 def _proc_io() -> dict[str, int] | None:

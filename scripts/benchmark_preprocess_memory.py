@@ -2,7 +2,7 @@
 """Synthetic RSS benchmark for C8.1 graph construction.
 
 The coordinator runs the frozen materialized strategy and the production
-streaming strategy in separate subprocesses so ru_maxrss values are directly
+streaming strategy in separate subprocesses so process peak RSS values are directly
 comparable. Graph serialization is replaced by an in-process sink; graph
 construction and edge-fusion semantics remain active.
 """
@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import resource
 import subprocess
 import sys
 import tempfile
@@ -84,10 +83,13 @@ class GraphSink:
 
 
 def peak_rss_mb():
-    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform == "darwin":
-        return value / (1024 * 1024)
-    return value / 1024
+    if str(SRC_DIR) not in sys.path:
+        sys.path.insert(0, str(SRC_DIR))
+    from runtime.memory_metrics import peak_rss_mb as get_peak
+    result = get_peak()
+    if result is None:
+        raise RuntimeError("Process peak RSS unavailable")
+    return result
 
 
 def build_graph(module, events, nodeid2msg):

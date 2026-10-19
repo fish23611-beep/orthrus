@@ -594,10 +594,9 @@ def test_ensure_compatible_postgres_parses_major_from_version_output(tmp_path, m
     assert major == "18"
 
 
-def test_ensure_compatible_postgres_follows_usr_bin_symlink(tmp_path, monkeypatch):
+def test_ensure_compatible_postgres_follows_usr_bin_symlink(tmp_path, monkeypatch, make_path_alias):
     real, _ = _make_fake_pg_binary(tmp_path, "17")
-    link = tmp_path / "usr_bin_pg_restore"
-    link.symlink_to(real)
+    link = make_path_alias(tmp_path / "usr_bin_pg_restore", real)
     monkeypatch.setattr(
         colab_postgres, "pg_restore_candidates", lambda: [str(link)]
     )

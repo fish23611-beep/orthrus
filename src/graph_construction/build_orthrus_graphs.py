@@ -6,6 +6,7 @@ import networkx as nx
 import torch
 from config import *
 from provnet_utils import *
+from artifact_names import time_window_filename
 from graph_construction.empty_day import (
     EMPTY_DAY_REASON_NO_RAW_EVENTS,
     build_marker_payload,
@@ -450,7 +451,7 @@ def gen_edge_fused_tw_streaming(cur, nodeid2msg, logger, cfg, event_fetch_size=8
 
                 date_dir = f"{graphs_dir}/graph_{day}/"
                 os.makedirs(date_dir, exist_ok=True)
-                graph_name = f"{date_dir}/{time_interval}"
+                graph_name = os.path.join(date_dir, time_window_filename(time_interval))
 
                 # Atomic save: write to temp file, then rename
                 temp_graph_path = graph_name + ".tmp"

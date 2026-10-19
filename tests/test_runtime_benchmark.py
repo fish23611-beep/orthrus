@@ -363,7 +363,7 @@ def test_missing_or_empty_shared_root_fails_fast_without_output(tmp_path):
     assert not (tmp_path / "output").exists()
 
 
-def test_same_nested_existing_and_symlink_overlap_roots_are_rejected(tmp_path):
+def test_same_nested_existing_and_symlink_overlap_roots_are_rejected(tmp_path, make_path_alias):
     args = _args(tmp_path)
     shared = Path(args.shared_artifact_root)
 
@@ -375,8 +375,7 @@ def test_same_nested_existing_and_symlink_overlap_roots_are_rejected(tmp_path):
     with pytest.raises(ValueError, match="overlap"):
         run_runtime_benchmark.validate(args)
 
-    link = tmp_path / "shared-link"
-    link.symlink_to(shared, target_is_directory=True)
+    link = make_path_alias(tmp_path / "shared-link", shared, target_is_directory=True)
     args.artifact_root = str(link / "via-symlink")
     with pytest.raises(ValueError, match="overlap"):
         run_runtime_benchmark.validate(args)

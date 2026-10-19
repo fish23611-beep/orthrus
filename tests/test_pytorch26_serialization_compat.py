@@ -367,7 +367,8 @@ class TestLegacyFallback:
         def fake_load(*args, **kwargs):
             if "weights_only" in kwargs:
                 raise TypeError("torch.load() got an unexpected keyword argument 'weights_only'")
-            return original_load(*args, **kwargs)
+            # Emulate the old default even when the host is PyTorch >= 2.6.
+            return original_load(*args, weights_only=False, **kwargs)
 
         mocker.patch("serialization_compat.torch.load", side_effect=fake_load)
 

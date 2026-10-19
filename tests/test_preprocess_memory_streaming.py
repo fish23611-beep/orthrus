@@ -24,6 +24,8 @@ import networkx as nx
 # Ensure src/ is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
+from artifact_names import time_window_filename
+
 
 # ---------------------------------------------------------------------------
 # Standalone streaming helpers (mirrors build_orthrus_graphs.py)
@@ -173,7 +175,7 @@ class TestCompletionMarkers:
         # Test WITHOUT .pt suffix (frozen version format)
         graph_subdir = temp_graphs_dir / "graph_0"
         graph_subdir.mkdir(exist_ok=True)
-        (graph_subdir / "2019-05-08_00:00:00~2019-05-08_00:15:00").write_text("dummy")
+        (graph_subdir / time_window_filename("2019-05-08_00:00:00~2019-05-08_00:15:00")).write_text("dummy")
         
         # Should detect legacy artifacts (no .pt suffix)
         assert check_preprocess_stage_complete(mock_cfg, "build_graphs") is True
@@ -488,7 +490,7 @@ class TestEdgeEmbeddingMemory:
             assert os.path.exists(output_file)
             
             # Verify output is a valid TemporalData
-            data = torch.load(output_file)
+            data = torch.load(output_file, weights_only=False)  # Test-created artifact.
             assert hasattr(data, 'src')
             assert hasattr(data, 'dst')
             assert hasattr(data, 't')
@@ -746,7 +748,7 @@ def _run_graph_case(tmp_path, event_fetch_size):
         if not name.endswith(".tmp") and not name.startswith(".preprocess_")
         for path in [os.path.join(root, name)]
     )
-    actual = [_canonical_graph(torch.load(path)) for path in paths]
+    actual = [_canonical_graph(torch.load(path, weights_only=False)) for path in paths]
     expected = _frozen_reference_graphs(
         events,
         nodeid2msg,
@@ -888,7 +890,7 @@ def _temporal_data_case(tmp_path):
         indexid2vec, etype2oh, ntype2oh, ["graph_8"], str(out_dir),
         MagicMock(), cfg,
     )
-    actual = torch.load(out_dir / "window.TemporalData.simple")
+    actual = torch.load(out_dir / "window.TemporalData.simple", weights_only=False)
 
     # Build expected tensors from CHRONOLOGICALLY sorted edges
     # (matching the fix: edges are now sorted before building TemporalData)
@@ -1002,7 +1004,7 @@ class TestArtifactAcceptanceRegressions:
         )
         graph_0 = temp_graphs_dir / "graph_0"
         graph_0.mkdir()
-        (graph_0 / "2019-05-08_00:00:00~2019-05-08_00:15:00").write_text("x")
+        (graph_0 / time_window_filename("2019-05-08_00:00:00~2019-05-08_00:15:00")).write_text("x")
         assert check_preprocess_stage_complete(mock_cfg, "build_graphs") is False
 
     def test_complete_legacy_suffixless_graph_artifacts_are_compatible(
@@ -1017,7 +1019,7 @@ class TestArtifactAcceptanceRegressions:
         for folder in ("graph_0", "graph_1"):
             graph_dir = temp_graphs_dir / folder
             graph_dir.mkdir()
-            (graph_dir / "2019-05-08_00:00:00~2019-05-08_00:15:00").write_text("x")
+            (graph_dir / time_window_filename("2019-05-08_00:00:00~2019-05-08_00:15:00")).write_text("x")
         assert check_preprocess_stage_complete(mock_cfg, "build_graphs") is True
 
     @pytest.mark.parametrize("stage,relative_dir", [

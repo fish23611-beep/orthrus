@@ -215,7 +215,7 @@ def gen_vectorized_graphs(indexid2vec, etype2oh, ntype2oh, split_files, out_dir,
     os.makedirs(out_dir, exist_ok=True)
 
     for path in tqdm(sorted_paths, "Embedding edges"):
-        file = path.split("/")[-1]
+        file = os.path.basename(path)
 
         # Load single graph at a time
         # ORTHRUS-generated NetworkX MultiDiGraph artifacts require full pickle

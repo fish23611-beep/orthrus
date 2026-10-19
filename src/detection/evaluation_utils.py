@@ -14,6 +14,7 @@ from data_utils import *
 from config import *
 import igraph as ig
 import csv
+from artifact_names import decode_time_window_filename
 from sklearn.cluster import KMeans
 
 import labelling
@@ -489,7 +490,7 @@ def compute_tw_labels_for_magic(cfg):
         num_found_event_labels = 0
         tw_to_malicious_nodes = defaultdict(list)
         for i, tw in enumerate(test_tw):
-            filename = tw.split('/')[-1]
+            filename = decode_time_window_filename(os.path.basename(tw))
             start_time = filename.split('~')[0]
             end_time = filename.split('~')[1]
 

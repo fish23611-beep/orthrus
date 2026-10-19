@@ -4,7 +4,6 @@ import bisect
 import hashlib
 import json
 import os
-import resource
 import sys
 import time as time_module
 from collections import OrderedDict
@@ -21,6 +20,7 @@ from torch_geometric.loader import TemporalDataLoader
 from encoders import OrthrusEncoder
 from serialization_compat import load_trusted_torch_artifact
 from runtime.runtime_profiler import get_profiler
+from runtime.memory_metrics import current_rss_mb, peak_rss_mb
 
 
 # --------------------------------------------------------------------------- #
@@ -32,26 +32,11 @@ INDEX_TO_SPLIT_NAME = {v: k for k, v in SPLIT_NAME_TO_INDEX.items()}
 
 
 def _current_rss_mb() -> float | None:
-    """Return current resident memory without adding a psutil dependency."""
-    try:
-        with open("/proc/self/statm", encoding="ascii") as handle:
-            resident_pages = int(handle.read().split()[1])
-        return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024 ** 2)
-    except (OSError, ValueError, IndexError):
-        try:
-            value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-            return value / (1024 * 1024) if sys.platform == "darwin" else value / 1024
-        except Exception:
-            return None
+    return current_rss_mb(legacy_peak_fallback=True)
 
 
 def _peak_rss_mb() -> float | None:
-    """Return the process high-water RSS reported by the kernel."""
-    try:
-        value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-        return value / (1024 * 1024) if sys.platform == "darwin" else value / 1024
-    except Exception:
-        return None
+    return peak_rss_mb()
 
 
 class _LoaderTelemetry:

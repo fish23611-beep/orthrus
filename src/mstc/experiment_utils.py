@@ -254,13 +254,9 @@ def events_per_second(processed_event_count: int, measured_seconds: float) -> fl
 
 
 def peak_cpu_memory_mb() -> float | None:
-    """Best-effort process peak RSS; it is process-wide rather than stage-exact."""
-    try:
-        import resource
-        rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-        return rss / (1024 * 1024) if sys.platform == "darwin" else rss / 1024
-    except Exception:
-        return None
+    """Return process-wide peak RSS in MiB, if available."""
+    from runtime.memory_metrics import peak_rss_mb
+    return peak_rss_mb()
 
 
 def capture_rng_state() -> dict[str, Any]:

@@ -305,7 +305,7 @@ class TestEventFieldAlignment:
         )
 
         # Load and verify
-        data = torch.load(out_dir / "window.TemporalData.simple")
+        data = torch.load(out_dir / "window.TemporalData.simple", weights_only=False)
 
         # Timestamps should be sorted: 10, 20, 30
         assert data.t.tolist() == [10, 20, 30]
@@ -356,7 +356,7 @@ class TestEventFieldAlignment:
             MagicMock(), cfg,
         )
 
-        data = torch.load(out_dir / "window.TemporalData.simple")
+        data = torch.load(out_dir / "window.TemporalData.simple", weights_only=False)
 
         # Should be sorted: 100, 200, 300, 400, 500
         expected_ts = [100, 200, 300, 400, 500]
@@ -570,7 +570,7 @@ class TestFullIntegration:
             MagicMock(), cfg,
         )
 
-        data = torch.load(out_dir / "window.TemporalData.simple")
+        data = torch.load(out_dir / "window.TemporalData.simple", weights_only=False)
 
         # Verify temporal order
         for i in range(len(data.t) - 1):

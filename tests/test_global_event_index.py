@@ -579,7 +579,7 @@ def test_full_data_split_preserved_in_save_load(tmp_path):
 
     path = os.path.join(str(tmp_path), "full_data.pt")
     torch.save(full, path)
-    loaded = torch.load(path)
+    loaded = torch.load(path, weights_only=False)  # Test-created PyG object.
 
     assert torch.equal(loaded.split, full.split)
     assert torch.equal(loaded.split, loaded.event_split)
