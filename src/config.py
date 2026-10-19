@@ -199,6 +199,7 @@ TASK_ARGS = {
           },
           "evaluation": {
                "checkpoint_policy": str,
+               "deterministic_inference": bool,
                "viz_malicious_nodes": bool,
                "ground_truth_version": str,  # ["darpa_v4"]
                "used_method": str,
@@ -533,6 +534,7 @@ def get_default_cfg(args):
 
      # C6 defaults are safe for the baseline variant but do not select MSTC evaluation.
      cfg.detection.evaluation.checkpoint_policy = "all_checkpoints"
+     cfg.detection.evaluation.deterministic_inference = False
      cfg.calibration.method = "hierarchical_relation"
      cfg.calibration.min_triplet_samples = 100
      cfg.calibration.min_type_pair_samples = 200

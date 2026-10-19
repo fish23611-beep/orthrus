@@ -150,7 +150,10 @@ def dump_environment(cfg: Any, out_dir: str | Path) -> Path:
         pyg_version = torch_geometric.__version__
     except Exception:
         pass
+    from detection.inference_stability import inference_metadata
+
     environment = {
+        "inference_stability": inference_metadata(cfg),
         "dataset": _environment_scalar(_cfg_value(cfg, "dataset", "name")),
         "model": _environment_scalar(_cfg_value(cfg, "model", "variant")) or _environment_scalar(_cfg_value(cfg, "detection", "gnn_training", "used_method")),
         "experiment_name": _environment_scalar(getattr(cfg, "_experiment_name", None)) or _environment_scalar(getattr(cfg, "exp", None)),

@@ -13,6 +13,7 @@ import torch
 
 from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime, update_runtime_nested
 from runtime.runtime_profiler import get_profiler
+from detection.inference_stability import deterministic_inference, enabled, inference_rng
 from detection.checkpoint_policy import (
     compute_validation_objective,
     select_checkpoint_from_validation,
@@ -420,43 +421,45 @@ def _run_checkpoint_replay(
     log(f"Evaluation with model {trained_model}...")
     model = None
     try:
-        with profiler.timer("loading.T_model_construction"):
-            model = build_model(
-                data_sample=data_sample,
-                device=device,
-                cfg=cfg,
-                max_node_num=max_node_num,
-                time_gap_statistics=time_gap_statistics,
-            )
-        model = load_model(model, model_path)
-        if cfg._from_weights:
-            model.load_state_dict(
-                torch.load(
-                    os.path.join(
-                        cfg._from_weights_path,
-                        f"{cfg.dataset.name}.pkl",
+        with inference_rng(cfg, device, "construction"):
+            with profiler.timer("loading.T_model_construction"):
+                model = build_model(
+                    data_sample=data_sample,
+                    device=device,
+                    cfg=cfg,
+                    max_node_num=max_node_num,
+                    time_gap_statistics=time_gap_statistics,
+                )
+            model = load_model(model, model_path)
+            if cfg._from_weights:
+                model.load_state_dict(
+                    torch.load(
+                        os.path.join(
+                            cfg._from_weights_path,
+                            f"{cfg.dataset.name}.pkl",
+                        )
                     )
                 )
-            )
 
         _reset_checkpoint_state(model, trained_model, profiler)
-        with profiler.timer("evaluation.T_replay_train"):
+        with inference_rng(cfg, device, "replay"), profiler.timer("evaluation.T_replay_train"):
             _replay_train_history(model, train_data, full_data, cfg, device)
         log(f"    [replay] train history rebuilt for {trained_model}")
 
         processed_events = 0
         for graphs, split in split_sequence:
-            processed_events += _run_single_split(
-                graphs,
-                split,
-                model=model,
-                full_data=full_data,
-                nodeid2msg=nodeid2msg,
-                trained_model=trained_model,
-                cfg=cfg,
-                device=device,
-                profiler=profiler,
-            )
+            with inference_rng(cfg, device, split):
+                processed_events += _run_single_split(
+                    graphs,
+                    split,
+                    model=model,
+                    full_data=full_data,
+                    nodeid2msg=nodeid2msg,
+                    trained_model=trained_model,
+                    cfg=cfg,
+                    device=device,
+                    profiler=profiler,
+                )
         return processed_events
     finally:
         if model is not None:
@@ -485,6 +488,13 @@ def _reject_stale_non_selected_test_artifacts(cfg, selected_epoch):
 
 
 def main(cfg):
+    if not enabled(cfg):
+        return _main(cfg)
+    with deterministic_inference(cfg, get_device(cfg)):
+        return _main(cfg)
+
+
+def _main(cfg):
     profiler = get_profiler()
     checkpoint_policy = get_checkpoint_policy(cfg)
     if (
