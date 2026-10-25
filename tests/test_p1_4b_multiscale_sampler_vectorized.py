@@ -746,7 +746,12 @@ def test_output_keys_shapes_and_dtypes():
 
 
 def test_profiling_metric_names_and_outputs_preserved():
-    from src.runtime.runtime_profiler import configure_profiler, get_profiler
+    # Select the exact profiler module used by the sampler.
+    from importlib import import_module
+    from src.mstc import multiscale_sampler
+    profiler_module = import_module(multiscale_sampler.get_profiler.__module__)
+    configure_profiler = profiler_module.configure_profiler
+    get_profiler = profiler_module.get_profiler
 
     rng = random.Random(7007)
     loader = _make_loader(num_nodes=20, capacity=16, budgets=(3, 3, 3))
