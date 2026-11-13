@@ -11,17 +11,25 @@ from factory import *
 from mstc.experiment_utils import dump_environment, events_per_second, peak_cpu_memory_mb, update_runtime, update_runtime_nested
 from wandb_control import wandb_log
 from runtime.runtime_profiler import get_profiler
+from mstc.training_loss import fit_training_weights, weighting_mode
 
 
 def train(data,
           full_data,
           model,
           optimizer,
-          cfg
+          cfg,
+          loss_weighting=None,
           ):
     model.train()
 
     losses = []
+    mode = weighting_mode(cfg)
+    balanced = mode != "event_mean"
+    if balanced and (not isinstance(model, MSTCOrthrus) or loss_weighting is None):
+        raise ValueError("Balanced MSTC training requires fixed full-training-split weights")
+    weighted_sum = 0.0
+    target_events = 0
     profiler = get_profiler()
     batch_loader = batch_loader_factory(cfg, data, model.graph_reindexer)
 
@@ -39,17 +47,18 @@ def train(data,
         with profiler.timer("training.T_forward", detail=True, parent="training.T_total_batch"), \
                 profiler.cuda_timer("training.T_forward_cuda_interval", detail=True, parent="training.T_total_batch"), \
                 profiler.record_function("MSTC::forward"):
-            outputs = model(batch, full_data)
+            outputs = model(batch, full_data, return_event_losses=True) if balanced else model(batch, full_data)
         with profiler.timer("training.T_loss_extract", detail=True,
                             parent="training.T_total_batch"), \
                 profiler.record_function("MSTC::loss_extract"):
-            loss = outputs["loss"] if isinstance(outputs, dict) else outputs
+            loss = (loss_weighting.reduce(outputs["event_loss"], batch.src, batch.dst)
+                    if balanced else outputs["loss"] if isinstance(outputs, dict) else outputs)
         if isinstance(outputs, dict):
             sync_started = timer() if profiler.detail_active else None
             with profiler.record_function("MSTC::logging_scalar_items"):
                 log(
                     "MSTC batch loss={:.4f}, type={:.4f}, time={:.4f}, src={:.4f}, dst={:.4f}".format(
-                        outputs["loss"].item(),
+                        loss.item() if balanced else outputs["loss"].item(),
                         outputs["loss_type"].item(),
                         outputs["loss_time"].item(),
                         outputs["loss_time_src"].item(),
@@ -74,8 +83,11 @@ def train(data,
                             parent="training.T_total_batch"), \
                 profiler.record_function("MSTC::loss_item"):
             losses.append(loss.item())
+            if balanced:
+                weighted_sum += losses[-1] * batch_events
+                target_events += batch_events
         profiler.end_batch(batch_token, "training.T_total_batch")
-    return np.mean(losses)
+    return weighted_sum / target_events if balanced and target_events else np.mean(losses)
 
 
 def _runtime_dir(cfg, fallback_dir):
@@ -163,6 +175,24 @@ def main(cfg):
     training_started = timer()
 
     train_data, _, _, full_data, max_node_num = load_all_datasets(cfg)
+    mode = weighting_mode(cfg)
+    loss_weighting = None
+    if mode != "event_mean":
+        # Scan only target train windows; sampled history/val/test never fit c_v.
+        loss_weighting = fit_training_weights(cfg, train_data, num_nodes=max_node_num)
+        run_dir = getattr(cfg, "_run_dir", None)
+        if not isinstance(run_dir, (str, os.PathLike)) or not os.fspath(run_dir):
+            raise ValueError("Balanced training requires an isolated run directory")
+        metadata_path = os.path.join(run_dir, "metadata", "train_loss_weighting.json")
+        os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+        summary = loss_weighting.summary()
+        if os.path.exists(metadata_path):
+            with open(metadata_path, encoding="utf-8") as handle:
+                if json.load(handle) != summary:
+                    raise ValueError("Training weighting metadata differs from this training split")
+        else:
+            with open(metadata_path, "x", encoding="utf-8") as handle:
+                json.dump(summary, handle, indent=2)
     if hasattr(full_data, "loader_telemetry"):
         update_runtime_nested(runtime_dir, "dataset_loader", "training", full_data.loader_telemetry)
 
@@ -224,8 +254,9 @@ def main(cfg):
                 model=model,
                 optimizer=optimizer,
                 cfg=cfg,
+                **({"loss_weighting": loss_weighting} if loss_weighting is not None else {}),
             )
-            tot_loss += loss
+            tot_loss += loss * window_event_count if loss_weighting is not None else loss
             processed_events += window_event_count
             # log(f"Loss {loss:4f}")
             g.to("cpu")
@@ -242,7 +273,7 @@ def main(cfg):
             })
 
 
-        tot_loss /= len(train_data)
+        tot_loss /= (loss_weighting.num_events if loss_weighting is not None else len(train_data))
         log(f'GNN training loss Epoch: {epoch:02d}, Loss: {tot_loss:.4f}')
         
         epoch_times.append(timer() - start)

@@ -116,8 +116,10 @@ class MSTCOrthrus(nn.Module):
             self.encoder.reset_state()
         self.last_seen_per_node.clear()
 
-    def forward(self, batch, full_data, inference: bool = False) -> dict[str, torch.Tensor]:
+    def forward(self, batch, full_data, inference: bool = False,
+                return_event_losses: bool = False) -> dict[str, torch.Tensor]:
         train_mode = not inference
+        per_event = inference or return_event_losses
         edge_index = batch.edge_index
         x = (batch.x_src, batch.x_dst)
         batch_size = edge_index.size(1)
@@ -174,11 +176,11 @@ class MSTCOrthrus(nn.Module):
                 ), profiler.record_function("MSTC::edge_head"):
                     if self.edge_decoder is None:
                         edge_logits = h_src.new_empty((batch_size, 0))
-                        loss_type = zero_per_event if inference else zero_scalar
+                        loss_type = zero_per_event if per_event else zero_scalar
                     else:
                         edge_logits = self.edge_decoder.logits(h_src, h_dst)
                         loss_type = self.edge_decoder.loss(
-                            h_src, h_dst, batch.edge_type, inference=inference
+                            h_src, h_dst, batch.edge_type, inference=per_event
                         )
 
                 with profiler.timer(
@@ -187,14 +189,14 @@ class MSTCOrthrus(nn.Module):
                     if not self.time_task_enabled:
                         src_time_logits = h_src.new_empty((batch_size, 0))
                         dst_time_logits = h_src.new_empty((batch_size, 0))
-                        loss_time = zero_per_event if inference else zero_scalar
-                        loss_time_src = zero_per_event if inference else zero_scalar
-                        loss_time_dst = zero_per_event if inference else zero_scalar
+                        loss_time = zero_per_event if per_event else zero_scalar
+                        loss_time_src = zero_per_event if per_event else zero_scalar
+                        loss_time_dst = zero_per_event if per_event else zero_scalar
                     else:
                         src_target = src_target.to(h_src.device)
                         dst_target = dst_target.to(h_src.device)
                         src_time_logits, dst_time_logits = self.time_gap_decoder(h_src, h_dst)
-                        reduction = "none" if inference else "mean"
+                        reduction = "none" if per_event else "mean"
                         loss_time, loss_time_src, loss_time_dst = self.time_gap_decoder.loss(
                             src_time_logits, dst_time_logits, src_target, dst_target,
                             reduction=reduction,
@@ -206,6 +208,12 @@ class MSTCOrthrus(nn.Module):
             self.last_seen_per_node = updated_last_seen
 
         if train_mode:
+            if return_event_losses:
+                return {
+                    "loss": score_raw.mean(), "event_loss": score_raw,
+                    "loss_type": loss_type.mean(), "loss_time": loss_time.mean(),
+                    "loss_time_src": loss_time_src.mean(), "loss_time_dst": loss_time_dst.mean(),
+                }
             return {
                 "loss": score_raw,
                 "loss_type": loss_type,

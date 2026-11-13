@@ -392,7 +392,7 @@ def _persist_mstc_predictions(run_dir, best_epoch_dir, cfg):
     if os.path.exists(source):
         os.makedirs(dest_dir, exist_ok=True)
         import shutil
-        shutil.copy2(source, dest)
+        shutil.copyfile(source, dest)
         log(f"[evaluation] MSTC predictions copied: {dest}")
 
 
@@ -486,10 +486,11 @@ def _persist_event_predictions(run_dir, best_epoch_dir, cfg, variant):
             return
         try:
             import shutil as _shutil
-            _shutil.copy2(source, dest)
+            _shutil.copyfile(source, dest)
             log(f"[evaluation] MSTC event_predictions copied: {dest}")
         except Exception as exc:
             log(f"[evaluation] Failed to copy MSTC event_predictions: {exc}")
+            raise
         return
 
     # Baseline: concatenate selected-epoch test edge-score CSVs

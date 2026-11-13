@@ -144,6 +144,7 @@ TASK_ARGS = {
                "lr": float,
                "weight_decay": float,
                "resume_checkpoint": str,
+               "train_loss_weighting": str,  # event_mean | node_contribution_balanced | node_contribution_shrunk
                "node_hid_dim": int,
                "node_out_dim": int,
                "encoder": {
@@ -511,6 +512,7 @@ def get_default_cfg(args):
 
      # C8-A resume path is optional and excluded from the checkpoint config hash.
      cfg.detection.gnn_training.resume_checkpoint = None
+     cfg.detection.gnn_training.train_loss_weighting = "event_mean"
 
      # C4 defaults keep existing configs on the baseline/type-only path.
      cfg.detection.gnn_training.decoder.predict_edge_type.enabled = True
@@ -646,7 +648,11 @@ def set_task_paths(cfg, *, create_dirs=None):
           # We first compute a unique hash for each usbtask
           for subtask_name, subtask_args in subtask.items():
                subtask_cfg = getattr(task_cfg, subtask_name)
-               restart_values = flatten_arg_values(subtask_cfg)
+               hash_cfg = subtask_cfg
+               if subtask_name == "gnn_training" and getattr(subtask_cfg, "train_loss_weighting", None) == "event_mean":
+                    hash_cfg = subtask_cfg.clone()
+                    del hash_cfg["train_loss_weighting"]
+               restart_values = flatten_arg_values(hash_cfg)
                # Semantic corpus scope changes Word2Vec training, not graph
                # construction. Add it only to embed_nodes; embed_edges picks
                # it up through the declared upstream dependency.

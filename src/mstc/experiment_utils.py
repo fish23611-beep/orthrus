@@ -45,6 +45,10 @@ def _to_plain(value: Any, *, redact: bool = True, for_hash: bool = False) -> Any
             key_text = str(key)
             if key_text.startswith("_") or (for_hash and key_text in _RUNTIME_CONFIG_KEYS):
                 continue
+            # An omitted weighting mode historically meant event_mean. Preserve
+            # old checkpoint identity, but keep treatment mode in the hash.
+            if for_hash and key_text == "train_loss_weighting" and item == "event_mean":
+                continue
             result[key_text] = "[REDACTED]" if redact and _is_sensitive_key(key_text) else _to_plain(
                 item, redact=redact, for_hash=for_hash
             )
